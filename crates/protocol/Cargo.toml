@@ -1,0 +1,12 @@
+[package]
+name = "protocol"
+version = "0.1.0"
+edition = "2021"
+description = "Shared types between HITL daemon crates"
+license = "MIT"
+
+[dependencies]
+mavlink = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

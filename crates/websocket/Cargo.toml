@@ -1,0 +1,17 @@
+[package]
+name = "websocket"
+version = "0.1.0"
+edition = "2021"
+description = "WebSocket server for HITL daemon browser communication"
+license = "MIT"
+
+[dependencies]
+protocol = { path = "../protocol" }
+axum = { version = "0.7", features = ["ws"] }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tower-http = { workspace = true }
+futures-util = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }

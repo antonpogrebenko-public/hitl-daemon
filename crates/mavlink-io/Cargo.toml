@@ -1,0 +1,16 @@
+[package]
+name = "mavlink-io"
+version = "0.1.0"
+edition = "2021"
+description = "MAVLink I/O library for HITL daemon"
+license = "MIT"
+
+[dependencies]
+protocol = { path = "../protocol" }
+tokio = { workspace = true }
+serialport = { workspace = true }
+mavlink = { workspace = true }
+tokio-serial = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+crossbeam-channel = { workspace = true }
