@@ -1,12 +1,12 @@
 //! HITL Daemon - Hardware-in-the-loop simulator for UAV testing
 //!
-//! This daemon connects to a Pixhawk flight controller via serial and provides
+//! This daemon connects to a PX4-compatible flight controller via serial and provides
 //! simulated sensor data for hardware-in-the-loop testing.
 
 use clap::Parser;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use mavlink::ardupilotmega::MavMessage;
-use mavlink_io::async_io::{MavlinkIo, NshRequest};
+use mavlink_io::async_io::{MavlinkIo, NshRequest, reconnect_delay};
 use mavlink_io::serial::find_pixhawk_ports;
 use protocol::ActuatorOutputs;
 use hitl_physics::throttle_to_omega;
@@ -19,7 +19,7 @@ use std::thread;
 use std::time::Duration;
 use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use websocket::{CommandType, StateUpdate, ValidatedNshCommand, WebSocketServer, WebSocketServerConfig};
+use websocket::{CommandType, ConnectionStatus, StateUpdate, ValidatedNshCommand, WebSocketServer, WebSocketServerConfig};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -82,16 +82,16 @@ fn detect_or_use_port(specified_port: Option<String>) -> Option<String> {
         return Some(port);
     }
 
-    info!("No port specified, auto-detecting Pixhawk...");
+    info!("No port specified, auto-detecting FC...");
     let ports = find_pixhawk_ports();
 
     if ports.is_empty() {
-        warn!("No Pixhawk devices detected");
+        warn!("No PX4 boards detected");
         return None;
     }
 
     if ports.len() > 1 {
-        info!("Multiple Pixhawk devices found:");
+        info!("Multiple PX4 boards found:");
         for port in &ports {
             info!("  - {}", port);
         }
@@ -99,7 +99,7 @@ fn detect_or_use_port(specified_port: Option<String>) -> Option<String> {
     }
 
     let port = ports.into_iter().next().unwrap();
-    info!(port = %port, "Auto-detected Pixhawk");
+    info!(port = %port, "Auto-detected FC");
     Some(port)
 }
 
@@ -201,18 +201,18 @@ async fn main() {
     info!(version = VERSION, "Starting HITL Daemon");
 
     // Determine operating mode
-    let port = if args.sim_only {
-        info!("Running in simulation-only mode (no Pixhawk connection)");
+    // sim_only_mode is ONLY true when --sim-only flag is explicitly passed
+    let sim_only_mode = args.sim_only;
+    let initial_port = if sim_only_mode {
+        info!("Running in simulation-only mode (no FC connection)");
         None
     } else {
-        detect_or_use_port(args.port)
+        let port = detect_or_use_port(args.port.clone());
+        if port.is_none() {
+            info!("No FC found at startup, will keep scanning...");
+        }
+        port
     };
-
-    let sim_only_mode = port.is_none();
-    if sim_only_mode && !args.sim_only {
-        warn!("No Pixhawk found, falling back to simulation-only mode");
-        warn!("Use --sim-only to suppress this warning");
-    }
 
     // Create simulation configuration with minimal sensor noise for HIL
     // PX4 needs some noise to validate sensors, but too much causes preflight failures
@@ -251,7 +251,7 @@ async fn main() {
     };
 
     info!(
-        port = port.as_deref().unwrap_or("none"),
+        port = initial_port.as_deref().unwrap_or("none"),
         baud = args.baud,
         websocket_port = args.websocket_port,
         reference_lat = sim_config.reference_lat,
@@ -315,156 +315,21 @@ async fn main() {
     // NSH command channel (WebSocket handler -> NSH processor)
     let (nsh_cmd_tx, mut nsh_cmd_rx) = tokio::sync::mpsc::channel::<ValidatedNshCommand>(32);
 
-    let mav_io: Option<Arc<MavlinkIo>> = if let Some(ref port_path) = port {
-        let (mut mav_io, tx_to_app, rx_from_app, nsh_resp_tx, nsh_req_rx) = MavlinkIo::new();
+    // Shared MAVLink I/O - can be updated by connection manager
+    let mav_io: Arc<tokio::sync::RwLock<Option<Arc<MavlinkIo>>>> = Arc::new(tokio::sync::RwLock::new(None));
 
-        // Spawn MAVLink I/O tasks
-        if let Err(e) = mav_io.spawn(port_path, args.baud, tx_to_app, rx_from_app, nsh_resp_tx, nsh_req_rx).await {
-            error!(error = %e, "Failed to open serial port");
-            error!("Falling back to simulation-only mode");
-
-            // Fall back to sim-only
-            let handle = spawn_sim_only_actuator_thread(actuator_tx, shutdown.clone());
-            thread_handles.push(handle);
-            None
-        } else {
-            let mav_io = Arc::new(mav_io);
-
-            // Spawn receiver thread (Pixhawk -> simulation + QGC)
-            let mav_io_recv = mav_io.clone();
-            let shutdown_recv = shutdown.clone();
-            let qgc_socket_send = qgc_socket.clone();
-            let qgc_target_send = qgc_target;
-            let recv_handle = thread::Builder::new()
-                .name("mav-receiver".to_string())
-                .spawn(move || {
-                    info!("MAVLink receiver thread started");
-                    while !shutdown_recv.load(Ordering::Relaxed) {
-                        if let Some((header, msg)) = mav_io_recv.try_recv() {
-                            // Forward to QGC via UDP
-                            if let Some(ref socket) = qgc_socket_send {
-                                let mut buf = Vec::new();
-                                if mavlink::write_v2_msg(&mut buf, header, &msg).is_ok() {
-                                    let _ = socket.send_to(&buf, qgc_target_send);
-                                }
-                            }
-
-                            // Process message locally
-                            match &msg {
-                                MavMessage::HIL_ACTUATOR_CONTROLS(hil) => {
-                                    debug!(
-                                        motors = ?[hil.controls[0], hil.controls[1], hil.controls[2], hil.controls[3]],
-                                        mode = ?hil.mode,
-                                        "Received HIL_ACTUATOR_CONTROLS"
-                                    );
-                                    match ActuatorOutputs::from_mavlink(&msg) {
-                                        Ok(actuator) => {
-                                            if actuator_tx.send(actuator).is_err() {
-                                                error!("Failed to send actuator to simulation");
-                                                break;
-                                            }
-                                        }
-                                        Err(e) => {
-                                            warn!(error = %e, "Failed to parse HIL_ACTUATOR_CONTROLS");
-                                        }
-                                    }
-                                }
-                                MavMessage::HEARTBEAT(hb) => {
-                                    debug!(
-                                        system_id = header.system_id,
-                                        autopilot = ?hb.autopilot,
-                                        "Received HEARTBEAT"
-                                    );
-                                }
-                                MavMessage::STATUSTEXT(st) => {
-                                    let text = String::from_utf8_lossy(&st.text);
-                                    info!(severity = ?st.severity, text = %text.trim_end_matches('\0'), "FC");
-                                }
-                                other => {
-                                    trace!(msg_type = ?std::mem::discriminant(other), "Received MAVLink message");
-                                }
-                            }
-                        } else {
-                            thread::sleep(Duration::from_micros(500));
-                        }
-                    }
-                    info!("MAVLink receiver thread exiting");
-                })
-                .expect("Failed to spawn MAVLink receiver thread");
-            thread_handles.push(recv_handle);
-
-            // Spawn sender thread (simulation -> Pixhawk)
-            let mav_io_send = mav_io.clone();
-            let shutdown_send = shutdown.clone();
-            let send_handle = thread::Builder::new()
-                .name("mav-sender".to_string())
-                .spawn(move || {
-                    info!("MAVLink sender thread started");
-                    while !shutdown_send.load(Ordering::Relaxed) {
-                        match sim_mav_rx.recv_timeout(Duration::from_millis(10)) {
-                            Ok(msg) => {
-                                if let Err(e) = mav_io_send.send(msg) {
-                                    error!(error = %e, "Failed to send to Pixhawk");
-                                    break;
-                                }
-                            }
-                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-                        }
-                    }
-                    info!("MAVLink sender thread exiting");
-                })
-                .expect("Failed to spawn MAVLink sender thread");
-            thread_handles.push(send_handle);
-
-            // Spawn QGC -> PX4 forwarder thread (if UDP enabled)
-            if let Some(qgc_recv) = qgc_socket.clone() {
-                let mav_io_qgc = mav_io.clone();
-                let shutdown_qgc = shutdown.clone();
-                let qgc_handle = thread::Builder::new()
-                    .name("qgc-to-px4".to_string())
-                    .spawn(move || {
-                        info!("QGC→PX4 forwarder thread started (listening for commands)");
-                        let mut buf = [0u8; 280];
-                        while !shutdown_qgc.load(Ordering::Relaxed) {
-                            match qgc_recv.recv_from(&mut buf) {
-                                Ok((n, _src)) if n > 0 => {
-                                    // Parse and forward to PX4
-                                    use mavlink::peek_reader::PeekReader;
-                                    use std::io::Cursor;
-                                    let cursor = Cursor::new(&buf[..n]);
-                                    let mut reader = PeekReader::new(cursor);
-                                    if let Ok((_, msg)) = mavlink::read_v2_msg::<MavMessage, _>(&mut reader) {
-                                        trace!("Forwarding QGC command to PX4: {:?}", std::mem::discriminant(&msg));
-                                        if let Err(e) = mav_io_qgc.send(msg) {
-                                            debug!(error = %e, "Failed to forward QGC message to PX4");
-                                        }
-                                    }
-                                }
-                                Ok(_) => thread::sleep(Duration::from_millis(5)),
-                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                    thread::sleep(Duration::from_millis(5));
-                                }
-                                Err(_) => thread::sleep(Duration::from_millis(10)),
-                            }
-                        }
-                        info!("QGC→PX4 forwarder thread exiting");
-                    })
-                    .expect("Failed to spawn QGC forwarder thread");
-                thread_handles.push(qgc_handle);
-            }
-
-            Some(mav_io)
-        }
-    } else {
-        // Simulation-only mode: generate fake actuator commands
-        let handle = spawn_sim_only_actuator_thread(actuator_tx, shutdown.clone());
+    // In sim-only mode, always generate fake actuator commands
+    // In normal mode, fake actuators run until FC connects
+    if sim_only_mode {
+        let handle = spawn_sim_only_actuator_thread(actuator_tx.clone(), shutdown.clone());
         thread_handles.push(handle);
-        None
-    };
+    }
 
     // Broadcast channel for NSH responses (to WebSocket clients)
     let (nsh_resp_broadcast_tx, _) = tokio::sync::broadcast::channel::<websocket::NshResponse>(64);
+
+    // Broadcast channel for connection status (to WebSocket clients)
+    let (conn_status_tx, _) = tokio::sync::broadcast::channel::<ConnectionStatus>(16);
 
     // Create WebSocket server
     let ws_config = WebSocketServerConfig {
@@ -476,14 +341,15 @@ async fn main() {
     let state_tx = ws_server.state_sender();
     let mut command_rx = ws_server.take_command_receiver();
 
-    // Enable NSH support if we have a Pixhawk connection
-    if mav_io.is_some() {
-        ws_server.set_nsh_sender(nsh_cmd_tx);
-        ws_server.set_nsh_response_receiver(nsh_resp_broadcast_tx.subscribe());
-    }
+    // Always enable NSH support (will be available when Pixhawk connects)
+    ws_server.set_nsh_sender(nsh_cmd_tx);
+    ws_server.set_nsh_response_receiver(nsh_resp_broadcast_tx.subscribe());
+
+    // Always enable connection status broadcasting
+    ws_server.set_connection_status_receiver(conn_status_tx.subscribe());
 
     // Spawn WebSocket server task
-    let serial_port_label = port.clone().unwrap_or_else(|| "simulation".to_string());
+    let serial_port_label = initial_port.clone().unwrap_or_else(|| "scanning".to_string());
     let ws_handle = tokio::spawn(async move {
         let version_parts: Vec<u8> = VERSION
             .split('.')
@@ -552,28 +418,38 @@ async fn main() {
         }
     });
 
-    // Spawn NSH command handler task (if Pixhawk connected)
+    // Clone broadcast tx before it's moved into tasks
+    let nsh_resp_broadcast_tx_for_reconnect = nsh_resp_broadcast_tx.clone();
+
+    // Spawn NSH command handler task (always runs, checks for mav_io dynamically)
     let shutdown_nsh = shutdown.clone();
-    let nsh_handle = if let Some(ref mav) = mav_io {
-        let mav_io_nsh = mav.clone();
+    let mav_io_nsh = mav_io.clone();
+    let nsh_handle = if !sim_only_mode {
         Some(tokio::spawn(async move {
             info!("NSH handler task started");
 
-            // Pending request tracking — serialized: one request at a time,
-            // new requests queue behind the current one via the mpsc channel.
+            // Pending request tracking — serialized: one request at a time
             let mut current_request_id: Option<u32> = None;
             let mut response_buffer: Vec<u8> = Vec::new();
             let mut request_deadline: Option<tokio::time::Instant> = None;
+            let mut cached_mav_io: Option<Arc<MavlinkIo>> = None;
 
             loop {
                 if shutdown_nsh.load(Ordering::Relaxed) {
                     break;
                 }
 
+                // Refresh cached mav_io reference
+                {
+                    let guard = mav_io_nsh.read().await;
+                    if cached_mav_io.as_ref().map(|m| m.is_disconnected()).unwrap_or(true) {
+                        cached_mav_io = guard.clone();
+                    }
+                }
+
                 // Use select to handle both commands and response polling
                 tokio::select! {
                     // Process incoming NSH commands from WebSocket clients
-                    // Only accept a new command when no request is in-flight
                     Some(cmd) = nsh_cmd_rx.recv(), if current_request_id.is_none() => {
                         debug!(
                             request_id = cmd.request_id,
@@ -582,9 +458,31 @@ async fn main() {
                             "Processing NSH command"
                         );
 
+                        // Check if we have a connection
+                        let Some(ref mav) = cached_mav_io else {
+                            let _ = nsh_resp_broadcast_tx.send(websocket::NshResponse {
+                                request_id: cmd.request_id,
+                                success: false,
+                                complete: true,
+                                output: "No FC connected".to_string(),
+                            });
+                            continue;
+                        };
+
+                        if mav.is_disconnected() {
+                            cached_mav_io = None;
+                            let _ = nsh_resp_broadcast_tx.send(websocket::NshResponse {
+                                request_id: cmd.request_id,
+                                success: false,
+                                complete: true,
+                                output: "FC disconnected".to_string(),
+                            });
+                            continue;
+                        }
+
                         // Send command via SERIAL_CONTROL
                         let mut data = cmd.command.into_bytes();
-                        data.push(b'\n'); // Add newline to execute command
+                        data.push(b'\n');
 
                         let request = NshRequest {
                             request_id: cmd.request_id,
@@ -592,7 +490,7 @@ async fn main() {
                             timeout_ms: cmd.timeout_ms,
                         };
 
-                        match mav_io_nsh.send_nsh(request) {
+                        match mav.send_nsh(request) {
                             Ok(_) => {
                                 current_request_id = Some(cmd.request_id);
                                 response_buffer.clear();
@@ -613,24 +511,30 @@ async fn main() {
 
                     // Poll for responses (check every 10ms)
                     _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                        // Check for NSH responses
-                        while let Some(resp) = mav_io_nsh.try_recv_nsh() {
-                            response_buffer.extend_from_slice(&resp.data);
+                        if let Some(ref mav) = cached_mav_io {
+                            // Check for NSH responses
+                            while let Some(resp) = mav.try_recv_nsh() {
+                                response_buffer.extend_from_slice(&resp.data);
 
-                            if resp.complete {
-                                // Send complete response to WebSocket clients
-                                if let Some(req_id) = current_request_id.take() {
-                                    let output = String::from_utf8_lossy(&response_buffer).to_string();
-                                    debug!(request_id = req_id, len = output.len(), "NSH response complete");
+                                // Check for completion: either count==0 OR nsh> prompt detected
+                                let output_str = String::from_utf8_lossy(&response_buffer);
+                                let has_prompt = output_str.contains("nsh> \x1b[K") || output_str.trim_end().ends_with("nsh>");
+                                let is_complete = resp.complete || has_prompt;
 
-                                    let _ = nsh_resp_broadcast_tx.send(websocket::NshResponse {
-                                        request_id: req_id,
-                                        success: true,
-                                        complete: true,
-                                        output,
-                                    });
-                                    response_buffer.clear();
-                                    request_deadline = None;
+                                if is_complete {
+                                    if let Some(req_id) = current_request_id.take() {
+                                        let output = output_str.to_string();
+                                        debug!(request_id = req_id, len = output.len(), "NSH response complete");
+
+                                        let _ = nsh_resp_broadcast_tx.send(websocket::NshResponse {
+                                            request_id: req_id,
+                                            success: true,
+                                            complete: true,
+                                            output,
+                                        });
+                                        response_buffer.clear();
+                                        request_deadline = None;
+                                    }
                                 }
                             }
                         }
@@ -638,16 +542,22 @@ async fn main() {
                         // Check for request timeout
                         if let (Some(req_id), Some(deadline)) = (current_request_id, request_deadline) {
                             if tokio::time::Instant::now() >= deadline {
-                                warn!(request_id = req_id, "NSH request timed out");
                                 let partial = String::from_utf8_lossy(&response_buffer).to_string();
+                                // If we got output, treat as success (user got the data)
+                                let has_output = !partial.trim().is_empty();
+                                if has_output {
+                                    debug!(request_id = req_id, "NSH request completed with output (timeout fallback)");
+                                } else {
+                                    warn!(request_id = req_id, "NSH request timed out with no output");
+                                }
                                 let _ = nsh_resp_broadcast_tx.send(websocket::NshResponse {
                                     request_id: req_id,
-                                    success: false,
+                                    success: has_output, // Success if we got output
                                     complete: true,
                                     output: if partial.is_empty() {
                                         "Request timed out".to_string()
                                     } else {
-                                        format!("{}\n[timed out]", partial)
+                                        partial // Don't append [timed out] - user got the data
                                     },
                                 });
                                 current_request_id = None;
@@ -665,6 +575,193 @@ async fn main() {
         None
     };
 
+    // Spawn connection monitor/reconnection task (if we have or want a FC connection)
+    let reconnect_handle = if !sim_only_mode {
+        let shutdown_reconnect = shutdown.clone();
+        let mav_io_shared = mav_io.clone();
+        let conn_status_tx_reconnect = conn_status_tx.clone();
+        let _nsh_resp_broadcast_tx_reconnect = nsh_resp_broadcast_tx_for_reconnect;
+        let actuator_tx_reconnect = actuator_tx.clone();
+        let sim_mav_rx_reconnect = sim_mav_rx.clone();
+        let qgc_socket_reconnect = qgc_socket.clone();
+        let preferred_port = args.port.clone();
+        let baud = args.baud;
+
+        Some(tokio::spawn(async move {
+            info!("Connection manager started");
+
+            let mut retry_count: u8 = 0;
+            let mut current_mav_io: Option<Arc<MavlinkIo>> = None;
+            let mut receiver_handle: Option<tokio::task::JoinHandle<()>> = None;
+            let mut sender_handle: Option<tokio::task::JoinHandle<()>> = None;
+
+            // Send initial status - searching
+            let _ = conn_status_tx_reconnect.send(ConnectionStatus {
+                connected: false,
+                reconnecting: true,
+                retry_count: 0,
+                serial_port: String::new(),
+            });
+
+            loop {
+                if shutdown_reconnect.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                // Check if we have an active connection
+                let is_connected = current_mav_io.as_ref().map(|m| !m.is_disconnected()).unwrap_or(false);
+
+                if is_connected {
+                    // Connection is alive, just check periodically
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+
+                // Not connected - clean up old connection if any
+                if current_mav_io.is_some() {
+                    warn!("FC connection lost");
+                    current_mav_io = None;
+                    *mav_io_shared.write().await = None;
+
+                    // Abort old tasks
+                    if let Some(h) = receiver_handle.take() { h.abort(); }
+                    if let Some(h) = sender_handle.take() { h.abort(); }
+
+                    let _ = conn_status_tx_reconnect.send(ConnectionStatus {
+                        connected: false,
+                        reconnecting: true,
+                        retry_count,
+                        serial_port: String::new(),
+                    });
+                }
+
+                // Try to find a Pixhawk
+                let port_path = if let Some(ref p) = preferred_port {
+                    Some(p.clone())
+                } else {
+                    find_pixhawk_ports().into_iter().next()
+                };
+
+                let Some(port_path) = port_path else {
+                    // No FC found, wait and retry
+                    let delay = reconnect_delay(retry_count);
+                    debug!(retry_count, delay_ms = delay.as_millis(), "No FC found, waiting...");
+
+                    let _ = conn_status_tx_reconnect.send(ConnectionStatus {
+                        connected: false,
+                        reconnecting: true,
+                        retry_count,
+                        serial_port: String::new(),
+                    });
+
+                    tokio::time::sleep(delay).await;
+                    if retry_count < 255 { retry_count += 1; }
+                    continue;
+                };
+
+                info!(port = %port_path, "Found FC, connecting...");
+
+                // Create MAVLink I/O
+                let (mut new_mav_io, tx_to_app, rx_from_app, nsh_resp_tx, nsh_req_rx) = MavlinkIo::new();
+
+                match new_mav_io.spawn(&port_path, baud, tx_to_app, rx_from_app, nsh_resp_tx.clone(), nsh_req_rx).await {
+                    Ok(()) => {
+                        info!(port = %port_path, "Connected to FC!");
+                        retry_count = 0;
+
+                        let new_mav_io = Arc::new(new_mav_io);
+                        current_mav_io = Some(new_mav_io.clone());
+                        *mav_io_shared.write().await = Some(new_mav_io.clone());
+
+                        // Broadcast connected status
+                        let _ = conn_status_tx_reconnect.send(ConnectionStatus {
+                            connected: true,
+                            reconnecting: false,
+                            retry_count: 0,
+                            serial_port: port_path.clone(),
+                        });
+
+                        // Spawn receiver task (Pixhawk -> simulation + QGC)
+                        let mav_io_recv = new_mav_io.clone();
+                        let shutdown_recv = shutdown_reconnect.clone();
+                        let actuator_tx_recv = actuator_tx_reconnect.clone();
+                        let qgc_socket_recv = qgc_socket_reconnect.clone();
+                        receiver_handle = Some(tokio::spawn(async move {
+                            info!("MAVLink receiver task started");
+                            loop {
+                                if shutdown_recv.load(Ordering::Relaxed) || mav_io_recv.is_disconnected() {
+                                    break;
+                                }
+
+                                if let Some((header, msg)) = mav_io_recv.try_recv() {
+                                    // Forward to QGC via UDP
+                                    if let Some(ref socket) = qgc_socket_recv {
+                                        let mut buf = Vec::new();
+                                        if mavlink::write_v2_msg(&mut buf, header, &msg).is_ok() {
+                                            let _ = socket.send_to(&buf, qgc_target);
+                                        }
+                                    }
+
+                                    // Process HIL_ACTUATOR_CONTROLS
+                                    if let MavMessage::HIL_ACTUATOR_CONTROLS(_) = &msg {
+                                        if let Ok(actuator) = ActuatorOutputs::from_mavlink(&msg) {
+                                            let _ = actuator_tx_recv.send(actuator);
+                                        }
+                                    }
+                                } else {
+                                    tokio::time::sleep(Duration::from_micros(500)).await;
+                                }
+                            }
+                            info!("MAVLink receiver task exiting");
+                        }));
+
+                        // Spawn sender task (simulation -> Pixhawk)
+                        let mav_io_send = new_mav_io.clone();
+                        let shutdown_send = shutdown_reconnect.clone();
+                        let sim_mav_rx_send = sim_mav_rx_reconnect.clone();
+                        sender_handle = Some(tokio::spawn(async move {
+                            info!("MAVLink sender task started");
+                            loop {
+                                if shutdown_send.load(Ordering::Relaxed) || mav_io_send.is_disconnected() {
+                                    break;
+                                }
+
+                                match sim_mav_rx_send.recv_timeout(Duration::from_millis(10)) {
+                                    Ok(msg) => {
+                                        if mav_io_send.send(msg).is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                                }
+                            }
+                            info!("MAVLink sender task exiting");
+                        }));
+                    }
+                    Err(e) => {
+                        error!(error = %e, port = %port_path, "Failed to connect to FC");
+
+                        let delay = reconnect_delay(retry_count);
+                        tokio::time::sleep(delay).await;
+                        if retry_count < 255 { retry_count += 1; }
+                    }
+                }
+            }
+
+            info!("Connection manager exiting");
+        }))
+    } else {
+        // In sim-only mode, broadcast that we're not connected and not reconnecting
+        let _ = conn_status_tx.send(ConnectionStatus {
+            connected: false,
+            reconnecting: false,
+            retry_count: 0,
+            serial_port: "simulation".to_string(),
+        });
+        None
+    };
+
     info!("HITL Daemon running. Press Ctrl+C to stop.");
     info!(
         websocket_url = format!("ws://localhost:{}/ws", args.websocket_port),
@@ -674,7 +771,7 @@ async fn main() {
     if sim_only_mode {
         info!("Mode: SIMULATION ONLY (no flight controller)");
     } else {
-        info!("Mode: HARDWARE-IN-THE-LOOP (connected to Pixhawk)");
+        info!("Mode: HARDWARE-IN-THE-LOOP (scanning for FC...)");
     }
 
     // Wait for shutdown signal
@@ -695,6 +792,9 @@ async fn main() {
     ws_cmd_handle.abort();
     ws_state_handle.abort();
     if let Some(handle) = nsh_handle {
+        handle.abort();
+    }
+    if let Some(handle) = reconnect_handle {
         handle.abort();
     }
 
