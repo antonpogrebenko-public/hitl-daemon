@@ -5,7 +5,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
-/// Known Pixhawk vendor IDs
+/// Known PX4 vendor IDs
 const VID_3DR: u16 = 0x26AC;
 const VID_NXP: u16 = 0x1FC9;
 const VID_HOLYBRO_1: u16 = 0x2DAE;
@@ -52,8 +52,8 @@ pub enum SerialError {
         source: serialport::Error,
     },
 
-    #[error("No Pixhawk devices found")]
-    NoPixhawkFound,
+    #[error("No PX4 boards found")]
+    NoFcFound,
 }
 
 /// On macOS, convert `/dev/cu.XXX` to `/dev/tty.XXX` if the tty variant exists.
@@ -73,12 +73,12 @@ fn maybe_prefer_tty(port: &str) -> String {
     port.to_string()
 }
 
-/// Check if a USB vendor ID matches known Pixhawk manufacturers
+/// Check if a USB vendor ID matches known PX4 board manufacturers
 fn is_pixhawk_vid(vid: u16) -> bool {
     matches!(vid, VID_3DR | VID_NXP | VID_HOLYBRO_1 | VID_HOLYBRO_2)
 }
 
-/// Find all serial ports that appear to be Pixhawk flight controllers
+/// Find all serial ports that appear to be PX4-compatible flight controllers
 ///
 /// Detects by USB vendor ID:
 /// - 0x26AC: 3DR
@@ -111,7 +111,7 @@ pub fn find_pixhawk_ports() -> Vec<String> {
                     pid = format!("0x{:04X}", usb_info.pid),
                     manufacturer = usb_info.manufacturer.as_deref().unwrap_or("Unknown"),
                     product = usb_info.product.as_deref().unwrap_or("Unknown"),
-                    "Found Pixhawk device"
+                    "Found PX4 board"
                 );
                 if !pixhawk_ports.contains(&port_name) {
                     pixhawk_ports.push(port_name);

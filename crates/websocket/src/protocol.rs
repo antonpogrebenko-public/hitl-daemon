@@ -48,6 +48,8 @@ pub const MSG_TYPE_STATE_UPDATE: u8 = 0x01;
 pub const MSG_TYPE_HANDSHAKE_ACK: u8 = 0x02;
 pub const MSG_TYPE_COMMAND_ACK: u8 = 0x03;
 pub const MSG_TYPE_NSH_RESPONSE: u8 = 0x04;
+pub const MSG_TYPE_CONNECTION_STATUS: u8 = 0x05;
+pub const MSG_TYPE_VEHICLE_MESSAGE: u8 = 0x06;
 pub const MSG_TYPE_COMMAND: u8 = 0x10;
 pub const MSG_TYPE_HANDSHAKE: u8 = 0x11;
 pub const MSG_TYPE_NSH_COMMAND: u8 = 0x12;
@@ -207,6 +209,70 @@ pub struct HandshakeAck {
     pub version_minor: u8,
     pub pixhawk_connected: bool,
     pub serial_port: String,
+}
+
+/// Connection status update sent to browser when FC connection changes
+///
+/// ## Binary format (0x05)
+/// - `[0]`: 0x05 message type
+/// - `[1]`: connected (u8 bool)
+/// - `[2]`: reconnecting (u8 bool)
+/// - `[3]`: retry_count (u8)
+/// - `[4-N]`: serial_port string (null-terminated, empty if not connected)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectionStatus {
+    /// Whether Pixhawk is currently connected
+    pub connected: bool,
+    /// Whether daemon is actively trying to reconnect
+    pub reconnecting: bool,
+    /// Number of reconnection attempts so far
+    pub retry_count: u8,
+    /// Serial port path (empty if not connected)
+    pub serial_port: String,
+}
+
+impl ConnectionStatus {
+    /// Serialize to binary format
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(5 + self.serial_port.len() + 1);
+        buf.push(MSG_TYPE_CONNECTION_STATUS);
+        buf.push(self.connected as u8);
+        buf.push(self.reconnecting as u8);
+        buf.push(self.retry_count);
+        buf.extend_from_slice(self.serial_port.as_bytes());
+        buf.push(0); // null terminator
+        buf
+    }
+}
+
+/// Vehicle message from PX4 (STATUSTEXT)
+///
+/// ## Binary format (0x06)
+/// - `[0]`: 0x06 message type
+/// - `[1]`: severity (u8, MAVLink MAV_SEVERITY: 0=EMERGENCY, 7=DEBUG)
+/// - `[2-5]`: timestamp_ms (u32 LE, daemon timestamp when received)
+/// - `[6-N]`: text string (null-terminated UTF-8)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VehicleMessage {
+    /// MAVLink MAV_SEVERITY level (0=EMERGENCY, 1=ALERT, 2=CRITICAL, 3=ERROR, 4=WARNING, 5=NOTICE, 6=INFO, 7=DEBUG)
+    pub severity: u8,
+    /// Daemon timestamp when message was received (milliseconds since daemon start)
+    pub timestamp_ms: u32,
+    /// Message text from PX4
+    pub text: String,
+}
+
+impl VehicleMessage {
+    /// Serialize to binary format
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(7 + self.text.len());
+        buf.push(MSG_TYPE_VEHICLE_MESSAGE);
+        buf.push(self.severity);
+        buf.extend_from_slice(&self.timestamp_ms.to_le_bytes());
+        buf.extend_from_slice(self.text.as_bytes());
+        buf.push(0); // null terminator
+        buf
+    }
 }
 
 impl HandshakeAck {
@@ -472,6 +538,8 @@ pub enum OutgoingMessage {
     HandshakeAck(HandshakeAck),
     CommandAck(CommandAck),
     NshResponse(NshResponse),
+    ConnectionStatus(ConnectionStatus),
+    VehicleMessage(VehicleMessage),
 }
 
 impl OutgoingMessage {
@@ -481,6 +549,8 @@ impl OutgoingMessage {
             OutgoingMessage::HandshakeAck(h) => h.to_bytes(),
             OutgoingMessage::CommandAck(c) => c.to_bytes(),
             OutgoingMessage::NshResponse(n) => n.to_bytes(),
+            OutgoingMessage::ConnectionStatus(c) => c.to_bytes(),
+            OutgoingMessage::VehicleMessage(v) => v.to_bytes(),
         }
     }
 }

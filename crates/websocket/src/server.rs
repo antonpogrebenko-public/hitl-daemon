@@ -4,7 +4,7 @@
 //! client communication.
 
 use crate::handler::{ConnectionHandler, ValidatedCommand, ValidatedNshCommand};
-use crate::protocol::{OutgoingMessage, StateUpdate};
+use crate::protocol::{ConnectionStatus, OutgoingMessage, StateUpdate, VehicleMessage};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -50,6 +50,10 @@ struct AppState {
     update_interval: Duration,
     /// NSH response sender for broadcasting to clients
     nsh_resp_tx: Option<broadcast::Sender<crate::protocol::NshResponse>>,
+    /// Connection status sender for broadcasting to clients
+    conn_status_tx: Option<broadcast::Sender<ConnectionStatus>>,
+    /// Vehicle message sender for broadcasting to clients
+    vehicle_msg_tx: Option<broadcast::Sender<VehicleMessage>>,
 }
 
 /// WebSocket server for browser communication
@@ -65,6 +69,10 @@ pub struct WebSocketServer {
     nsh_tx: Option<mpsc::Sender<ValidatedNshCommand>>,
     /// Channel to receive NSH responses for broadcasting to clients
     nsh_resp_rx: Option<broadcast::Receiver<crate::protocol::NshResponse>>,
+    /// Channel to receive connection status updates for broadcasting to clients
+    conn_status_rx: Option<broadcast::Receiver<ConnectionStatus>>,
+    /// Channel to receive vehicle messages (STATUSTEXT) for broadcasting to clients
+    vehicle_msg_rx: Option<broadcast::Receiver<VehicleMessage>>,
 }
 
 impl WebSocketServer {
@@ -80,6 +88,8 @@ impl WebSocketServer {
             command_tx,
             nsh_tx: None,
             nsh_resp_rx: None,
+            conn_status_rx: None,
+            vehicle_msg_rx: None,
         }
     }
 
@@ -91,6 +101,16 @@ impl WebSocketServer {
     /// Set the NSH response receiver (for broadcasting responses to clients)
     pub fn set_nsh_response_receiver(&mut self, nsh_resp_rx: broadcast::Receiver<crate::protocol::NshResponse>) {
         self.nsh_resp_rx = Some(nsh_resp_rx);
+    }
+
+    /// Set the connection status receiver (for broadcasting status to clients)
+    pub fn set_connection_status_receiver(&mut self, conn_status_rx: broadcast::Receiver<ConnectionStatus>) {
+        self.conn_status_rx = Some(conn_status_rx);
+    }
+
+    /// Set the vehicle message receiver (for broadcasting STATUSTEXT messages to clients)
+    pub fn set_vehicle_message_receiver(&mut self, vehicle_msg_rx: broadcast::Receiver<VehicleMessage>) {
+        self.vehicle_msg_rx = Some(vehicle_msg_rx);
     }
 
     /// Get a sender for broadcasting state updates
@@ -122,12 +142,12 @@ impl WebSocketServer {
             state_rx,
         );
 
-        // Enable NSH support if sender is configured (implies Pixhawk is connected)
-        let pixhawk_connected = self.nsh_tx.is_some();
+        // Enable NSH support (always available; FC availability is tracked separately)
         if let Some(nsh_tx) = self.nsh_tx {
             handler.set_nsh_sender(nsh_tx);
         }
-        handler.set_pixhawk_connected(pixhawk_connected).await;
+        // Start with FC disconnected — connection manager will update via ConnectionStatus
+        handler.set_pixhawk_connected(false).await;
 
         let update_interval = Duration::from_secs_f64(1.0 / self.config.update_rate_hz as f64);
 
@@ -151,10 +171,60 @@ impl WebSocketServer {
             tx
         });
 
+        // Create connection status broadcast sender if we have a receiver
+        let handler_for_status = handler.clone();
+        let conn_status_tx = self.conn_status_rx.map(|rx| {
+            let (tx, _) = broadcast::channel(16);
+            let tx_clone = tx.clone();
+            let handler_clone = handler_for_status.clone();
+            tokio::spawn(async move {
+                let mut rx = rx;
+                loop {
+                    match rx.recv().await {
+                        Ok(status) => {
+                            info!(
+                                connected = status.connected,
+                                reconnecting = status.reconnecting,
+                                retry_count = status.retry_count,
+                                "Broadcasting connection status to clients"
+                            );
+                            // Update handler's FC connection status for new client handshakes
+                            handler_clone.set_pixhawk_connected(status.connected).await;
+                            let _ = tx_clone.send(status);
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    }
+                }
+            });
+            tx
+        });
+
+        // Create vehicle message broadcast sender if we have a receiver
+        let vehicle_msg_tx = self.vehicle_msg_rx.map(|rx| {
+            let (tx, _) = broadcast::channel(64);
+            let tx_clone = tx.clone();
+            tokio::spawn(async move {
+                let mut rx = rx;
+                loop {
+                    match rx.recv().await {
+                        Ok(msg) => {
+                            let _ = tx_clone.send(msg);
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    }
+                }
+            });
+            tx
+        });
+
         let app_state = Arc::new(AppState {
             handler,
             update_interval,
             nsh_resp_tx,
+            conn_status_tx,
+            vehicle_msg_tx,
         });
 
         // Build CORS layer — restrict origins in production, allow localhost for dev
@@ -219,6 +289,12 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     // Subscribe to NSH responses if available
     let mut nsh_resp_rx = state.nsh_resp_tx.as_ref().map(|tx| tx.subscribe());
 
+    // Subscribe to connection status updates if available
+    let mut conn_status_rx = state.conn_status_tx.as_ref().map(|tx| tx.subscribe());
+
+    // Subscribe to vehicle messages if available
+    let mut vehicle_msg_rx = state.vehicle_msg_tx.as_ref().map(|tx| tx.subscribe());
+
     // Channel for sending responses from the receive task to the send task
     let (response_tx, mut response_rx) = mpsc::channel::<OutgoingMessage>(32);
 
@@ -273,6 +349,58 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         Err(broadcast::error::RecvError::Closed) => {
                             // NSH channel closed, continue without it
                             nsh_resp_rx = None;
+                        }
+                    }
+                }
+                // Handle connection status updates (if available)
+                result = async {
+                    match conn_status_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match result {
+                        Ok(status) => {
+                            info!(
+                                client_id,
+                                connected = status.connected,
+                                reconnecting = status.reconnecting,
+                                "Sending connection status to client"
+                            );
+                            let msg = OutgoingMessage::ConnectionStatus(status);
+                            let bytes = msg.to_bytes();
+                            if ws_sender.send(Message::Binary(bytes.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            warn!(client_id, lagged = n, "Connection status receiver lagged");
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            conn_status_rx = None;
+                        }
+                    }
+                }
+                // Handle vehicle messages (if available)
+                result = async {
+                    match vehicle_msg_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match result {
+                        Ok(msg) => {
+                            let outgoing = OutgoingMessage::VehicleMessage(msg);
+                            let bytes = outgoing.to_bytes();
+                            if ws_sender.send(Message::Binary(bytes.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            warn!(client_id, lagged = n, "Vehicle message receiver lagged");
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            vehicle_msg_rx = None;
                         }
                     }
                 }

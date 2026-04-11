@@ -19,7 +19,7 @@ use std::thread;
 use std::time::Duration;
 use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use websocket::{CommandType, ConnectionStatus, StateUpdate, ValidatedNshCommand, WebSocketServer, WebSocketServerConfig};
+use websocket::{CommandType, ConnectionStatus, StateUpdate, ValidatedNshCommand, VehicleMessage, WebSocketServer, WebSocketServerConfig};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -331,6 +331,9 @@ async fn main() {
     // Broadcast channel for connection status (to WebSocket clients)
     let (conn_status_tx, _) = tokio::sync::broadcast::channel::<ConnectionStatus>(16);
 
+    // Broadcast channel for vehicle messages (STATUSTEXT from PX4)
+    let (vehicle_msg_tx, _) = tokio::sync::broadcast::channel::<VehicleMessage>(64);
+
     // Create WebSocket server
     let ws_config = WebSocketServerConfig {
         port: args.websocket_port,
@@ -347,6 +350,9 @@ async fn main() {
 
     // Always enable connection status broadcasting
     ws_server.set_connection_status_receiver(conn_status_tx.subscribe());
+
+    // Always enable vehicle message broadcasting
+    ws_server.set_vehicle_message_receiver(vehicle_msg_tx.subscribe());
 
     // Spawn WebSocket server task
     let serial_port_label = initial_port.clone().unwrap_or_else(|| "scanning".to_string());
@@ -686,6 +692,8 @@ async fn main() {
                         let shutdown_recv = shutdown_reconnect.clone();
                         let actuator_tx_recv = actuator_tx_reconnect.clone();
                         let qgc_socket_recv = qgc_socket_reconnect.clone();
+                        let vehicle_msg_tx_recv = vehicle_msg_tx.clone();
+                        let start_time = std::time::Instant::now();
                         receiver_handle = Some(tokio::spawn(async move {
                             info!("MAVLink receiver task started");
                             loop {
@@ -706,6 +714,24 @@ async fn main() {
                                     if let MavMessage::HIL_ACTUATOR_CONTROLS(_) = &msg {
                                         if let Ok(actuator) = ActuatorOutputs::from_mavlink(&msg) {
                                             let _ = actuator_tx_recv.send(actuator);
+                                        }
+                                    }
+
+                                    // Process STATUSTEXT messages for vehicle messages overlay
+                                    if let MavMessage::STATUSTEXT(status) = &msg {
+                                        let text = std::str::from_utf8(&status.text)
+                                            .unwrap_or("")
+                                            .trim_end_matches('\0')
+                                            .to_string();
+                                        if !text.is_empty() {
+                                            let severity = status.severity as u8;
+                                            let timestamp_ms = start_time.elapsed().as_millis() as u32;
+                                            debug!(severity = severity, text = %text, "STATUSTEXT received");
+                                            let _ = vehicle_msg_tx_recv.send(VehicleMessage {
+                                                severity,
+                                                timestamp_ms,
+                                                text,
+                                            });
                                         }
                                     }
                                 } else {

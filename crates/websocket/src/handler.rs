@@ -109,7 +109,7 @@ impl ConnectionHandler {
         client_id
     }
 
-    /// Set Pixhawk connection status
+    /// Set FC connection status
     pub async fn set_pixhawk_connected(&self, connected: bool) {
         *self.pixhawk_connected.write().await = connected;
     }
@@ -162,7 +162,7 @@ impl ConnectionHandler {
                 request_id: nsh.request_id,
                 success: false,
                 complete: true,
-                output: "NSH not available (no Pixhawk connected)".to_string(),
+                output: "NSH not available (no FC connected)".to_string(),
             });
         };
 

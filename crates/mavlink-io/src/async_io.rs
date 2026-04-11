@@ -4,6 +4,7 @@ use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
 use mavlink::{ardupilotmega::MavMessage, MavHeader};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinHandle;
@@ -14,6 +15,26 @@ use crate::messages::{COMPONENT_ID, SYSTEM_ID};
 
 /// Channel buffer size for send/receive queues
 const CHANNEL_BUFFER_SIZE: usize = 256;
+
+/// Reconnection timing constants
+const RECONNECT_BASE_DELAY_MS: u64 = 250;
+const RECONNECT_MAX_DELAY_MS: u64 = 1000;
+/// Maximum reconnection attempts (exported for use in main.rs)
+#[allow(dead_code)]
+pub const RECONNECT_MAX_ATTEMPTS: u8 = 255;
+
+/// Serial connection state broadcast to WebSocket clients
+#[derive(Debug, Clone, PartialEq)]
+pub struct SerialConnectionState {
+    /// Whether Pixhawk is currently connected via serial
+    pub connected: bool,
+    /// Whether daemon is actively trying to reconnect
+    pub reconnecting: bool,
+    /// Number of reconnection attempts so far (0 when connected)
+    pub retry_count: u8,
+    /// Serial port path (empty if not connected)
+    pub port: String,
+}
 
 #[derive(Debug, Error)]
 pub enum AsyncIoError {
@@ -265,6 +286,8 @@ impl MavlinkIo {
             }
         }
 
+        // Signal disconnect so the connection manager knows the FC is gone
+        shutdown.store(true, Ordering::SeqCst);
         info!("Reader task finished");
     }
 
@@ -385,6 +408,8 @@ impl MavlinkIo {
             }
         }
 
+        // Signal disconnect so the connection manager knows the FC is gone
+        shutdown.store(true, Ordering::SeqCst);
         info!("Writer task finished");
     }
 
@@ -429,6 +454,24 @@ impl Default for MavlinkIo {
         let (io, _, _, _, _) = Self::new();
         io
     }
+}
+
+impl MavlinkIo {
+    /// Check if the I/O tasks have shut down (connection lost)
+    pub fn is_disconnected(&self) -> bool {
+        self.shutdown.load(Ordering::Relaxed)
+    }
+
+    /// Signal disconnection (called when I/O error detected)
+    pub fn signal_disconnect(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Calculate reconnection delay with exponential backoff
+pub fn reconnect_delay(attempt: u8) -> Duration {
+    let delay_ms = RECONNECT_BASE_DELAY_MS * 2u64.pow(attempt.min(5) as u32);
+    Duration::from_millis(delay_ms.min(RECONNECT_MAX_DELAY_MS))
 }
 
 #[cfg(test)]

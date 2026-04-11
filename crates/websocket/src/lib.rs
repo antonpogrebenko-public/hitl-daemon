@@ -8,5 +8,5 @@ pub mod protocol;
 pub mod server;
 
 pub use handler::{ConnectionHandler, ValidatedCommand, ValidatedNshCommand};
-pub use protocol::{Command, CommandType, HandshakeAck, IncomingMessage, NshCommand, NshResponse, OutgoingMessage, StateUpdate};
+pub use protocol::{Command, CommandType, ConnectionStatus, HandshakeAck, IncomingMessage, NshCommand, NshResponse, OutgoingMessage, StateUpdate, VehicleMessage};
 pub use server::{WebSocketServer, WebSocketServerConfig};
