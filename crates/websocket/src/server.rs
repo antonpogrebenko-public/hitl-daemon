@@ -206,13 +206,21 @@ impl WebSocketServer {
             let tx_clone = tx.clone();
             tokio::spawn(async move {
                 let mut rx = rx;
+                info!("Vehicle message forwarder task started");
                 loop {
                     match rx.recv().await {
                         Ok(msg) => {
+                            info!(severity = msg.severity, text = %msg.text, "Forwarding vehicle message to clients");
                             let _ = tx_clone.send(msg);
                         }
-                        Err(broadcast::error::RecvError::Closed) => break,
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => {
+                            info!("Vehicle message channel closed");
+                            break;
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            warn!(lagged = n, "Vehicle message receiver lagged");
+                            continue;
+                        }
                     }
                 }
             });
@@ -390,6 +398,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 } => {
                     match result {
                         Ok(msg) => {
+                            info!(client_id, severity = msg.severity, text = %msg.text, "Sending vehicle message to client");
                             let outgoing = OutgoingMessage::VehicleMessage(msg);
                             let bytes = outgoing.to_bytes();
                             if ws_sender.send(Message::Binary(bytes.into())).await.is_err() {
