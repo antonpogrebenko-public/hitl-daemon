@@ -8,6 +8,7 @@ use crate::protocol::{
     OutgoingMessage, StateUpdate,
 };
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, RwLock};
@@ -66,6 +67,8 @@ pub struct ConnectionHandler {
     rate_limits: Arc<RwLock<HashMap<u64, (Instant, usize)>>>,
     /// Next client ID
     next_client_id: Arc<RwLock<u64>>,
+    /// Shutdown signal triggered by browser client
+    shutdown_signal: Arc<AtomicBool>,
 }
 
 impl ConnectionHandler {
@@ -76,6 +79,7 @@ impl ConnectionHandler {
         serial_port: String,
         command_tx: mpsc::Sender<ValidatedCommand>,
         state_rx: broadcast::Receiver<StateUpdate>,
+        shutdown_signal: Arc<AtomicBool>,
     ) -> Self {
         Self {
             version_major,
@@ -87,6 +91,7 @@ impl ConnectionHandler {
             state_rx,
             rate_limits: Arc::new(RwLock::new(HashMap::new())),
             next_client_id: Arc::new(RwLock::new(1)),
+            shutdown_signal,
         }
     }
 
@@ -151,7 +156,8 @@ impl ConnectionHandler {
                 Ok(Some(self.handle_nsh_command(client_id, nsh).await))
             }
             IncomingMessage::Shutdown => {
-                info!(client_id, "Received shutdown request (not yet implemented)");
+                info!(client_id, "Shutdown command received from browser");
+                self.shutdown_signal.store(true, Ordering::SeqCst);
                 Ok(None)
             }
         }
@@ -382,6 +388,7 @@ impl Clone for ConnectionHandler {
             state_rx: self.state_rx.resubscribe(),
             rate_limits: Arc::clone(&self.rate_limits),
             next_client_id: Arc::clone(&self.next_client_id),
+            shutdown_signal: Arc::clone(&self.shutdown_signal),
         }
     }
 }
@@ -395,8 +402,9 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
         let (state_tx, state_rx) = broadcast::channel(16);
         drop(state_tx); // We don't need to send states in these tests
+        let shutdown = Arc::new(AtomicBool::new(false));
 
-        let handler = ConnectionHandler::new(1, 0, "/dev/test".to_string(), cmd_tx, state_rx);
+        let handler = ConnectionHandler::new(1, 0, "/dev/test".to_string(), cmd_tx, state_rx, shutdown);
 
         (handler, cmd_rx)
     }

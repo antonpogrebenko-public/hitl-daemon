@@ -16,6 +16,7 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
@@ -73,6 +74,8 @@ pub struct WebSocketServer {
     conn_status_rx: Option<broadcast::Receiver<ConnectionStatus>>,
     /// Channel to receive vehicle messages (STATUSTEXT) for broadcasting to clients
     vehicle_msg_rx: Option<broadcast::Receiver<VehicleMessage>>,
+    /// Shutdown signal that browser can trigger
+    shutdown_signal: Arc<AtomicBool>,
 }
 
 impl WebSocketServer {
@@ -90,7 +93,13 @@ impl WebSocketServer {
             nsh_resp_rx: None,
             conn_status_rx: None,
             vehicle_msg_rx: None,
+            shutdown_signal: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Get the shutdown signal (set to true when a browser sends 0x07 shutdown command)
+    pub fn shutdown_signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.shutdown_signal)
     }
 
     /// Set the NSH command channel (enables NSH support)
@@ -140,6 +149,7 @@ impl WebSocketServer {
             serial_port,
             self.command_tx.clone(),
             state_rx,
+            self.shutdown_signal.clone(),
         );
 
         // Enable NSH support (always available; FC availability is tracked separately)
