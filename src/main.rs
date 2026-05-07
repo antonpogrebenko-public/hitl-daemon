@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tracing::{debug, error, info, trace, warn};
+use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use websocket::{CommandType, ConnectionStatus, StateUpdate, ValidatedNshCommand, VehicleMessage, WebSocketServer, WebSocketServerConfig};
 
@@ -64,16 +65,42 @@ struct Args {
     #[arg(long)]
     sim_only: bool,
 
+    /// Write logs to this file in addition to stdout (e.g. /tmp/hitl.log)
+    #[arg(long)]
+    log_file: Option<String>,
+
     /// UDP port for QGroundControl bridge (0 to disable)
     #[arg(long, default_value = "14550")]
     qgc_udp: u16,
 }
 
-fn init_tracing() {
-    tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+fn init_tracing(log_file: Option<&str>) -> Option<WorkerGuard> {
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let stdout_layer = tracing_subscriber::fmt::layer();
+
+    if let Some(path) = log_file {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("Failed to open log file");
+        let (file_writer, guard) = tracing_appender::non_blocking(file);
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(file_writer);
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(stdout_layer)
+            .with(file_layer)
+            .init();
+        Some(guard)
+    } else {
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(stdout_layer)
+            .init();
+        None
+    }
 }
 
 fn detect_or_use_port(specified_port: Option<String>) -> Option<String> {
@@ -194,9 +221,8 @@ fn create_state_update(sim_state: &SimulationState) -> StateUpdate {
 
 #[tokio::main]
 async fn main() {
-    init_tracing();
-
     let args = Args::parse();
+    let _log_guard = init_tracing(args.log_file.as_deref());
 
     info!(version = VERSION, "Starting HITL Daemon");
 
@@ -607,6 +633,7 @@ async fn main() {
                 reconnecting: true,
                 retry_count: 0,
                 serial_port: String::new(),
+                fc_model: None,
             });
 
             loop {
@@ -638,6 +665,7 @@ async fn main() {
                         reconnecting: true,
                         retry_count,
                         serial_port: String::new(),
+                        fc_model: None,
                     });
                 }
 
@@ -658,6 +686,7 @@ async fn main() {
                         reconnecting: true,
                         retry_count,
                         serial_port: String::new(),
+                        fc_model: None,
                     });
 
                     tokio::time::sleep(delay).await;
@@ -685,6 +714,7 @@ async fn main() {
                             reconnecting: false,
                             retry_count: 0,
                             serial_port: port_path.clone(),
+                            fc_model: None,
                         });
 
                         // Spawn receiver task (Pixhawk -> simulation + QGC)
@@ -741,17 +771,35 @@ async fn main() {
                             info!("MAVLink receiver task exiting");
                         }));
 
-                        // Spawn sender task (simulation -> Pixhawk)
+                        // Spawn sender task (simulation -> Pixhawk + QGC -> Pixhawk)
                         let mav_io_send = new_mav_io.clone();
                         let shutdown_send = shutdown_reconnect.clone();
                         let sim_mav_rx_send = sim_mav_rx_reconnect.clone();
+                        let qgc_socket_send = qgc_socket_reconnect.clone();
                         sender_handle = Some(tokio::spawn(async move {
                             info!("MAVLink sender task started");
+                            let mut qgc_recv_buf = [0u8; 280]; // MAVLink v2 max frame size
                             loop {
                                 if shutdown_send.load(Ordering::Relaxed) || mav_io_send.is_disconnected() {
                                     break;
                                 }
 
+                                // Poll for messages from QGC (parameters, commands)
+                                if let Some(ref socket) = qgc_socket_send {
+                                    while let Ok((len, _addr)) = socket.recv_from(&mut qgc_recv_buf) {
+                                        use mavlink::peek_reader::PeekReader;
+                                        let cursor = std::io::Cursor::new(&qgc_recv_buf[..len]);
+                                        let mut reader = PeekReader::new(cursor);
+                                        if let Ok((_header, msg)) = mavlink::read_v2_msg::<MavMessage, _>(&mut reader) {
+                                            trace!("QGC -> Pixhawk: {:?}", msg);
+                                            if mav_io_send.send(msg).is_err() {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Forward simulation sensor messages to Pixhawk
                                 match sim_mav_rx_send.recv_timeout(Duration::from_millis(10)) {
                                     Ok(msg) => {
                                         if mav_io_send.send(msg).is_err() {
@@ -784,6 +832,7 @@ async fn main() {
             reconnecting: false,
             retry_count: 0,
             serial_port: "simulation".to_string(),
+            fc_model: None,
         });
         None
     };

@@ -25,7 +25,6 @@ const BLOCKED_NSH_COMMANDS: &[&str] = &[
     "format",
     "hardfault_log",
     "bl_update",
-    "param reset_all",
 ];
 
 /// Takeoff altitude bounds (meters)
@@ -150,6 +149,10 @@ impl ConnectionHandler {
             IncomingMessage::NshCommand(nsh) => {
                 debug!(client_id, request_id = nsh.request_id, cmd = %nsh.command, "Received NSH command");
                 Ok(Some(self.handle_nsh_command(client_id, nsh).await))
+            }
+            IncomingMessage::Shutdown => {
+                info!(client_id, "Received shutdown request (not yet implemented)");
+                Ok(None)
             }
         }
     }

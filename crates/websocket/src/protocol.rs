@@ -14,7 +14,8 @@
 //! - `[81]`: battery_percent (u8)
 //! - `[82]`: armed (u8 bool)
 //! - `[83]`: flight_mode (u8)
-//! - Total: 84 bytes
+//! - `[84-85]`: packets_per_sec (u16 LE)
+//! - Total: 86 bytes
 //!
 //! ## 0x02: Handshake ACK
 //! - `[0]`: 0x02 message type
@@ -53,9 +54,10 @@ pub const MSG_TYPE_VEHICLE_MESSAGE: u8 = 0x06;
 pub const MSG_TYPE_COMMAND: u8 = 0x10;
 pub const MSG_TYPE_HANDSHAKE: u8 = 0x11;
 pub const MSG_TYPE_NSH_COMMAND: u8 = 0x12;
+pub const MSG_TYPE_SHUTDOWN: u8 = 0x07;
 
 // State update size
-pub const STATE_UPDATE_SIZE: usize = 84;
+pub const STATE_UPDATE_SIZE: usize = 86;
 
 #[derive(Debug, Error)]
 pub enum ProtocolError {
@@ -88,10 +90,11 @@ pub struct StateUpdate {
     pub battery_percent: u8,
     pub armed: bool,
     pub flight_mode: u8,
+    pub packets_per_sec: u16,
 }
 
 impl StateUpdate {
-    /// Serialize to binary format (84 bytes)
+    /// Serialize to binary format (86 bytes)
     pub fn to_bytes(&self) -> [u8; STATE_UPDATE_SIZE] {
         let mut buf = [0u8; STATE_UPDATE_SIZE];
 
@@ -133,6 +136,7 @@ impl StateUpdate {
         buf[81] = self.battery_percent;
         buf[82] = self.armed as u8;
         buf[83] = self.flight_mode;
+        buf[84..86].copy_from_slice(&self.packets_per_sec.to_le_bytes());
 
         buf
     }
@@ -186,6 +190,7 @@ impl StateUpdate {
         let battery_percent = data[81];
         let armed = data[82] != 0;
         let flight_mode = data[83];
+        let packets_per_sec = u16::from_le_bytes(data[84..86].try_into().unwrap());
 
         Ok(Self {
             timestamp_us,
@@ -198,6 +203,7 @@ impl StateUpdate {
             battery_percent,
             armed,
             flight_mode,
+            packets_per_sec,
         })
     }
 }
@@ -219,6 +225,7 @@ pub struct HandshakeAck {
 /// - `[2]`: reconnecting (u8 bool)
 /// - `[3]`: retry_count (u8)
 /// - `[4-N]`: serial_port string (null-terminated, empty if not connected)
+/// - `[N+1-M]`: fc_model string (null-terminated, empty if unknown)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionStatus {
     /// Whether Pixhawk is currently connected
@@ -229,18 +236,23 @@ pub struct ConnectionStatus {
     pub retry_count: u8,
     /// Serial port path (empty if not connected)
     pub serial_port: String,
+    /// FC model string from HEARTBEAT autopilot version (None if unknown)
+    pub fc_model: Option<String>,
 }
 
 impl ConnectionStatus {
     /// Serialize to binary format
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(5 + self.serial_port.len() + 1);
+        let fc_model_str = self.fc_model.as_deref().unwrap_or("");
+        let mut buf = Vec::with_capacity(5 + self.serial_port.len() + 1 + fc_model_str.len() + 1);
         buf.push(MSG_TYPE_CONNECTION_STATUS);
         buf.push(self.connected as u8);
         buf.push(self.reconnecting as u8);
         buf.push(self.retry_count);
         buf.extend_from_slice(self.serial_port.as_bytes());
-        buf.push(0); // null terminator
+        buf.push(0); // null terminator for serial_port
+        buf.extend_from_slice(fc_model_str.as_bytes());
+        buf.push(0); // null terminator for fc_model
         buf
     }
 }
@@ -561,6 +573,7 @@ pub enum IncomingMessage {
     Command(Command),
     Handshake,
     NshCommand(NshCommand),
+    Shutdown,
 }
 
 impl IncomingMessage {
@@ -577,6 +590,7 @@ impl IncomingMessage {
             MSG_TYPE_COMMAND => Ok(IncomingMessage::Command(Command::from_bytes(data)?)),
             MSG_TYPE_HANDSHAKE => Ok(IncomingMessage::Handshake),
             MSG_TYPE_NSH_COMMAND => Ok(IncomingMessage::NshCommand(NshCommand::from_bytes(data)?)),
+            MSG_TYPE_SHUTDOWN => Ok(IncomingMessage::Shutdown),
             other => Err(ProtocolError::UnknownMessageType(other)),
         }
     }
@@ -599,6 +613,7 @@ mod tests {
             battery_percent: 85,
             armed: true,
             flight_mode: 3,
+            packets_per_sec: 349,
         };
 
         let bytes = state.to_bytes();
@@ -616,6 +631,59 @@ mod tests {
         assert_eq!(parsed.battery_percent, state.battery_percent);
         assert_eq!(parsed.armed, state.armed);
         assert_eq!(parsed.flight_mode, state.flight_mode);
+        assert_eq!(parsed.packets_per_sec, state.packets_per_sec);
+    }
+
+    #[test]
+    fn test_shutdown_message() {
+        let bytes = [MSG_TYPE_SHUTDOWN];
+        let msg = IncomingMessage::from_bytes(&bytes).unwrap();
+        assert!(matches!(msg, IncomingMessage::Shutdown));
+    }
+
+    #[test]
+    fn test_connection_status_with_fc_model() {
+        let status = ConnectionStatus {
+            connected: true,
+            reconnecting: false,
+            retry_count: 0,
+            serial_port: "/dev/tty.usb".to_string(),
+            fc_model: Some("Pixhawk 6C".to_string()),
+        };
+        let bytes = status.to_bytes();
+        assert_eq!(bytes[0], MSG_TYPE_CONNECTION_STATUS);
+        assert_eq!(bytes[1], 1); // connected
+        assert_eq!(bytes[2], 0); // not reconnecting
+        assert_eq!(bytes[3], 0); // retry_count
+
+        // Find null terminators
+        let port_null = bytes[4..].iter().position(|&b| b == 0).unwrap() + 4;
+        let port_str = std::str::from_utf8(&bytes[4..port_null]).unwrap();
+        assert_eq!(port_str, "/dev/tty.usb");
+
+        let model_start = port_null + 1;
+        let model_null = bytes[model_start..].iter().position(|&b| b == 0).unwrap() + model_start;
+        let model_str = std::str::from_utf8(&bytes[model_start..model_null]).unwrap();
+        assert_eq!(model_str, "Pixhawk 6C");
+    }
+
+    #[test]
+    fn test_connection_status_without_fc_model() {
+        let status = ConnectionStatus {
+            connected: false,
+            reconnecting: true,
+            retry_count: 3,
+            serial_port: String::new(),
+            fc_model: None,
+        };
+        let bytes = status.to_bytes();
+        assert_eq!(bytes[1], 0); // not connected
+        assert_eq!(bytes[2], 1); // reconnecting
+        assert_eq!(bytes[3], 3); // retry_count
+        // Empty serial port: null terminator at index 4
+        assert_eq!(bytes[4], 0);
+        // Empty fc_model: null terminator at index 5
+        assert_eq!(bytes[5], 0);
     }
 
     #[test]
