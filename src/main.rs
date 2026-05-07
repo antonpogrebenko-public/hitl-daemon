@@ -8,7 +8,7 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use mavlink::ardupilotmega::MavMessage;
 use mavlink_io::async_io::{MavlinkIo, NshRequest, reconnect_delay};
 use mavlink_io::serial::find_pixhawk_ports;
-use protocol::ActuatorOutputs;
+use protocol::{ActuatorOutputs, DaemonState, DaemonStatus};
 use hitl_physics::throttle_to_omega;
 use hitl_sensors::{ImuConfig, SensorsConfig};
 use simulation::{SimulationConfig, SimulationLoop, SimulationState};
@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use tokio::sync::watch;
 use tracing::{debug, error, info, trace, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -76,32 +77,66 @@ struct Args {
     qgc_udp: u16,
 }
 
-fn init_tracing(log_file: Option<&str>) -> Option<WorkerGuard> {
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let stdout_layer = tracing_subscriber::fmt::layer();
+enum TracingMode {
+    Tui { log_rx: std::sync::mpsc::Receiver<String> },
+    Plain,
+}
 
-    if let Some(path) = log_file {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .expect("Failed to open log file");
-        let (file_writer, guard) = tracing_appender::non_blocking(file);
-        let file_layer = tracing_subscriber::fmt::layer()
-            .with_ansi(false)
-            .with_writer(file_writer);
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(stdout_layer)
-            .with(file_layer)
-            .init();
-        Some(guard)
+fn init_tracing(log_file: Option<&str>, tui_mode: bool) -> (Option<WorkerGuard>, TracingMode) {
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    if tui_mode {
+        let (log_tx, log_rx) = std::sync::mpsc::sync_channel::<String>(512);
+        let tui_layer = tui::TuiLayer::new(log_tx);
+
+        if let Some(path) = log_file {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .expect("Failed to open log file");
+            let (file_writer, guard) = tracing_appender::non_blocking(file);
+            let file_layer = tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(file_writer);
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(tui_layer)
+                .with(file_layer)
+                .init();
+            (Some(guard), TracingMode::Tui { log_rx })
+        } else {
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(tui_layer)
+                .init();
+            (None, TracingMode::Tui { log_rx })
+        }
     } else {
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(stdout_layer)
-            .init();
-        None
+        let stdout_layer = tracing_subscriber::fmt::layer();
+        if let Some(path) = log_file {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .expect("Failed to open log file");
+            let (file_writer, guard) = tracing_appender::non_blocking(file);
+            let file_layer = tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(file_writer);
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(stdout_layer)
+                .with(file_layer)
+                .init();
+            (Some(guard), TracingMode::Plain)
+        } else {
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(stdout_layer)
+                .init();
+            (None, TracingMode::Plain)
+        }
     }
 }
 
@@ -187,7 +222,7 @@ fn spawn_sim_only_actuator_thread(
 }
 
 /// Create WebSocket state update from simulation state
-fn create_state_update(sim_state: &SimulationState) -> StateUpdate {
+fn create_state_update(sim_state: &SimulationState, packets_per_sec: u16) -> StateUpdate {
     let state = sim_state.read();
     let q = &state.quadrotor;
 
@@ -218,13 +253,15 @@ fn create_state_update(sim_state: &SimulationState) -> StateUpdate {
         battery_percent: 100,
         armed: state.armed,
         flight_mode: state.flight_mode,
+        packets_per_sec,
     }
 }
 
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
-    let _log_guard = init_tracing(args.log_file.as_deref());
+    let is_tty = atty::is(atty::Stream::Stdout);
+    let (_log_guard, tracing_mode) = init_tracing(args.log_file.as_deref(), is_tty);
 
     info!(version = VERSION, "Starting HITL Daemon");
 
@@ -308,6 +345,25 @@ async fn main() {
         shutdown_ctrlc.store(true, Ordering::SeqCst);
     });
 
+    // DaemonStatus watch channel (TUI reads this at 2Hz)
+    let (status_tx, status_rx) = watch::channel(DaemonStatus::default());
+
+    // Spawn TUI thread if in TUI mode
+    let tui_handle = match tracing_mode {
+        TracingMode::Tui { log_rx } => {
+            let tui_shutdown = shutdown.clone();
+            Some(
+                thread::Builder::new()
+                    .name("tui".to_string())
+                    .spawn(move || {
+                        tui::run_tui(status_rx, log_rx, tui_shutdown);
+                    })
+                    .expect("Failed to spawn TUI thread"),
+            )
+        }
+        TracingMode::Plain => None,
+    };
+
     // Spawn simulation thread
     let (sim_handle, sim_state) = spawn_simulation_thread(
         sim_config,
@@ -382,6 +438,9 @@ async fn main() {
     // Always enable vehicle message broadcasting
     ws_server.set_vehicle_message_receiver(vehicle_msg_tx.subscribe());
 
+    // Get browser shutdown signal before ws_server is moved
+    let ws_shutdown = ws_server.shutdown_signal();
+
     // Spawn WebSocket server task
     let serial_port_label = initial_port.clone().unwrap_or_else(|| "scanning".to_string());
     let ws_handle = tokio::spawn(async move {
@@ -397,6 +456,25 @@ async fn main() {
             error!("WebSocket server error: {}", e);
         }
     });
+
+    // Merge browser shutdown with main shutdown
+    let shutdown_merge = shutdown.clone();
+    tokio::spawn(async move {
+        loop {
+            if ws_shutdown.load(Ordering::Relaxed) {
+                info!("Shutdown triggered from browser");
+                shutdown_merge.store(true, Ordering::SeqCst);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+
+    // Shared FC model (set once when HEARTBEAT identifies the FC)
+    let fc_model: Arc<tokio::sync::RwLock<Option<String>>> = Arc::new(tokio::sync::RwLock::new(None));
+
+    // Shared packets_per_sec (updated every second by status task)
+    let packets_per_sec_shared = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
     // Spawn task to handle WebSocket commands
     let shutdown_ws_cmd = shutdown.clone();
@@ -441,14 +519,71 @@ async fn main() {
     // Spawn task to broadcast state updates to WebSocket clients
     let shutdown_ws_state = shutdown.clone();
     let sim_state_broadcast = sim_state.clone();
+    let pps_for_state = packets_per_sec_shared.clone();
     let ws_state_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(33)); // ~30 Hz
 
         while !shutdown_ws_state.load(Ordering::Relaxed) {
             interval.tick().await;
 
-            let state_update = create_state_update(&sim_state_broadcast);
+            let pps = pps_for_state.load(Ordering::Relaxed) as u16;
+            let state_update = create_state_update(&sim_state_broadcast, pps);
             let _ = state_tx.send(state_update);
+        }
+    });
+
+    // Status updater task (updates DaemonStatus for TUI at 2Hz, calculates packets/sec every second)
+    let shutdown_status = shutdown.clone();
+    let mav_io_status = mav_io.clone();
+    let fc_model_status = fc_model.clone();
+    let pps_for_status = packets_per_sec_shared.clone();
+    let start_time_status = std::time::Instant::now();
+    let status_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(500));
+        let mut tick_count: u8 = 0;
+
+        loop {
+            if shutdown_status.load(Ordering::Relaxed) {
+                break;
+            }
+            interval.tick().await;
+
+            // Every second (every 2 ticks at 500ms), compute packets/sec
+            tick_count = tick_count.wrapping_add(1);
+            if tick_count % 2 == 0 {
+                if let Some(ref mav) = *mav_io_status.read().await {
+                    let count = mav.take_packet_count();
+                    pps_for_status.store(count, Ordering::Relaxed);
+                } else {
+                    pps_for_status.store(0, Ordering::Relaxed);
+                }
+            }
+
+            // Derive daemon state
+            let mav_connected = mav_io_status.read().await.is_some();
+            let current_pps = pps_for_status.load(Ordering::Relaxed);
+            let state = if shutdown_status.load(Ordering::Relaxed) {
+                DaemonState::ShuttingDown
+            } else if sim_only_mode {
+                DaemonState::Streaming
+            } else if mav_connected && current_pps > 0 {
+                DaemonState::Streaming
+            } else if mav_connected {
+                DaemonState::Connected
+            } else {
+                DaemonState::WaitingForFc
+            };
+
+            let model = fc_model_status.read().await.clone();
+
+            let _ = status_tx.send(DaemonStatus {
+                state,
+                fc_model: model,
+                serial_port: None,
+                packets_per_sec: current_pps.min(u16::MAX as u32) as u16,
+                connected_clients: 0,
+                uptime_secs: start_time_status.elapsed().as_secs(),
+            });
         }
     });
 
@@ -618,6 +753,7 @@ async fn main() {
         let actuator_tx_reconnect = actuator_tx.clone();
         let sim_mav_rx_reconnect = sim_mav_rx.clone();
         let qgc_socket_reconnect = qgc_socket.clone();
+        let fc_model_reconnect = fc_model.clone();
         let preferred_port = args.port.clone();
         let baud = args.baud;
 
@@ -725,6 +861,9 @@ async fn main() {
                         let actuator_tx_recv = actuator_tx_reconnect.clone();
                         let qgc_socket_recv = qgc_socket_reconnect.clone();
                         let vehicle_msg_tx_recv = vehicle_msg_tx.clone();
+                        let fc_model_recv = fc_model_reconnect.clone();
+                        let conn_status_tx_recv = conn_status_tx_reconnect.clone();
+                        let port_path_recv = port_path.clone();
                         let start_time = std::time::Instant::now();
                         receiver_handle = Some(tokio::spawn(async move {
                             info!("MAVLink receiver task started");
@@ -764,6 +903,36 @@ async fn main() {
                                                 timestamp_ms,
                                                 text,
                                             });
+                                        }
+                                    }
+
+                                    // Extract FC model from first HEARTBEAT
+                                    if let MavMessage::HEARTBEAT(hb) = &msg {
+                                        use mavlink::ardupilotmega::{MavAutopilot, MavType};
+                                        let mut model = fc_model_recv.write().await;
+                                        if model.is_none() {
+                                            if hb.autopilot != MavAutopilot::MAV_AUTOPILOT_INVALID {
+                                                let name = match hb.autopilot {
+                                                    MavAutopilot::MAV_AUTOPILOT_PX4 => match hb.mavtype {
+                                                        MavType::MAV_TYPE_QUADROTOR => "PX4 Quadrotor",
+                                                        MavType::MAV_TYPE_HEXAROTOR => "PX4 Hexarotor",
+                                                        MavType::MAV_TYPE_OCTOROTOR => "PX4 Octorotor",
+                                                        MavType::MAV_TYPE_FIXED_WING => "PX4 Fixed Wing",
+                                                        _ => "PX4 Vehicle",
+                                                    },
+                                                    MavAutopilot::MAV_AUTOPILOT_ARDUPILOTMEGA => "ArduPilot",
+                                                    _ => "Unknown FC",
+                                                };
+                                                info!(fc_model = name, "Flight controller identified");
+                                                *model = Some(name.to_string());
+                                                let _ = conn_status_tx_recv.send(ConnectionStatus {
+                                                    connected: true,
+                                                    reconnecting: false,
+                                                    retry_count: 0,
+                                                    serial_port: port_path_recv.clone(),
+                                                    fc_model: Some(name.to_string()),
+                                                });
+                                            }
                                         }
                                     }
                                 } else {
@@ -868,6 +1037,7 @@ async fn main() {
     ws_handle.abort();
     ws_cmd_handle.abort();
     ws_state_handle.abort();
+    status_handle.abort();
     if let Some(handle) = nsh_handle {
         handle.abort();
     }
@@ -877,6 +1047,11 @@ async fn main() {
 
     // Wait for threads
     for handle in thread_handles {
+        let _ = handle.join();
+    }
+
+    // Wait for TUI thread
+    if let Some(handle) = tui_handle {
         let _ = handle.join();
     }
 
