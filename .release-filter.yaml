@@ -1,0 +1,16 @@
+exclude_paths:
+  - "th3seus-infra/.*"
+  - ".github/.*"
+  - ".*\\.secret.*"
+  - "th3seus-tools/.*"
+  - "docs/.*"
+
+exclude_keywords:
+  - "internal"
+  - "secret"
+  - "credential"
+  - "wip"
+  - "debug"
+  - "fixup"
+  - "squash"
+  - "tmp"
