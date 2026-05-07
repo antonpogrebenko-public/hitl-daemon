@@ -4,9 +4,9 @@ use mavlink::ardupilotmega::{MavMessage, MavModeFlag, HIL_ACTUATOR_CONTROLS_DATA
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Motor channel mapping from PX4 to simulation.
+/// Motor channel mapping from PX4 HIL_ACTUATOR_CONTROLS to simulation.
 ///
-/// PX4 Quadcopter X (4001) motor layout:
+/// Simulation motor numbering matches PX4 Standard Quad X directly — no remapping needed:
 /// ```text
 ///     Front
 ///   3(CW)   1(CCW)
@@ -16,20 +16,9 @@ use thiserror::Error;
 ///   2(CCW)  4(CW)
 ///     Back
 /// ```
-///
-/// Simulation motor layout:
-/// ```text
-///     Front
-///   1(CW)   2(CCW)
-///      \   /
-///        X
-///      /   \
-///   4(CCW) 3(CW)
-///     Back
-/// ```
-///
-/// Mapping: sim_motor[i] = px4_channel[PX4_TO_SIM_MOTOR_MAP[i]]
-pub const PX4_TO_SIM_MOTOR_MAP: [usize; 4] = [2, 0, 3, 1];
+/// ch0 → Motor 1 (FR, CCW), ch1 → Motor 2 (BL, CCW)
+/// ch2 → Motor 3 (FL, CW),  ch3 → Motor 4 (BR, CW)
+pub const PX4_TO_SIM_MOTOR_MAP: [usize; 4] = [0, 1, 2, 3];
 
 /// Flight mode indicators from HIL_ACTUATOR_CONTROLS
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +34,62 @@ pub enum FlightMode {
 impl Default for FlightMode {
     fn default() -> Self {
         FlightMode::Disarmed
+    }
+}
+
+/// Daemon operational state for TUI and status reporting
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DaemonState {
+    Starting,
+    WaitingForFc,
+    Connected,
+    Streaming,
+    FcLost,
+    Reconnecting,
+    ShuttingDown,
+}
+
+impl Default for DaemonState {
+    fn default() -> Self {
+        DaemonState::Starting
+    }
+}
+
+impl std::fmt::Display for DaemonState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DaemonState::Starting => write!(f, "Starting"),
+            DaemonState::WaitingForFc => write!(f, "Waiting for FC"),
+            DaemonState::Connected => write!(f, "Connected"),
+            DaemonState::Streaming => write!(f, "Streaming"),
+            DaemonState::FcLost => write!(f, "FC Lost"),
+            DaemonState::Reconnecting => write!(f, "Reconnecting"),
+            DaemonState::ShuttingDown => write!(f, "Shutting Down"),
+        }
+    }
+}
+
+/// Daemon status for TUI display and web status widget
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonStatus {
+    pub state: DaemonState,
+    pub fc_model: Option<String>,
+    pub serial_port: Option<String>,
+    pub packets_per_sec: u16,
+    pub connected_clients: u8,
+    pub uptime_secs: u64,
+}
+
+impl Default for DaemonStatus {
+    fn default() -> Self {
+        Self {
+            state: DaemonState::Starting,
+            fc_model: None,
+            serial_port: None,
+            packets_per_sec: 0,
+            connected_clients: 0,
+            uptime_secs: 0,
+        }
     }
 }
 
@@ -161,11 +206,11 @@ mod tests {
     #[test]
     fn test_from_hil_actuator_controls() {
         let mut controls = [0.0f32; 16];
-        // PX4 channels: 0=FR, 1=BL, 2=FL, 3=BR
-        controls[0] = 0.1;  // PX4 Motor 1 (FR) -> Sim Motor 2
-        controls[1] = 0.2;  // PX4 Motor 2 (BL) -> Sim Motor 4
-        controls[2] = 0.3;  // PX4 Motor 3 (FL) -> Sim Motor 1
-        controls[3] = 0.4;  // PX4 Motor 4 (BR) -> Sim Motor 3
+        // PX4 channels match sim motors 1-4 directly (Standard Quad X)
+        controls[0] = 0.1;  // ch0 = Motor 1 (FR, CCW)
+        controls[1] = 0.2;  // ch1 = Motor 2 (BL, CCW)
+        controls[2] = 0.3;  // ch2 = Motor 3 (FL, CW)
+        controls[3] = 0.4;  // ch3 = Motor 4 (BR, CW)
 
         let data = HIL_ACTUATOR_CONTROLS_DATA {
             time_usec: 1000000,
@@ -181,15 +226,11 @@ mod tests {
         assert!(outputs.is_armed());
         assert!(outputs.is_hil_active());
 
-        // Verify motor remapping: PX4_TO_SIM_MOTOR_MAP = [2, 0, 3, 1]
-        // sim_motors[0] = px4[2] = 0.3 (FL)
-        // sim_motors[1] = px4[0] = 0.1 (FR)
-        // sim_motors[2] = px4[3] = 0.4 (BR)
-        // sim_motors[3] = px4[1] = 0.2 (BL)
-        assert!((outputs.motors[0] - 0.3).abs() < 0.01);
-        assert!((outputs.motors[1] - 0.1).abs() < 0.01);
-        assert!((outputs.motors[2] - 0.4).abs() < 0.01);
-        assert!((outputs.motors[3] - 0.2).abs() < 0.01);
+        // Identity mapping: sim motors = px4 channels directly
+        assert!((outputs.motors[0] - 0.1).abs() < 0.01);  // Motor 1 (FR)
+        assert!((outputs.motors[1] - 0.2).abs() < 0.01);  // Motor 2 (BL)
+        assert!((outputs.motors[2] - 0.3).abs() < 0.01);  // Motor 3 (FL)
+        assert!((outputs.motors[3] - 0.4).abs() < 0.01);  // Motor 4 (BR)
     }
 
     #[test]
