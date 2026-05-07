@@ -22,6 +22,8 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use websocket::{CommandType, ConnectionStatus, StateUpdate, ValidatedNshCommand, VehicleMessage, WebSocketServer, WebSocketServerConfig};
 
+mod tui;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// HITL Daemon - Hardware-in-the-loop simulator for UAV testing

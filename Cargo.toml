@@ -1,6 +1,6 @@
 [package]
 name = "hitl-daemon"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 description = "Hardware-in-the-loop simulator daemon for UAV testing"
 license = "MIT"
@@ -15,6 +15,11 @@ hitl-sensors = { path = "../hitl-sensors" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tracing-appender = "0.2.3"
+ratatui = "0.28"
+crossterm = "0.28"
+atty = "0.2"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { workspace = true }
 crossbeam-channel = { workspace = true }
 mavlink = { workspace = true }
