@@ -2,7 +2,7 @@
 
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
 use mavlink::{ardupilotmega::MavMessage, MavHeader};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -82,6 +82,8 @@ pub struct MavlinkIo {
     nsh_rx: Receiver<NshResponseData>,
     /// Flag to signal shutdown
     shutdown: Arc<AtomicBool>,
+    /// Count of MAVLink messages successfully parsed from serial
+    pub packets_received: Arc<AtomicU32>,
     /// Reader task handle
     reader_handle: Option<JoinHandle<()>>,
     /// Writer task handle
@@ -109,6 +111,7 @@ impl MavlinkIo {
             nsh_tx,
             nsh_rx,
             shutdown: Arc::new(AtomicBool::new(false)),
+            packets_received: Arc::new(AtomicU32::new(0)),
             reader_handle: None,
             writer_handle: None,
         };
@@ -157,10 +160,11 @@ impl MavlinkIo {
 
         let shutdown_reader = self.shutdown.clone();
         let shutdown_writer = self.shutdown.clone();
+        let packets_counter = self.packets_received.clone();
 
         // Spawn reader task
         let reader_handle = tokio::spawn(async move {
-            Self::reader_task(reader, tx_to_app, nsh_tx_to_app, shutdown_reader).await;
+            Self::reader_task(reader, tx_to_app, nsh_tx_to_app, shutdown_reader, packets_counter).await;
         });
 
         // Spawn writer task
@@ -214,6 +218,7 @@ impl MavlinkIo {
         tx: Sender<(MavHeader, MavMessage)>,
         nsh_tx: Sender<NshResponseData>,
         shutdown: Arc<AtomicBool>,
+        packets_received: Arc<AtomicU32>,
     ) {
         info!("Reader task started");
         let mut buffer = [0u8; 1024];
@@ -238,6 +243,7 @@ impl MavlinkIo {
                         Self::try_parse_message(&parse_buffer)
                     {
                         parse_buffer.drain(..consumed);
+                        packets_received.fetch_add(1, Ordering::Relaxed);
 
                         // Check for SERIAL_CONTROL responses (NSH data)
                         // Forward all SERIAL_CONTROL messages as NSH responses
@@ -457,6 +463,12 @@ impl Default for MavlinkIo {
 }
 
 impl MavlinkIo {
+    /// Read the current packet count and reset to zero.
+    /// Call once per second to get packets/sec.
+    pub fn take_packet_count(&self) -> u32 {
+        self.packets_received.swap(0, Ordering::Relaxed)
+    }
+
     /// Check if the I/O tasks have shut down (connection lost)
     pub fn is_disconnected(&self) -> bool {
         self.shutdown.load(Ordering::Relaxed)
