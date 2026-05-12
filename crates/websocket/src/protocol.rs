@@ -51,10 +51,12 @@ pub const MSG_TYPE_COMMAND_ACK: u8 = 0x03;
 pub const MSG_TYPE_NSH_RESPONSE: u8 = 0x04;
 pub const MSG_TYPE_CONNECTION_STATUS: u8 = 0x05;
 pub const MSG_TYPE_VEHICLE_MESSAGE: u8 = 0x06;
+pub const MSG_TYPE_SHUTDOWN: u8 = 0x07;
+pub const MSG_TYPE_CONFIG_RESULT: u8 = 0x08;
 pub const MSG_TYPE_COMMAND: u8 = 0x10;
 pub const MSG_TYPE_HANDSHAKE: u8 = 0x11;
 pub const MSG_TYPE_NSH_COMMAND: u8 = 0x12;
-pub const MSG_TYPE_SHUTDOWN: u8 = 0x07;
+pub const MSG_TYPE_CONFIGURE_BUILD: u8 = 0x13;
 
 // State update size
 pub const STATE_UPDATE_SIZE: usize = 86;
@@ -285,6 +287,68 @@ impl VehicleMessage {
         buf.push(0); // null terminator
         buf
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConfigureBuild {
+    pub motor_slug: String,
+    pub prop_diameter_inches: f64,
+    pub frame_weight_g: f64,
+}
+
+impl ConfigureBuild {
+    pub fn from_bytes(data: &[u8]) -> Result<Self, ProtocolError> {
+        if data.len() < 2 {
+            return Err(ProtocolError::MessageTooShort {
+                expected: 2,
+                actual: data.len(),
+            });
+        }
+
+        if data[0] != MSG_TYPE_CONFIGURE_BUILD {
+            return Err(ProtocolError::UnknownMessageType(data[0]));
+        }
+
+        let json_str = std::str::from_utf8(&data[1..])
+            .map_err(|_| ProtocolError::InvalidPayload {
+                command_type: CommandType::Arm,
+                reason: "ConfigureBuild: invalid UTF-8".to_string(),
+            })?;
+
+        serde_json::from_str(json_str).map_err(|e| ProtocolError::InvalidPayload {
+            command_type: CommandType::Arm,
+            reason: format!("ConfigureBuild: {e}"),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigResult {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: Option<AppliedConfig>,
+}
+
+impl ConfigResult {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let json = serde_json::to_vec(self).expect("ConfigResult serialization cannot fail");
+        let mut buf = Vec::with_capacity(1 + json.len());
+        buf.push(MSG_TYPE_CONFIG_RESULT);
+        buf.extend_from_slice(&json);
+        buf
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AppliedConfig {
+    pub mass_kg: f64,
+    pub kt: f64,
+    pub kq: f64,
+    pub arm_length_m: f64,
+    pub max_thrust_per_motor_g: f64,
+    pub thrust_to_weight_ratio: f64,
 }
 
 impl HandshakeAck {
@@ -552,6 +616,7 @@ pub enum OutgoingMessage {
     NshResponse(NshResponse),
     ConnectionStatus(ConnectionStatus),
     VehicleMessage(VehicleMessage),
+    ConfigResult(ConfigResult),
 }
 
 impl OutgoingMessage {
@@ -563,6 +628,7 @@ impl OutgoingMessage {
             OutgoingMessage::NshResponse(n) => n.to_bytes(),
             OutgoingMessage::ConnectionStatus(c) => c.to_bytes(),
             OutgoingMessage::VehicleMessage(v) => v.to_bytes(),
+            OutgoingMessage::ConfigResult(r) => r.to_bytes(),
         }
     }
 }
@@ -573,6 +639,7 @@ pub enum IncomingMessage {
     Command(Command),
     Handshake,
     NshCommand(NshCommand),
+    ConfigureBuild(ConfigureBuild),
     Shutdown,
 }
 
@@ -590,6 +657,7 @@ impl IncomingMessage {
             MSG_TYPE_COMMAND => Ok(IncomingMessage::Command(Command::from_bytes(data)?)),
             MSG_TYPE_HANDSHAKE => Ok(IncomingMessage::Handshake),
             MSG_TYPE_NSH_COMMAND => Ok(IncomingMessage::NshCommand(NshCommand::from_bytes(data)?)),
+            MSG_TYPE_CONFIGURE_BUILD => Ok(IncomingMessage::ConfigureBuild(ConfigureBuild::from_bytes(data)?)),
             MSG_TYPE_SHUTDOWN => Ok(IncomingMessage::Shutdown),
             other => Err(ProtocolError::UnknownMessageType(other)),
         }

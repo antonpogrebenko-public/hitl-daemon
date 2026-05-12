@@ -3,9 +3,10 @@
 //! Handles individual client connections, parsing incoming commands and
 //! sending state updates.
 
+use crate::build_config::BuildConfigHandler;
 use crate::protocol::{
-    Command, CommandAck, CommandType, HandshakeAck, IncomingMessage, NshCommand, NshResponse,
-    OutgoingMessage, StateUpdate,
+    Command, CommandAck, CommandType, ConfigResult, HandshakeAck, IncomingMessage, NshCommand,
+    NshResponse, OutgoingMessage, StateUpdate,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -61,6 +62,8 @@ pub struct ConnectionHandler {
     command_tx: mpsc::Sender<ValidatedCommand>,
     /// Channel to send NSH commands for execution
     nsh_tx: Option<mpsc::Sender<ValidatedNshCommand>>,
+    /// Handler for build configuration requests
+    build_config: Option<Arc<BuildConfigHandler>>,
     /// Broadcast channel to receive state updates
     state_rx: broadcast::Receiver<StateUpdate>,
     /// Rate limiting: client_id -> (window_start, command_count)
@@ -88,6 +91,7 @@ impl ConnectionHandler {
             pixhawk_connected: Arc::new(RwLock::new(false)),
             command_tx,
             nsh_tx: None,
+            build_config: None,
             state_rx,
             rate_limits: Arc::new(RwLock::new(HashMap::new())),
             next_client_id: Arc::new(RwLock::new(1)),
@@ -103,6 +107,11 @@ impl ConnectionHandler {
     /// Get a clone of the NSH sender (if available)
     pub fn nsh_sender(&self) -> Option<mpsc::Sender<ValidatedNshCommand>> {
         self.nsh_tx.clone()
+    }
+
+    /// Set the build config handler
+    pub fn set_build_config_handler(&mut self, handler: Arc<BuildConfigHandler>) {
+        self.build_config = Some(handler);
     }
 
     /// Allocate a new client ID
@@ -154,6 +163,22 @@ impl ConnectionHandler {
             IncomingMessage::NshCommand(nsh) => {
                 debug!(client_id, request_id = nsh.request_id, cmd = %nsh.command, "Received NSH command");
                 Ok(Some(self.handle_nsh_command(client_id, nsh).await))
+            }
+            IncomingMessage::ConfigureBuild(build) => {
+                debug!(client_id, motor_slug = %build.motor_slug, "Received build config request");
+                let handler = match &self.build_config {
+                    Some(h) => h.clone(),
+                    None => {
+                        let result = ConfigResult {
+                            success: false,
+                            error: Some("Build configuration not available".to_string()),
+                            config: None,
+                        };
+                        return Ok(Some(OutgoingMessage::ConfigResult(result)));
+                    }
+                };
+                let result = handler.handle(build).await;
+                Ok(Some(OutgoingMessage::ConfigResult(result)))
             }
             IncomingMessage::Shutdown => {
                 info!(client_id, "Shutdown command received from browser");
@@ -227,7 +252,7 @@ impl ConnectionHandler {
             client_id,
         };
 
-        match nsh_tx.send(validated).await {
+        match nsh_tx.try_send(validated) {
             Ok(_) => {
                 info!(
                     client_id,
@@ -235,21 +260,24 @@ impl ConnectionHandler {
                     cmd = %nsh.command,
                     "NSH command forwarded"
                 );
-                // Response will come asynchronously via NshResponse messages
-                // Return an immediate ACK that the command was received
                 OutgoingMessage::NshResponse(NshResponse {
                     request_id: nsh.request_id,
                     success: true,
-                    complete: false, // Indicates more data will follow
+                    complete: false,
                     output: String::new(),
                 })
             }
-            Err(e) => {
-                warn!(
-                    client_id,
-                    request_id = nsh.request_id,
-                    "Failed to forward NSH command: {}", e
-                );
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                warn!(client_id, request_id = nsh.request_id, "NSH queue full");
+                OutgoingMessage::NshResponse(NshResponse {
+                    request_id: nsh.request_id,
+                    success: false,
+                    complete: true,
+                    output: "NSH busy — previous command still in progress".to_string(),
+                })
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                warn!(client_id, request_id = nsh.request_id, "NSH channel closed");
                 OutgoingMessage::NshResponse(NshResponse {
                     request_id: nsh.request_id,
                     success: false,
@@ -385,6 +413,7 @@ impl Clone for ConnectionHandler {
             pixhawk_connected: Arc::clone(&self.pixhawk_connected),
             command_tx: self.command_tx.clone(),
             nsh_tx: self.nsh_tx.clone(),
+            build_config: self.build_config.clone(),
             state_rx: self.state_rx.resubscribe(),
             rate_limits: Arc::clone(&self.rate_limits),
             next_client_id: Arc::clone(&self.next_client_id),
