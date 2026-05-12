@@ -9,7 +9,7 @@ use mavlink::ardupilotmega::MavMessage;
 use mavlink_io::async_io::{MavlinkIo, NshRequest, reconnect_delay};
 use mavlink_io::serial::find_pixhawk_ports;
 use protocol::{ActuatorOutputs, DaemonState, DaemonStatus};
-use hitl_physics::throttle_to_omega;
+use hitl_physics::{throttle_to_omega, PhysicsConfig};
 use hitl_sensors::{ImuConfig, SensorsConfig};
 use simulation::{SimulationConfig, SimulationLoop, SimulationState};
 use std::net::UdpSocket;
@@ -173,8 +173,9 @@ fn spawn_simulation_thread(
     actuator_rx: Receiver<ActuatorOutputs>,
     mav_tx: Sender<MavMessage>,
     _shutdown: Arc<AtomicBool>,
+    config_rx: Receiver<PhysicsConfig>,
 ) -> (thread::JoinHandle<()>, SimulationState) {
-    let mut sim_loop = SimulationLoop::new(config, actuator_rx, mav_tx);
+    let mut sim_loop = SimulationLoop::new(config, actuator_rx, config_rx, mav_tx);
     let state = sim_loop.state_handle();
 
     let handle = thread::Builder::new()
@@ -331,8 +332,10 @@ async fn main() {
     // Create channels
     // actuator_tx/rx: MAVLink receiver -> Simulation (HIL_ACTUATOR_CONTROLS)
     // sim_mav_tx/rx: Simulation -> MAVLink sender (HIL_SENSOR, HIL_GPS)
+    // build_config_tx/rx: WebSocket -> Simulation (PhysicsConfig updates)
     let (actuator_tx, actuator_rx) = bounded::<ActuatorOutputs>(16);
     let (sim_mav_tx, sim_mav_rx) = bounded::<MavMessage>(64);
+    let (build_config_tx, build_config_rx) = bounded::<PhysicsConfig>(1);
 
     // Shutdown signal
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -370,6 +373,7 @@ async fn main() {
         actuator_rx,
         sim_mav_tx,
         shutdown.clone(),
+        build_config_rx,
     );
 
     // Thread handles to join later
@@ -397,7 +401,7 @@ async fn main() {
     };
 
     // NSH command channel (WebSocket handler -> NSH processor)
-    let (nsh_cmd_tx, mut nsh_cmd_rx) = tokio::sync::mpsc::channel::<ValidatedNshCommand>(32);
+    let (nsh_cmd_tx, mut nsh_cmd_rx) = tokio::sync::mpsc::channel::<ValidatedNshCommand>(4);
 
     // Shared MAVLink I/O - can be updated by connection manager
     let mav_io: Arc<tokio::sync::RwLock<Option<Arc<MavlinkIo>>>> = Arc::new(tokio::sync::RwLock::new(None));
@@ -437,6 +441,10 @@ async fn main() {
 
     // Always enable vehicle message broadcasting
     ws_server.set_vehicle_message_receiver(vehicle_msg_tx.subscribe());
+
+    // Set up build config handler to send PhysicsConfig updates to simulation
+    let build_config_handler = std::sync::Arc::new(websocket::BuildConfigHandler::new(build_config_tx));
+    ws_server.set_build_config_handler(build_config_handler);
 
     // Get browser shutdown signal before ws_server is moved
     let ws_shutdown = ws_server.shutdown_signal();
@@ -538,15 +546,24 @@ async fn main() {
     let fc_model_status = fc_model.clone();
     let pps_for_status = packets_per_sec_shared.clone();
     let start_time_status = std::time::Instant::now();
+    let mut conn_status_rx = conn_status_tx.subscribe();
     let status_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(500));
         let mut tick_count: u8 = 0;
+        let mut current_serial_port: Option<String> = None;
+        let mut is_reconnecting = false;
 
         loop {
             if shutdown_status.load(Ordering::Relaxed) {
                 break;
             }
             interval.tick().await;
+
+            // Drain connection status updates
+            while let Ok(cs) = conn_status_rx.try_recv() {
+                current_serial_port = if cs.serial_port.is_empty() { None } else { Some(cs.serial_port) };
+                is_reconnecting = cs.reconnecting;
+            }
 
             // Every second (every 2 ticks at 500ms), compute packets/sec
             tick_count = tick_count.wrapping_add(1);
@@ -570,6 +587,8 @@ async fn main() {
                 DaemonState::Streaming
             } else if mav_connected {
                 DaemonState::Connected
+            } else if is_reconnecting {
+                DaemonState::Reconnecting
             } else {
                 DaemonState::WaitingForFc
             };
@@ -579,7 +598,7 @@ async fn main() {
             let _ = status_tx.send(DaemonStatus {
                 state,
                 fc_model: model,
-                serial_port: None,
+                serial_port: current_serial_port.clone(),
                 packets_per_sec: current_pps.min(u16::MAX as u32) as u16,
                 connected_clients: 0,
                 uptime_secs: start_time_status.elapsed().as_secs(),
@@ -793,10 +812,19 @@ async fn main() {
                     warn!("FC connection lost");
                     current_mav_io = None;
                     *mav_io_shared.write().await = None;
+                    *fc_model_reconnect.write().await = None;
 
-                    // Abort old tasks
-                    if let Some(h) = receiver_handle.take() { h.abort(); }
-                    if let Some(h) = sender_handle.take() { h.abort(); }
+                    // Abort old tasks and wait for them to release the port
+                    if let Some(h) = receiver_handle.take() {
+                        h.abort();
+                        let _ = tokio::time::timeout(Duration::from_secs(1), h).await;
+                    }
+                    if let Some(h) = sender_handle.take() {
+                        h.abort();
+                        let _ = tokio::time::timeout(Duration::from_secs(1), h).await;
+                    }
+
+                    if retry_count < 255 { retry_count += 1; }
 
                     let _ = conn_status_tx_reconnect.send(ConnectionStatus {
                         connected: false,
@@ -805,6 +833,10 @@ async fn main() {
                         serial_port: String::new(),
                         fc_model: None,
                     });
+
+                    // Cooldown before reconnect — gives OS time to release port
+                    let delay = reconnect_delay(retry_count);
+                    tokio::time::sleep(delay).await;
                 }
 
                 // Try to find a Pixhawk
@@ -867,8 +899,17 @@ async fn main() {
                         let start_time = std::time::Instant::now();
                         receiver_handle = Some(tokio::spawn(async move {
                             info!("MAVLink receiver task started");
+                            let heartbeat_timeout = Duration::from_secs(5);
+                            let mut heartbeat_received = false;
                             loop {
                                 if shutdown_recv.load(Ordering::Relaxed) || mav_io_recv.is_disconnected() {
+                                    break;
+                                }
+
+                                // Watchdog: if no heartbeat within timeout, FC is likely in bootloader
+                                if !heartbeat_received && start_time.elapsed() > heartbeat_timeout {
+                                    warn!("No heartbeat received within {}s — FC may be in bootloader mode", heartbeat_timeout.as_secs());
+                                    mav_io_recv.signal_disconnect();
                                     break;
                                 }
 
@@ -908,6 +949,7 @@ async fn main() {
 
                                     // Extract FC model from first HEARTBEAT
                                     if let MavMessage::HEARTBEAT(hb) = &msg {
+                                        heartbeat_received = true;
                                         use mavlink::ardupilotmega::{MavAutopilot, MavType};
                                         let mut model = fc_model_recv.write().await;
                                         if model.is_none() {
@@ -936,7 +978,7 @@ async fn main() {
                                         }
                                     }
                                 } else {
-                                    tokio::time::sleep(Duration::from_micros(500)).await;
+                                    tokio::time::sleep(Duration::from_millis(2)).await;
                                 }
                             }
                             info!("MAVLink receiver task exiting");

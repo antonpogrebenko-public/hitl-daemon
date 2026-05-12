@@ -3,6 +3,7 @@
 //! Provides the HTTP/WebSocket server that accepts connections and manages
 //! client communication.
 
+use crate::build_config::BuildConfigHandler;
 use crate::handler::{ConnectionHandler, ValidatedCommand, ValidatedNshCommand};
 use crate::protocol::{ConnectionStatus, OutgoingMessage, StateUpdate, VehicleMessage};
 use axum::{
@@ -76,6 +77,8 @@ pub struct WebSocketServer {
     vehicle_msg_rx: Option<broadcast::Receiver<VehicleMessage>>,
     /// Shutdown signal that browser can trigger
     shutdown_signal: Arc<AtomicBool>,
+    /// Build configuration handler
+    build_config_handler: Option<Arc<BuildConfigHandler>>,
 }
 
 impl WebSocketServer {
@@ -94,6 +97,7 @@ impl WebSocketServer {
             conn_status_rx: None,
             vehicle_msg_rx: None,
             shutdown_signal: Arc::new(AtomicBool::new(false)),
+            build_config_handler: None,
         }
     }
 
@@ -120,6 +124,11 @@ impl WebSocketServer {
     /// Set the vehicle message receiver (for broadcasting STATUSTEXT messages to clients)
     pub fn set_vehicle_message_receiver(&mut self, vehicle_msg_rx: broadcast::Receiver<VehicleMessage>) {
         self.vehicle_msg_rx = Some(vehicle_msg_rx);
+    }
+
+    /// Set the build configuration handler
+    pub fn set_build_config_handler(&mut self, handler: Arc<BuildConfigHandler>) {
+        self.build_config_handler = Some(handler);
     }
 
     /// Get a sender for broadcasting state updates
@@ -155,6 +164,10 @@ impl WebSocketServer {
         // Enable NSH support (always available; FC availability is tracked separately)
         if let Some(nsh_tx) = self.nsh_tx {
             handler.set_nsh_sender(nsh_tx);
+        }
+        // Enable build config handler if set
+        if let Some(build_config_handler) = self.build_config_handler {
+            handler.set_build_config_handler(build_config_handler);
         }
         // Start with FC disconnected — connection manager will update via ConnectionStatus
         handler.set_pixhawk_connected(false).await;
@@ -287,12 +300,16 @@ async fn health_handler() -> impl IntoResponse {
     "OK"
 }
 
+/// Maximum allowed incoming WebSocket message size (1 KB)
+const MAX_INCOMING_MESSAGE_SIZE: usize = 1024;
+
 /// WebSocket upgrade handler
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(|socket| handle_socket(socket, state))
+    ws.max_message_size(MAX_INCOMING_MESSAGE_SIZE)
+        .on_upgrade(|socket| handle_socket(socket, state))
 }
 
 /// Handle a WebSocket connection
