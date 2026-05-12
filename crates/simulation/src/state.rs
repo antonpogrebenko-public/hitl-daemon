@@ -158,4 +158,9 @@ impl SimulationState {
     pub fn reset(&self) {
         self.inner.write().reset(&self.config);
     }
+
+    /// Reconfigure: reset inner state for new physics parameters
+    pub fn reconfigure(&self) {
+        self.inner.write().reset(&self.config);
+    }
 }

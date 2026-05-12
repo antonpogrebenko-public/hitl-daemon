@@ -1,14 +1,14 @@
 //! Main simulation loop running at 400 Hz
 
 use crate::state::{SimulationConfig, SimulationState};
-use crossbeam_channel::{Receiver, Sender};
-use hitl_physics::{rk4_step, throttle_to_omega};
+use crossbeam_channel::{Receiver, Sender, TryRecvError};
+use hitl_physics::{rk4_step, throttle_to_omega, PhysicsConfig};
 use mavlink::ardupilotmega::{
     MavMessage, HIL_GPS_DATA, HIL_SENSOR_DATA, HilSensorUpdatedFlags,
 };
 use protocol::ActuatorOutputs;
 use std::time::{Duration, Instant};
-use tracing::{info, trace};
+use tracing::{info, trace, warn};
 
 /// Simulation statistics
 #[derive(Debug, Clone, Default)]
@@ -27,6 +27,8 @@ pub struct SimulationStats {
     pub hil_gps_count: u64,
     /// Actuator messages received
     pub actuator_count: u64,
+    /// Sensor messages dropped (channel full)
+    pub sensor_drops: u64,
 }
 
 /// Mag sensor update divider (400 Hz / 8 = 50 Hz)
@@ -58,6 +60,7 @@ pub struct SimulationLoop {
     state: SimulationState,
     config: SimulationConfig,
     actuator_rx: Receiver<ActuatorOutputs>,
+    config_rx: Receiver<PhysicsConfig>,
     mav_tx: Sender<MavMessage>,
     stats: SimulationStats,
     /// Cached mag reading (only updated at MAG_UPDATE_DIVIDER rate)
@@ -71,6 +74,7 @@ impl SimulationLoop {
     pub fn new(
         config: SimulationConfig,
         actuator_rx: Receiver<ActuatorOutputs>,
+        config_rx: Receiver<PhysicsConfig>,
         mav_tx: Sender<MavMessage>,
     ) -> Self {
         let state = SimulationState::new(config.clone());
@@ -79,6 +83,7 @@ impl SimulationLoop {
             state,
             config,
             actuator_rx,
+            config_rx,
             mav_tx,
             stats: SimulationStats::default(),
             last_mag: None,
@@ -104,15 +109,33 @@ impl SimulationLoop {
             "Starting simulation loop"
         );
 
-        let loop_start = Instant::now();
-        let mut stats_print_time = Instant::now();
         let stats_interval = Duration::from_secs(5);
 
-        let mut total_latency_us: u64 = 0;
-        let mut latency_samples: u64 = 0;
+        // Window-based stats — reset every interval so reported values reflect recent behaviour.
+        let mut window_start = Instant::now();
+        let mut window_ticks: u64 = 0;
+        let mut window_latency_us: u64 = 0;
+        let mut window_max_latency_us: u64 = 0;
+
+        // Absolute scheduling: advance next_tick by one period each iteration so overruns
+        // don't accumulate (a single 8s spike won't cause 8s of catch-up busy-looping).
+        let mut next_tick = Instant::now();
 
         while self.state.is_running() {
             let tick_start = Instant::now();
+
+            match self.config_rx.try_recv() {
+                Ok(new_physics) => {
+                    info!("Reconfiguring simulation");
+                    self.config.physics = new_physics;
+                    self.state.reconfigure();
+                    self.last_mag = None;
+                    self.last_baro = None;
+                    self.stats = SimulationStats::default();
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => break,
+            }
 
             // Process any pending actuator commands (non-blocking)
             self.process_actuator_commands();
@@ -123,37 +146,42 @@ impl SimulationLoop {
             // Sample sensors and send HIL messages
             self.sample_and_send_sensors(dt);
 
-            // Update stats
             self.stats.total_ticks += 1;
+            window_ticks += 1;
 
-            let tick_elapsed = tick_start.elapsed();
-            let latency_us = tick_elapsed.as_micros() as u64;
-            total_latency_us += latency_us;
-            latency_samples += 1;
-
-            if latency_us > self.stats.max_latency_us {
-                self.stats.max_latency_us = latency_us;
+            let latency_us = tick_start.elapsed().as_micros() as u64;
+            window_latency_us += latency_us;
+            if latency_us > window_max_latency_us {
+                window_max_latency_us = latency_us;
             }
 
-            // Print stats every 5 seconds
-            if stats_print_time.elapsed() >= stats_interval {
-                let elapsed = loop_start.elapsed().as_secs_f64();
-                self.stats.actual_tick_rate = self.stats.total_ticks as f64 / elapsed;
-                self.stats.avg_latency_us = total_latency_us as f64 / latency_samples as f64;
+            // Print per-window stats every 5 seconds
+            if window_start.elapsed() >= stats_interval {
+                let window_secs = window_start.elapsed().as_secs_f64();
+                self.stats.actual_tick_rate = window_ticks as f64 / window_secs;
+                self.stats.avg_latency_us = window_latency_us as f64 / window_ticks as f64;
+                self.stats.max_latency_us = window_max_latency_us;
 
                 self.print_stats();
-                stats_print_time = Instant::now();
+
+                window_start = Instant::now();
+                window_ticks = 0;
+                window_latency_us = 0;
+                window_max_latency_us = 0;
             }
 
-            // Precise sleep to maintain tick rate
-            let elapsed = tick_start.elapsed();
-            if elapsed < tick_duration {
-                spin_sleep::sleep(tick_duration - elapsed);
+            // Absolute-deadline sleep: skip ticks we're already past rather than catching up.
+            next_tick += tick_duration;
+            let now = Instant::now();
+            if next_tick > now {
+                spin_sleep::sleep(next_tick - now);
             } else {
+                // We're behind; reset deadline to now to avoid a burst of catch-up ticks.
+                next_tick = now;
                 trace!(
-                    elapsed_us = elapsed.as_micros(),
+                    latency_us,
                     target_us = tick_duration.as_micros(),
-                    "Tick overrun"
+                    "Tick overrun — deadline reset"
                 );
             }
         }
@@ -353,15 +381,26 @@ impl SimulationLoop {
 
         // Build and send HIL_SENSOR message
         let hil_sensor = self.build_hil_sensor(&imu_reading, &baro_reading, &mag_reading, sim_time_us, fields_updated);
-        if self.mav_tx.send(MavMessage::HIL_SENSOR(hil_sensor)).is_ok() {
-            self.stats.hil_sensor_count += 1;
+        match self.mav_tx.try_send(MavMessage::HIL_SENSOR(hil_sensor)) {
+            Ok(()) => { self.stats.hil_sensor_count += 1; }
+            Err(crossbeam_channel::TrySendError::Full(_)) => {
+                self.stats.sensor_drops += 1;
+                if self.stats.sensor_drops == 1 || self.stats.sensor_drops % 1000 == 0 {
+                    warn!(drops = self.stats.sensor_drops, "Sensor message channel full — FC not consuming");
+                }
+            }
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {}
         }
 
         // Send HIL_GPS when sensor provides it (sensor handles rate limiting)
         if let Some(gps) = gps_reading {
             let hil_gps = self.build_hil_gps(&gps, sim_time_us);
-            if self.mav_tx.send(MavMessage::HIL_GPS(hil_gps)).is_ok() {
-                self.stats.hil_gps_count += 1;
+            match self.mav_tx.try_send(MavMessage::HIL_GPS(hil_gps)) {
+                Ok(()) => { self.stats.hil_gps_count += 1; }
+                Err(crossbeam_channel::TrySendError::Full(_)) => {
+                    self.stats.sensor_drops += 1;
+                }
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {}
             }
         }
     }
