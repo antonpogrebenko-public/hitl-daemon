@@ -130,6 +130,12 @@ Reduce GPS noise: `horizontal_noise_sigma: 0.1` (was 1.0m)
 ### NSH when daemon running
 Use `nsh --ws` mode. Direct serial mode outputs garbage when daemon holds the port.
 
+### EKF2 restart on config change
+When `ConfigureBuild` is received, the daemon automatically restarts EKF2 via NSH commands (`ekf2 stop` then `ekf2 start`) to clear stale estimator state. This causes a transient "ekf2 missing data" preflight warning that clears in ~2 seconds.
+
+### Flight mode from HEARTBEAT
+The daemon extracts flight mode from `HEARTBEAT.custom_mode` bits 16-23 (PX4 main mode) and updates the simulation state. The frontend displays this in real-time. Note: PX4 may reject mode changes when EKF2 has preflight failures.
+
 ## WebSocket Protocol
 
 - Port: 9876

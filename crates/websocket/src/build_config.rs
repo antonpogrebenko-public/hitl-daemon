@@ -1,7 +1,9 @@
 use crossbeam_channel::Sender;
 use hitl_physics::PhysicsConfig;
+use crate::handler::ValidatedNshCommand;
 use crate::protocol::{AppliedConfig, ConfigResult, ConfigureBuild};
-use tracing::{error, info};
+use tokio::sync::mpsc;
+use tracing::{error, info, warn};
 
 const DEFAULT_API_URL: &str = "https://api.th3seus.net";
 const MAX_MOTOR_SPEED_SQUARED: f64 = 2500.0 * 2500.0;
@@ -10,10 +12,11 @@ pub struct BuildConfigHandler {
     api_url: String,
     http_client: reqwest::Client,
     config_tx: Sender<PhysicsConfig>,
+    nsh_tx: Option<mpsc::Sender<ValidatedNshCommand>>,
 }
 
 impl BuildConfigHandler {
-    pub fn new(config_tx: Sender<PhysicsConfig>) -> Self {
+    pub fn new(config_tx: Sender<PhysicsConfig>, nsh_tx: Option<mpsc::Sender<ValidatedNshCommand>>) -> Self {
         let api_url = std::env::var("RELEASE_API_URL")
             .unwrap_or_else(|_| DEFAULT_API_URL.to_string());
 
@@ -24,6 +27,7 @@ impl BuildConfigHandler {
                 .build()
                 .expect("Failed to build HTTP client"),
             config_tx,
+            nsh_tx,
         }
     }
 
@@ -91,11 +95,53 @@ impl BuildConfigHandler {
             "Build configured successfully"
         );
 
+        // Restart EKF2 to clear stale state from previous config
+        self.restart_ekf2().await;
+
         ConfigResult {
             success: true,
             error: None,
             config: Some(applied),
         }
+    }
+
+    /// Restart EKF2 to clear stale estimator state after config change
+    async fn restart_ekf2(&self) {
+        let Some(ref nsh_tx) = self.nsh_tx else {
+            warn!("NSH not available, skipping EKF2 restart");
+            return;
+        };
+
+        // Send ekf2 stop command
+        let stop_cmd = ValidatedNshCommand {
+            request_id: 0xFFFF_FF01, // Special ID for internal commands
+            command: "ekf2 stop".to_string(),
+            timeout_ms: 2000,
+            client_id: 0, // System client
+        };
+
+        if let Err(e) = nsh_tx.send(stop_cmd).await {
+            warn!(error = %e, "Failed to send ekf2 stop command");
+            return;
+        }
+
+        // Small delay to let EKF2 stop cleanly
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Send ekf2 start command
+        let start_cmd = ValidatedNshCommand {
+            request_id: 0xFFFF_FF02,
+            command: "ekf2 start".to_string(),
+            timeout_ms: 2000,
+            client_id: 0,
+        };
+
+        if let Err(e) = nsh_tx.send(start_cmd).await {
+            warn!(error = %e, "Failed to send ekf2 start command");
+            return;
+        }
+
+        info!("EKF2 restarted after config change");
     }
 
     async fn fetch_motor_specs(&self, slug: &str) -> Result<serde_json::Value, String> {

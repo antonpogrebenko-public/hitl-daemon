@@ -432,6 +432,12 @@ async fn main() {
     let state_tx = ws_server.state_sender();
     let mut command_rx = ws_server.take_command_receiver();
 
+    // Set up build config handler to send PhysicsConfig updates to simulation
+    // Pass NSH sender so it can restart EKF2 after config changes (clone before moving to ws_server)
+    let nsh_tx_for_config = if sim_only_mode { None } else { Some(nsh_cmd_tx.clone()) };
+    let build_config_handler = std::sync::Arc::new(websocket::BuildConfigHandler::new(build_config_tx, nsh_tx_for_config));
+    ws_server.set_build_config_handler(build_config_handler);
+
     // Always enable NSH support (will be available when Pixhawk connects)
     ws_server.set_nsh_sender(nsh_cmd_tx);
     ws_server.set_nsh_response_receiver(nsh_resp_broadcast_tx.subscribe());
@@ -441,10 +447,6 @@ async fn main() {
 
     // Always enable vehicle message broadcasting
     ws_server.set_vehicle_message_receiver(vehicle_msg_tx.subscribe());
-
-    // Set up build config handler to send PhysicsConfig updates to simulation
-    let build_config_handler = std::sync::Arc::new(websocket::BuildConfigHandler::new(build_config_tx));
-    ws_server.set_build_config_handler(build_config_handler);
 
     // Get browser shutdown signal before ws_server is moved
     let ws_shutdown = ws_server.shutdown_signal();
@@ -773,6 +775,7 @@ async fn main() {
         let sim_mav_rx_reconnect = sim_mav_rx.clone();
         let qgc_socket_reconnect = qgc_socket.clone();
         let fc_model_reconnect = fc_model.clone();
+        let sim_state_reconnect = sim_state.clone();
         let preferred_port = args.port.clone();
         let baud = args.baud;
 
@@ -896,6 +899,7 @@ async fn main() {
                         let fc_model_recv = fc_model_reconnect.clone();
                         let conn_status_tx_recv = conn_status_tx_reconnect.clone();
                         let port_path_recv = port_path.clone();
+                        let sim_state_recv = sim_state_reconnect.clone();
                         let start_time = std::time::Instant::now();
                         receiver_handle = Some(tokio::spawn(async move {
                             info!("MAVLink receiver task started");
@@ -947,9 +951,15 @@ async fn main() {
                                         }
                                     }
 
-                                    // Extract FC model from first HEARTBEAT
+                                    // Extract flight mode and FC model from HEARTBEAT
                                     if let MavMessage::HEARTBEAT(hb) = &msg {
                                         heartbeat_received = true;
+
+                                        // Update flight mode from custom_mode
+                                        // PX4 custom_mode is a 32-bit field where main mode is in bits 16-23
+                                        let main_mode = ((hb.custom_mode >> 16) & 0xFF) as u8;
+                                        sim_state_recv.set_flight_mode(main_mode);
+
                                         use mavlink::ardupilotmega::{MavAutopilot, MavType};
                                         let mut model = fc_model_recv.write().await;
                                         if model.is_none() {
