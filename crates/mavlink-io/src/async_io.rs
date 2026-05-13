@@ -16,6 +16,15 @@ use crate::messages::{COMPONENT_ID, SYSTEM_ID};
 /// Channel buffer size for send/receive queues
 const CHANNEL_BUFFER_SIZE: usize = 256;
 
+/// Maximum parse buffer size before forced drain (prevents OOM on corrupt streams)
+const MAX_PARSE_BUFFER_SIZE: usize = 8192;
+
+/// MAVLink v2 start byte
+const MAVLINK_V2_STX: u8 = 0xFD;
+
+/// Timeout for serial write operations
+const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Reconnection timing constants
 const RECONNECT_BASE_DELAY_MS: u64 = 250;
 const RECONNECT_MAX_DELAY_MS: u64 = 1000;
@@ -230,7 +239,18 @@ impl MavlinkIo {
                 break;
             }
 
-            match reader.read(&mut buffer).await {
+            // Timeout read so we can check shutdown flag periodically
+            let read_result = tokio::time::timeout(
+                Duration::from_secs(1),
+                reader.read(&mut buffer),
+            ).await;
+
+            let read_result = match read_result {
+                Ok(result) => result,
+                Err(_) => continue, // Timeout — loop back to check shutdown
+            };
+
+            match read_result {
                 Ok(0) => {
                     warn!("Serial port closed");
                     break;
@@ -238,50 +258,64 @@ impl MavlinkIo {
                 Ok(n) => {
                     parse_buffer.extend_from_slice(&buffer[..n]);
 
+                    // Prevent unbounded growth from corrupt streams
+                    if parse_buffer.len() > MAX_PARSE_BUFFER_SIZE {
+                        warn!(
+                            size = parse_buffer.len(),
+                            "Parse buffer exceeded limit — scanning for next frame start"
+                        );
+                        Self::drain_to_next_frame(&mut parse_buffer);
+                    }
+
                     // Try to parse complete messages from the buffer
-                    while let Some((header, message, consumed)) =
-                        Self::try_parse_message(&parse_buffer)
-                    {
-                        parse_buffer.drain(..consumed);
-                        packets_received.fetch_add(1, Ordering::Relaxed);
+                    loop {
+                        match Self::try_parse_message(&parse_buffer) {
+                            Some((header, message, consumed)) => {
+                                parse_buffer.drain(..consumed);
+                                packets_received.fetch_add(1, Ordering::Relaxed);
 
-                        // Check for SERIAL_CONTROL responses (NSH data)
-                        // Forward all SERIAL_CONTROL messages as NSH responses
-                        if let MavMessage::SERIAL_CONTROL(ref sc) = message {
-                            // Extract data up to count bytes
-                            let data_len = sc.count.min(70) as usize;
-                            let data = sc.data[..data_len].to_vec();
+                                // Check for SERIAL_CONTROL responses (NSH data)
+                                if let MavMessage::SERIAL_CONTROL(ref sc) = message {
+                                    let data_len = sc.count.min(70) as usize;
+                                    let data = sc.data[..data_len].to_vec();
+                                    let complete = sc.count == 0;
 
-                            // PX4 sends count=0 to signal end of response.
-                            // Intermediate packets may have count < 70 without
-                            // meaning "complete", so only treat count==0 as done.
-                            let complete = sc.count == 0;
+                                    debug!(
+                                        count = sc.count,
+                                        data_len = data_len,
+                                        complete = complete,
+                                        "Received SERIAL_CONTROL response"
+                                    );
 
-                            debug!(
-                                count = sc.count,
-                                data_len = data_len,
-                                complete = complete,
-                                "Received SERIAL_CONTROL response"
-                            );
+                                    if !data.is_empty() || complete {
+                                        if nsh_tx
+                                            .send(NshResponseData {
+                                                request_id: 0,
+                                                data,
+                                                complete,
+                                            })
+                                            .is_err()
+                                        {
+                                            warn!("Failed to send NSH response to application");
+                                        }
+                                    }
+                                }
 
-                            // Send response if there's data OR if this is the completion signal
-                            if !data.is_empty() || complete {
-                                if nsh_tx
-                                    .send(NshResponseData {
-                                        request_id: 0, // Application correlates via pending request tracking
-                                        data,
-                                        complete,
-                                    })
-                                    .is_err()
-                                {
-                                    warn!("Failed to send NSH response to application");
+                                if tx.send((header, message)).is_err() {
+                                    error!("Failed to send message to application");
+                                    return;
                                 }
                             }
-                        }
-
-                        if tx.send((header, message)).is_err() {
-                            error!("Failed to send message to application");
-                            return;
+                            None => {
+                                // No valid frame found — if buffer has data but starts
+                                // with a non-STX byte, skip to the next potential frame
+                                if parse_buffer.len() >= 8
+                                    && parse_buffer[0] != MAVLINK_V2_STX
+                                {
+                                    Self::drain_to_next_frame(&mut parse_buffer);
+                                }
+                                break;
+                            }
                         }
                     }
                 }
@@ -310,7 +344,7 @@ impl MavlinkIo {
 
         // Send initial heartbeat immediately so PX4 knows we're here
         if let Ok(hb) = Self::serialize_heartbeat(&mut sequence) {
-            let _ = writer.write_all(&hb).await;
+            let _ = tokio::time::timeout(WRITE_TIMEOUT, writer.write_all(&hb)).await;
         }
 
         loop {
@@ -322,9 +356,16 @@ impl MavlinkIo {
             // Send periodic GCS heartbeat (1 Hz) — PX4 requires this
             if last_heartbeat.elapsed() >= heartbeat_interval {
                 if let Ok(hb) = Self::serialize_heartbeat(&mut sequence) {
-                    if let Err(e) = writer.write_all(&hb).await {
-                        error!(error = %e, "Failed to write heartbeat");
-                        break;
+                    match tokio::time::timeout(WRITE_TIMEOUT, writer.write_all(&hb)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            error!(error = %e, "Failed to write heartbeat");
+                            break;
+                        }
+                        Err(_) => {
+                            error!("Heartbeat write timed out — serial port stalled");
+                            break;
+                        }
                     }
                 }
                 last_heartbeat = tokio::time::Instant::now();
@@ -339,8 +380,7 @@ impl MavlinkIo {
                         "Sending NSH request via SERIAL_CONTROL"
                     );
 
-                    // Send NSH data via SERIAL_CONTROL message
-                    // Split into chunks of 70 bytes max (SERIAL_CONTROL data field size)
+                    let mut write_failed = false;
                     for chunk in nsh_request.data.chunks(70) {
                         let mut data = [0u8; 70];
                         data[..chunk.len()].copy_from_slice(chunk);
@@ -350,7 +390,7 @@ impl MavlinkIo {
                             flags: mavlink::ardupilotmega::SerialControlFlag::SERIAL_CONTROL_FLAG_RESPOND
                                 | mavlink::ardupilotmega::SerialControlFlag::SERIAL_CONTROL_FLAG_EXCLUSIVE,
                             timeout: nsh_request.timeout_ms,
-                            baudrate: 0, // Not used for shell
+                            baudrate: 0,
                             count: chunk.len() as u8,
                             data,
                         };
@@ -369,10 +409,22 @@ impl MavlinkIo {
                             continue;
                         }
 
-                        if let Err(e) = writer.write_all(&buf).await {
-                            error!(error = %e, "Failed to write SERIAL_CONTROL to serial port");
-                            break;
+                        match tokio::time::timeout(WRITE_TIMEOUT, writer.write_all(&buf)).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                error!(error = %e, "Failed to write SERIAL_CONTROL to serial port");
+                                write_failed = true;
+                                break;
+                            }
+                            Err(_) => {
+                                error!("SERIAL_CONTROL write timed out — serial port stalled");
+                                write_failed = true;
+                                break;
+                            }
                         }
+                    }
+                    if write_failed {
+                        break;
                     }
                 }
                 Err(TryRecvError::Empty) => {}
@@ -397,15 +449,20 @@ impl MavlinkIo {
                         continue;
                     }
 
-                    if let Err(e) = writer.write_all(&buf).await {
-                        error!(error = %e, "Failed to write to serial port");
-                        break;
+                    match tokio::time::timeout(WRITE_TIMEOUT, writer.write_all(&buf)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            error!(error = %e, "Failed to write to serial port");
+                            break;
+                        }
+                        Err(_) => {
+                            error!("Serial write timed out — port stalled");
+                            break;
+                        }
                     }
                 }
                 Err(TryRecvError::Empty) => {
-                    // No messages to send, sleep briefly to allow other tasks to run
-                    // Using sleep instead of yield_now for better tokio scheduling with sync channels
-                    tokio::time::sleep(std::time::Duration::from_micros(100)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                 }
                 Err(TryRecvError::Disconnected) => {
                     warn!("Send channel disconnected");
@@ -451,6 +508,20 @@ impl MavlinkIo {
                 Some((header, message, consumed))
             }
             Err(_) => None,
+        }
+    }
+
+    /// Drain bytes up to the next MAVLink v2 start byte (0xFD).
+    /// If no start byte found, clears the entire buffer.
+    fn drain_to_next_frame(buffer: &mut Vec<u8>) {
+        if let Some(pos) = buffer.iter().skip(1).position(|&b| b == MAVLINK_V2_STX) {
+            let drain_count = pos + 1; // skip(1) offset
+            debug!(drained = drain_count, "Skipped corrupt bytes to next frame start");
+            buffer.drain(..drain_count);
+        } else {
+            let drained = buffer.len();
+            buffer.clear();
+            debug!(drained, "No frame start found — cleared parse buffer");
         }
     }
 }

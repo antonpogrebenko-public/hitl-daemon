@@ -32,7 +32,21 @@ pub fn run_tui(
     log_rx: std::sync::mpsc::Receiver<String>,
     shutdown: Arc<AtomicBool>,
 ) {
-    if let Err(e) = run_tui_inner(status_rx, log_rx, shutdown) {
+    // Install panic hook that restores terminal before printing panic info
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = stdout().execute(LeaveAlternateScreen);
+        default_hook(info);
+    }));
+
+    let result = run_tui_inner(status_rx, log_rx, shutdown);
+
+    // Always restore terminal, even on error
+    let _ = disable_raw_mode();
+    let _ = stdout().execute(LeaveAlternateScreen);
+
+    if let Err(e) = result {
         eprintln!("TUI error: {e}");
     }
 }
@@ -127,8 +141,13 @@ fn run_tui_inner(
                 })
                 .collect();
 
+            let log_area_height = chunks[1].height as usize;
+            let total_lines = log_lines.len();
+            let scroll_offset = total_lines.saturating_sub(log_area_height);
+
             let log_widget = Paragraph::new(log_lines)
                 .wrap(Wrap { trim: false })
+                .scroll((scroll_offset as u16, 0))
                 .block(Block::default().borders(Borders::NONE));
             frame.render_widget(log_widget, chunks[1]);
 
@@ -152,10 +171,6 @@ fn run_tui_inner(
             }
         }
     }
-
-    // Restore terminal
-    disable_raw_mode()?;
-    stdout().execute(LeaveAlternateScreen)?;
 
     Ok(())
 }
