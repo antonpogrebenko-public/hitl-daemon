@@ -40,7 +40,7 @@ impl BuildConfigHandler {
             }
         };
 
-        let kv = match motor_specs.get("kv").and_then(|v| v.as_f64()) {
+        let kv = match motor_specs.get("kvRating").and_then(|v| v.as_f64()) {
             Some(kv) => kv,
             None => {
                 return ConfigResult {
