@@ -6,7 +6,6 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 const DEFAULT_API_URL: &str = "https://api.th3seus.net";
-const MAX_MOTOR_SPEED_SQUARED: f64 = 2500.0 * 2500.0;
 
 pub struct BuildConfigHandler {
     api_url: String,
@@ -89,11 +88,14 @@ impl BuildConfigHandler {
             blade_count,
             request.frame_weight_g,
             motor_weight_g,
+            request.battery_voltage,
         );
 
-        let max_thrust_per_motor_g = (physics.kt * MAX_MOTOR_SPEED_SQUARED) / 9.80665 * 1000.0;
+        let max_omega = physics.max_motor_speed_from_voltage();
+        let max_thrust_per_motor_g = (physics.kt * max_omega * max_omega) / 9.80665 * 1000.0;
         let thrust_to_weight_ratio = (4.0 * max_thrust_per_motor_g) / (physics.mass_kg * 1000.0);
 
+        let max_motor_rpm = physics.motor_kv * physics.battery_voltage;
         let applied = AppliedConfig {
             mass_kg: physics.mass_kg,
             kt: physics.kt,
@@ -101,6 +103,9 @@ impl BuildConfigHandler {
             arm_length_m: physics.arm_length_m,
             max_thrust_per_motor_g,
             thrust_to_weight_ratio,
+            motor_kv: physics.motor_kv,
+            battery_voltage: physics.battery_voltage,
+            max_motor_rpm,
         };
 
         if let Err(e) = self.config_tx.send(physics) {

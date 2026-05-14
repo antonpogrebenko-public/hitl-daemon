@@ -295,6 +295,13 @@ pub struct ConfigureBuild {
     pub prop_slug: Option<String>,
     pub prop_diameter_inches: f64,
     pub frame_weight_g: f64,
+    /// Battery voltage (optional, defaults to 14.8V / 4S)
+    #[serde(default = "default_battery_voltage")]
+    pub battery_voltage: f64,
+}
+
+fn default_battery_voltage() -> f64 {
+    14.8 // 4S LiPo nominal
 }
 
 impl ConfigureBuild {
@@ -350,6 +357,10 @@ pub struct AppliedConfig {
     pub arm_length_m: f64,
     pub max_thrust_per_motor_g: f64,
     pub thrust_to_weight_ratio: f64,
+    // Electrical/thermal parameters
+    pub motor_kv: f64,
+    pub battery_voltage: f64,
+    pub max_motor_rpm: f64,
 }
 
 impl HandshakeAck {
