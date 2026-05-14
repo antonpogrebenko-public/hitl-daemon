@@ -60,9 +60,33 @@ impl BuildConfigHandler {
             .and_then(|v| v.as_f64())
             .unwrap_or(30.0);
 
-        let physics = PhysicsConfig::from_motor_specs(
+        // Fetch propeller specs if provided, otherwise use defaults
+        let (prop_diameter, prop_pitch, blade_count) = if let Some(ref prop_slug) = request.prop_slug {
+            match self.fetch_component_specs(prop_slug).await {
+                Ok(specs) => {
+                    let diameter = specs.get("diameterIn").and_then(|v| v.as_f64())
+                        .unwrap_or(request.prop_diameter_inches);
+                    let pitch = specs.get("pitchIn").and_then(|v| v.as_f64())
+                        .unwrap_or(diameter * 0.9);
+                    let blades = specs.get("bladeCount").and_then(|v| v.as_i64())
+                        .unwrap_or(3) as i32;
+                    info!(slug = %prop_slug, diameter, pitch, blades, "Loaded propeller specs");
+                    (diameter, pitch, blades)
+                }
+                Err(e) => {
+                    warn!(slug = %prop_slug, error = %e, "Failed to fetch propeller specs, using defaults");
+                    (request.prop_diameter_inches, request.prop_diameter_inches * 0.9, 3)
+                }
+            }
+        } else {
+            (request.prop_diameter_inches, request.prop_diameter_inches * 0.9, 3)
+        };
+
+        let physics = PhysicsConfig::from_build_specs(
             kv,
-            request.prop_diameter_inches,
+            prop_diameter,
+            prop_pitch,
+            blade_count,
             request.frame_weight_g,
             motor_weight_g,
         );
@@ -145,6 +169,10 @@ impl BuildConfigHandler {
     }
 
     async fn fetch_motor_specs(&self, slug: &str) -> Result<serde_json::Value, String> {
+        self.fetch_component_specs(slug).await
+    }
+
+    async fn fetch_component_specs(&self, slug: &str) -> Result<serde_json::Value, String> {
         let url = format!("{}/api/components/{}", self.api_url, slug);
         let resp = self.http_client.get(&url).send().await
             .map_err(|e| format!("HTTP request failed: {e}"))?;

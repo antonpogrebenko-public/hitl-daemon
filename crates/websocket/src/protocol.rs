@@ -292,6 +292,7 @@ impl VehicleMessage {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ConfigureBuild {
     pub motor_slug: String,
+    pub prop_slug: Option<String>,
     pub prop_diameter_inches: f64,
     pub frame_weight_g: f64,
 }

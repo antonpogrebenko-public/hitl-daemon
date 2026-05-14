@@ -1,6 +1,6 @@
 [package]
 name = "hitl-daemon"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 description = "Hardware-in-the-loop simulator daemon for UAV testing"
 license = "MIT"
