@@ -2,7 +2,7 @@
 
 use crate::state::{SimulationConfig, SimulationState};
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
-use hitl_physics::{rk4_step, throttle_to_omega, PhysicsConfig};
+use hitl_physics::{rk4_step, throttle_to_omega_with_config, total_motor_current, BatteryConfig, PhysicsConfig};
 use mavlink::ardupilotmega::{
     MavMessage, HIL_GPS_DATA, HIL_SENSOR_DATA, HilSensorUpdatedFlags,
 };
@@ -60,7 +60,7 @@ pub struct SimulationLoop {
     state: SimulationState,
     config: SimulationConfig,
     actuator_rx: Receiver<ActuatorOutputs>,
-    config_rx: Receiver<PhysicsConfig>,
+    config_rx: Receiver<(PhysicsConfig, BatteryConfig)>,
     mav_tx: Sender<MavMessage>,
     stats: SimulationStats,
     /// Cached mag reading (only updated at MAG_UPDATE_DIVIDER rate)
@@ -74,7 +74,7 @@ impl SimulationLoop {
     pub fn new(
         config: SimulationConfig,
         actuator_rx: Receiver<ActuatorOutputs>,
-        config_rx: Receiver<PhysicsConfig>,
+        config_rx: Receiver<(PhysicsConfig, BatteryConfig)>,
         mav_tx: Sender<MavMessage>,
     ) -> Self {
         let state = SimulationState::new(config.clone());
@@ -125,9 +125,10 @@ impl SimulationLoop {
             let tick_start = Instant::now();
 
             match self.config_rx.try_recv() {
-                Ok(new_physics) => {
+                Ok((new_physics, new_battery)) => {
                     info!("Reconfiguring simulation");
                     self.config.physics = new_physics;
+                    self.config.battery = new_battery;
                     self.state.reconfigure();
                     self.last_mag = None;
                     self.last_baro = None;
@@ -217,19 +218,25 @@ impl SimulationLoop {
     fn step_physics(&mut self, dt: f64) {
         let mut state = self.state.write();
 
-        // Check if motors are active (any throttle > 1%)
+        // Skip physics only when disarmed on the ground (gyro calibration)
+        let on_ground = state.quadrotor.position[2] >= -0.01;
         let motors_active = state.motor_commands.iter().any(|&c| c > 0.01);
 
-        if motors_active {
-            // Convert motor commands (0-1) to angular velocities
+        if motors_active || !on_ground {
+            // Convert motor commands (0-1) to angular velocities using config-aware max speed
             let motor_omegas: [f64; 4] = std::array::from_fn(|i| {
-                throttle_to_omega(state.motor_commands[i] as f64)
+                throttle_to_omega_with_config(state.motor_commands[i] as f64, &self.config.physics)
             });
+
+            // Discharge battery based on motor current draw
+            if motors_active && !state.battery.is_depleted() {
+                let current = total_motor_current(&motor_omegas, &self.config.physics);
+                state.battery.discharge(current, dt);
+            }
 
             // Step physics using RK4 integration
             state.quadrotor = rk4_step(&state.quadrotor, &self.config.physics, motor_omegas, dt);
         }
-        // When disarmed (motors off), keep drone stationary for gyro calibration
 
         // Ground contact constraint: in NED, Z >= 0 means at or below ground.
         // Clamp position, kill downward velocity, apply friction.

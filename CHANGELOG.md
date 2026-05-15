@@ -5,6 +5,39 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.2] - 2026-05-15
+
+### Added
+- Battery simulation: LiPo discharge model consumes battery during flight based on motor current draw
+- Estimated flight time reported in ConfigureBuild response
+- Recharge command (type 7) resets battery to 100% without reconfiguring
+- Battery recharges automatically on reconfiguration
+- `battery_capacity_mah` and `battery_cell_count` fields in ConfigureBuild payload
+
+### Changed
+- State update packet reports live battery voltage/percent from simulation (no longer hardcoded)
+- Zero-throttle mid-flight now applies gravity (freefall) instead of slow descent
+
+## [0.6.1] - 2026-05-15
+
+### Fixed
+- Yaw oscillation after build config: inertia estimation in `from_build_specs` produced Izz ~3× too low for PX4 default PIDs, causing yaw hunting
+- Simulation loop used legacy `throttle_to_omega` (fixed 2500 rad/s max) instead of voltage-aware `throttle_to_omega_with_config` after reconfiguration
+
+### Changed
+- Inertia model uses point-mass motor contribution with Izz floor of 0.020 kg·m²
+
+## [0.6.0] - 2026-05-14
+
+### Added
+- Battery voltage parameter in ConfigureBuild command
+- Battery voltage affects max motor RPM (KV × voltage × π/30)
+- Propeller selection support (slug or diameter)
+- Electrical parameters in AppliedConfig response (motor_kv, battery_voltage, max_motor_rpm)
+
+### Changed
+- Physics config now uses voltage-limited max motor speed instead of fixed constant
+
 ## [0.5.1] - 2026-05-13
 
 ### Added

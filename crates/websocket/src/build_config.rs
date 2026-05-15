@@ -1,5 +1,5 @@
 use crossbeam_channel::Sender;
-use hitl_physics::PhysicsConfig;
+use hitl_physics::{estimate_flight_time_min, BatteryConfig, PhysicsConfig};
 use crate::handler::ValidatedNshCommand;
 use crate::protocol::{AppliedConfig, ConfigResult, ConfigureBuild};
 use tokio::sync::mpsc;
@@ -10,12 +10,12 @@ const DEFAULT_API_URL: &str = "https://api.th3seus.net";
 pub struct BuildConfigHandler {
     api_url: String,
     http_client: reqwest::Client,
-    config_tx: Sender<PhysicsConfig>,
+    config_tx: Sender<(PhysicsConfig, BatteryConfig)>,
     nsh_tx: Option<mpsc::Sender<ValidatedNshCommand>>,
 }
 
 impl BuildConfigHandler {
-    pub fn new(config_tx: Sender<PhysicsConfig>, nsh_tx: Option<mpsc::Sender<ValidatedNshCommand>>) -> Self {
+    pub fn new(config_tx: Sender<(PhysicsConfig, BatteryConfig)>, nsh_tx: Option<mpsc::Sender<ValidatedNshCommand>>) -> Self {
         let api_url = std::env::var("RELEASE_API_URL")
             .unwrap_or_else(|_| DEFAULT_API_URL.to_string());
 
@@ -91,11 +91,19 @@ impl BuildConfigHandler {
             request.battery_voltage,
         );
 
+        let battery = BatteryConfig::new(
+            request.battery_cell_count,
+            request.battery_capacity_mah,
+            75.0,
+        );
+
         let max_omega = physics.max_motor_speed_from_voltage();
         let max_thrust_per_motor_g = (physics.kt * max_omega * max_omega) / 9.80665 * 1000.0;
         let thrust_to_weight_ratio = (4.0 * max_thrust_per_motor_g) / (physics.mass_kg * 1000.0);
 
         let max_motor_rpm = physics.motor_kv * physics.battery_voltage;
+        let flight_time = estimate_flight_time_min(&battery, &physics);
+
         let applied = AppliedConfig {
             mass_kg: physics.mass_kg,
             kt: physics.kt,
@@ -106,9 +114,10 @@ impl BuildConfigHandler {
             motor_kv: physics.motor_kv,
             battery_voltage: physics.battery_voltage,
             max_motor_rpm,
+            estimated_flight_time_min: flight_time,
         };
 
-        if let Err(e) = self.config_tx.send(physics) {
+        if let Err(e) = self.config_tx.send((physics, battery)) {
             error!(error = %e, "Failed to send physics config to simulation");
             return ConfigResult {
                 success: false,

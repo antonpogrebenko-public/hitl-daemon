@@ -91,19 +91,22 @@ let clean_sensors = SensorsConfig {
 
 ## Motor Mapping
 
-PX4 Quad X motor order differs from simulation:
+PX4 Standard Quad X — identity mapping (no remapping needed):
 
 ```
-PX4:                    Simulation:
-    Front                   Front
-  3(CW)   1(CCW)         1(CW)   2(CCW)
-     \   /                  \   /
-       X           →          X
-     /   \                  /   \
-  2(CCW)  4(CW)          4(CCW) 3(CW)
-    Back                    Back
+    Front
+  3(CW)   1(CCW)
+     \   /
+       X
+     /   \
+  2(CCW)  4(CW)
+    Back
 
-Mapping: PX4_TO_SIM_MOTOR_MAP = [2, 0, 3, 1]
+PX4_TO_SIM_MOTOR_MAP = [0, 1, 2, 3]
+ch0 → Motor 1 (FR, CCW)
+ch1 → Motor 2 (BL, CCW)
+ch2 → Motor 3 (FL, CW)
+ch3 → Motor 4 (BR, CW)
 ```
 
 ## Building

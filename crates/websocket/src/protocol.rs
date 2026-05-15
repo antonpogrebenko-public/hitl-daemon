@@ -295,14 +295,17 @@ pub struct ConfigureBuild {
     pub prop_slug: Option<String>,
     pub prop_diameter_inches: f64,
     pub frame_weight_g: f64,
-    /// Battery voltage (optional, defaults to 14.8V / 4S)
     #[serde(default = "default_battery_voltage")]
     pub battery_voltage: f64,
+    #[serde(default = "default_battery_capacity_mah")]
+    pub battery_capacity_mah: f64,
+    #[serde(default = "default_battery_cell_count")]
+    pub battery_cell_count: u8,
 }
 
-fn default_battery_voltage() -> f64 {
-    14.8 // 4S LiPo nominal
-}
+fn default_battery_voltage() -> f64 { 14.8 }
+fn default_battery_capacity_mah() -> f64 { 1500.0 }
+fn default_battery_cell_count() -> u8 { 4 }
 
 impl ConfigureBuild {
     pub fn from_bytes(data: &[u8]) -> Result<Self, ProtocolError> {
@@ -357,10 +360,10 @@ pub struct AppliedConfig {
     pub arm_length_m: f64,
     pub max_thrust_per_motor_g: f64,
     pub thrust_to_weight_ratio: f64,
-    // Electrical/thermal parameters
     pub motor_kv: f64,
     pub battery_voltage: f64,
     pub max_motor_rpm: f64,
+    pub estimated_flight_time_min: f64,
 }
 
 impl HandshakeAck {
@@ -502,6 +505,7 @@ pub enum CommandType {
     Rtl = 4,
     SetMode = 5,
     EmergencyStop = 6,
+    Recharge = 7,
 }
 
 impl std::fmt::Display for CommandType {
@@ -514,6 +518,7 @@ impl std::fmt::Display for CommandType {
             CommandType::Rtl => write!(f, "RTL"),
             CommandType::SetMode => write!(f, "SetMode"),
             CommandType::EmergencyStop => write!(f, "EmergencyStop"),
+            CommandType::Recharge => write!(f, "Recharge"),
         }
     }
 }
@@ -530,6 +535,7 @@ impl TryFrom<u8> for CommandType {
             4 => Ok(CommandType::Rtl),
             5 => Ok(CommandType::SetMode),
             6 => Ok(CommandType::EmergencyStop),
+            7 => Ok(CommandType::Recharge),
             _ => Err(ProtocolError::InvalidCommandType(value)),
         }
     }

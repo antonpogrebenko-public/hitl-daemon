@@ -1,6 +1,6 @@
 //! Shared simulation state between threads
 
-use hitl_physics::{PhysicsConfig, QuadrotorState};
+use hitl_physics::{BatteryConfig, BatteryState, PhysicsConfig, QuadrotorState};
 use hitl_sensors::{Sensors, SensorsConfig};
 use parking_lot::RwLock;
 use std::sync::Arc;
@@ -10,6 +10,8 @@ use std::sync::Arc;
 pub struct SimulationConfig {
     /// Physics configuration
     pub physics: PhysicsConfig,
+    /// Battery configuration
+    pub battery: BatteryConfig,
     /// Sensor configuration
     pub sensors: SensorsConfig,
     /// Reference latitude for GPS (degrees)
@@ -28,6 +30,7 @@ impl Default for SimulationConfig {
     fn default() -> Self {
         Self {
             physics: PhysicsConfig::default(),
+            battery: BatteryConfig::default(),
             sensors: SensorsConfig::default(),
             // Default to Boulder, CO
             reference_lat: 40.015,
@@ -43,6 +46,8 @@ impl Default for SimulationConfig {
 pub struct SimulationStateInner {
     /// Quadrotor physics state
     pub quadrotor: QuadrotorState,
+    /// Battery discharge state
+    pub battery: BatteryState,
     /// Sensor suite
     pub sensors: Sensors,
     /// Simulation time in microseconds
@@ -62,6 +67,7 @@ impl SimulationStateInner {
     pub fn new(config: &SimulationConfig) -> Self {
         Self {
             quadrotor: QuadrotorState::default(),
+            battery: BatteryState::fully_charged(&config.battery),
             sensors: Sensors::with_config(config.sensors.clone()),
             sim_time_us: 0,
             motor_commands: [0.0; 4],
@@ -74,6 +80,7 @@ impl SimulationStateInner {
     /// Reset simulation to initial state
     pub fn reset(&mut self, config: &SimulationConfig) {
         self.quadrotor = QuadrotorState::default();
+        self.battery = BatteryState::fully_charged(&config.battery);
         self.sensors = Sensors::with_config(config.sensors.clone());
         self.sim_time_us = 0;
         self.motor_commands = [0.0; 4];
@@ -162,5 +169,10 @@ impl SimulationState {
     /// Reconfigure: reset inner state for new physics parameters
     pub fn reconfigure(&self) {
         self.inner.write().reset(&self.config);
+    }
+
+    /// Recharge the battery to full
+    pub fn recharge_battery(&self) {
+        self.inner.write().battery.recharge();
     }
 }

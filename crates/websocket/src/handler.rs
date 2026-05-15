@@ -15,6 +15,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{debug, info, warn};
 
+/// Callback for battery recharge (avoids websocket → simulation crate dependency)
+pub type RechargeCallback = Arc<dyn Fn() + Send + Sync>;
+
 /// Rate limiting configuration
 const COMMAND_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(1);
 const MAX_COMMANDS_PER_WINDOW: usize = 10;
@@ -64,6 +67,8 @@ pub struct ConnectionHandler {
     nsh_tx: Option<mpsc::Sender<ValidatedNshCommand>>,
     /// Handler for build configuration requests
     build_config: Option<Arc<BuildConfigHandler>>,
+    /// Callback to recharge battery in simulation
+    recharge_fn: Option<RechargeCallback>,
     /// Broadcast channel to receive state updates
     state_rx: broadcast::Receiver<StateUpdate>,
     /// Rate limiting: client_id -> (window_start, command_count)
@@ -92,6 +97,7 @@ impl ConnectionHandler {
             command_tx,
             nsh_tx: None,
             build_config: None,
+            recharge_fn: None,
             state_rx,
             rate_limits: Arc::new(RwLock::new(HashMap::new())),
             next_client_id: Arc::new(RwLock::new(1)),
@@ -112,6 +118,11 @@ impl ConnectionHandler {
     /// Set the build config handler
     pub fn set_build_config_handler(&mut self, handler: Arc<BuildConfigHandler>) {
         self.build_config = Some(handler);
+    }
+
+    /// Set the battery recharge callback
+    pub fn set_recharge_callback(&mut self, callback: RechargeCallback) {
+        self.recharge_fn = Some(callback);
     }
 
     /// Allocate a new client ID
@@ -300,6 +311,24 @@ impl ConnectionHandler {
             });
         }
 
+        // Handle recharge locally (doesn't go to FC)
+        if cmd.command_type == CommandType::Recharge {
+            if let Some(ref recharge) = self.recharge_fn {
+                recharge();
+                info!(client_id, "Battery recharged");
+                return OutgoingMessage::CommandAck(CommandAck {
+                    command_id: cmd.command_id,
+                    success: true,
+                    error: None,
+                });
+            }
+            return OutgoingMessage::CommandAck(CommandAck {
+                command_id: cmd.command_id,
+                success: false,
+                error: Some("Battery recharge unavailable".to_string()),
+            });
+        }
+
         // Validate command parameters
         if let Err(e) = self.validate_command(&cmd) {
             warn!(
@@ -418,6 +447,7 @@ impl Clone for ConnectionHandler {
             rate_limits: Arc::clone(&self.rate_limits),
             next_client_id: Arc::clone(&self.next_client_id),
             shutdown_signal: Arc::clone(&self.shutdown_signal),
+            recharge_fn: self.recharge_fn.clone(),
         }
     }
 }

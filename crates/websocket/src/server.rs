@@ -79,6 +79,8 @@ pub struct WebSocketServer {
     shutdown_signal: Arc<AtomicBool>,
     /// Build configuration handler
     build_config_handler: Option<Arc<BuildConfigHandler>>,
+    /// Recharge callback (for recharge command)
+    recharge_fn: Option<crate::handler::RechargeCallback>,
 }
 
 impl WebSocketServer {
@@ -98,6 +100,7 @@ impl WebSocketServer {
             vehicle_msg_rx: None,
             shutdown_signal: Arc::new(AtomicBool::new(false)),
             build_config_handler: None,
+            recharge_fn: None,
         }
     }
 
@@ -129,6 +132,11 @@ impl WebSocketServer {
     /// Set the build configuration handler
     pub fn set_build_config_handler(&mut self, handler: Arc<BuildConfigHandler>) {
         self.build_config_handler = Some(handler);
+    }
+
+    /// Set the battery recharge callback
+    pub fn set_recharge_callback(&mut self, callback: crate::handler::RechargeCallback) {
+        self.recharge_fn = Some(callback);
     }
 
     /// Get a sender for broadcasting state updates
@@ -168,6 +176,10 @@ impl WebSocketServer {
         // Enable build config handler if set
         if let Some(build_config_handler) = self.build_config_handler {
             handler.set_build_config_handler(build_config_handler);
+        }
+        // Enable recharge callback
+        if let Some(recharge_fn) = self.recharge_fn {
+            handler.set_recharge_callback(recharge_fn);
         }
         // Start with FC disconnected — connection manager will update via ConnectionStatus
         handler.set_pixhawk_connected(false).await;

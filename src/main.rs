@@ -9,7 +9,7 @@ use mavlink::ardupilotmega::MavMessage;
 use mavlink_io::async_io::{MavlinkIo, NshRequest, reconnect_delay};
 use mavlink_io::serial::find_pixhawk_ports;
 use protocol::{ActuatorOutputs, DaemonState, DaemonStatus};
-use hitl_physics::{throttle_to_omega, PhysicsConfig};
+use hitl_physics::{throttle_to_omega_with_config, PhysicsConfig};
 use hitl_sensors::{ImuConfig, SensorsConfig};
 use simulation::{SimulationConfig, SimulationLoop, SimulationState};
 use std::net::UdpSocket;
@@ -173,7 +173,7 @@ fn spawn_simulation_thread(
     actuator_rx: Receiver<ActuatorOutputs>,
     mav_tx: Sender<MavMessage>,
     _shutdown: Arc<AtomicBool>,
-    config_rx: Receiver<PhysicsConfig>,
+    config_rx: Receiver<(PhysicsConfig, hitl_physics::BatteryConfig)>,
 ) -> (thread::JoinHandle<()>, SimulationState) {
     let mut sim_loop = SimulationLoop::new(config, actuator_rx, config_rx, mav_tx);
     let state = sim_loop.state_handle();
@@ -226,6 +226,7 @@ fn spawn_sim_only_actuator_thread(
 fn create_state_update(sim_state: &SimulationState, packets_per_sec: u16) -> StateUpdate {
     let state = sim_state.read();
     let q = &state.quadrotor;
+    let config = sim_state.config();
 
     StateUpdate {
         timestamp_us: state.sim_time_us,
@@ -244,14 +245,14 @@ fn create_state_update(sim_state: &SimulationState, packets_per_sec: u16) -> Sta
         ],
         motor_rpms: if state.armed {
             state.motor_commands.map(|c| {
-                let omega = throttle_to_omega(c as f64);
+                let omega = throttle_to_omega_with_config(c as f64, &config.physics);
                 (omega * 60.0 / (2.0 * std::f64::consts::PI)) as f32
             })
         } else {
-            [0.0; 4] // Show 0 RPM when disarmed
+            [0.0; 4]
         },
-        battery_voltage: 16.8,
-        battery_percent: 100,
+        battery_voltage: state.battery.voltage() as f32,
+        battery_percent: state.battery.percent(),
         armed: state.armed,
         flight_mode: state.flight_mode,
         packets_per_sec,
@@ -332,10 +333,10 @@ async fn main() {
     // Create channels
     // actuator_tx/rx: MAVLink receiver -> Simulation (HIL_ACTUATOR_CONTROLS)
     // sim_mav_tx/rx: Simulation -> MAVLink sender (HIL_SENSOR, HIL_GPS)
-    // build_config_tx/rx: WebSocket -> Simulation (PhysicsConfig updates)
+    // build_config_tx/rx: WebSocket -> Simulation (PhysicsConfig + BatteryConfig updates)
     let (actuator_tx, actuator_rx) = bounded::<ActuatorOutputs>(16);
     let (sim_mav_tx, sim_mav_rx) = bounded::<MavMessage>(64);
-    let (build_config_tx, build_config_rx) = bounded::<PhysicsConfig>(1);
+    let (build_config_tx, build_config_rx) = bounded::<(PhysicsConfig, hitl_physics::BatteryConfig)>(1);
 
     // Shutdown signal
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -437,6 +438,10 @@ async fn main() {
     let nsh_tx_for_config = if sim_only_mode { None } else { Some(nsh_cmd_tx.clone()) };
     let build_config_handler = std::sync::Arc::new(websocket::BuildConfigHandler::new(build_config_tx, nsh_tx_for_config));
     ws_server.set_build_config_handler(build_config_handler);
+    let sim_state_for_recharge = sim_state.clone();
+    ws_server.set_recharge_callback(std::sync::Arc::new(move || {
+        sim_state_for_recharge.recharge_battery();
+    }));
 
     // Always enable NSH support (will be available when Pixhawk connects)
     ws_server.set_nsh_sender(nsh_cmd_tx);
