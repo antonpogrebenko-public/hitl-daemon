@@ -368,6 +368,11 @@ async fn main() {
         TracingMode::Plain => None,
     };
 
+    // Clone the MAVLink output for the WebSocket build-config handler so it
+    // can push Phase 6 per-build PIDs via PARAM_SET. In --sim-only mode there
+    // is no PX4 attached, so the param push is pointless and we pass None.
+    let build_config_mav_tx = if sim_only_mode { None } else { Some(sim_mav_tx.clone()) };
+
     // Spawn simulation thread
     let (sim_handle, sim_state) = spawn_simulation_thread(
         sim_config,
@@ -436,7 +441,11 @@ async fn main() {
     // Set up build config handler to send PhysicsConfig updates to simulation
     // Pass NSH sender so it can restart EKF2 after config changes (clone before moving to ws_server)
     let nsh_tx_for_config = if sim_only_mode { None } else { Some(nsh_cmd_tx.clone()) };
-    let build_config_handler = std::sync::Arc::new(websocket::BuildConfigHandler::new(build_config_tx, nsh_tx_for_config));
+    let build_config_handler = std::sync::Arc::new(websocket::BuildConfigHandler::new(
+        build_config_tx,
+        nsh_tx_for_config,
+        build_config_mav_tx,
+    ));
     ws_server.set_build_config_handler(build_config_handler);
     let sim_state_for_recharge = sim_state.clone();
     ws_server.set_recharge_callback(std::sync::Arc::new(move || {

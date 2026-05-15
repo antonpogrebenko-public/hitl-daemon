@@ -301,6 +301,12 @@ pub struct ConfigureBuild {
     pub battery_capacity_mah: f64,
     #[serde(default = "default_battery_cell_count")]
     pub battery_cell_count: u8,
+    #[serde(default)]
+    pub esc_slug: Option<String>,
+    #[serde(default)]
+    pub fc_slug: Option<String>,
+    #[serde(default)]
+    pub frame_slug: Option<String>,
 }
 
 fn default_battery_voltage() -> f64 { 14.8 }
@@ -364,6 +370,30 @@ pub struct AppliedConfig {
     pub battery_voltage: f64,
     pub max_motor_rpm: f64,
     pub estimated_flight_time_min: f64,
+    /// Per-build PX4 rate-controller gains pushed via `PARAM_SET` (Phase 6).
+    /// Absent when the daemon ran in `--sim-only` mode or the fingerprint
+    /// matched the previously-applied build (so we skipped the push).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied_pids: Option<Px4PidsView>,
+}
+
+/// JSON-friendly view of `hitl_physics::px4_pids::Px4Pids` for transport over
+/// the WebSocket. Kept here (rather than re-exporting upstream) so the wire
+/// schema is owned by the protocol crate and can evolve independently.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct Px4PidsView {
+    pub roll_p: f32,
+    pub roll_i: f32,
+    pub roll_d: f32,
+    pub roll_ff: f32,
+    pub pitch_p: f32,
+    pub pitch_i: f32,
+    pub pitch_d: f32,
+    pub pitch_ff: f32,
+    pub yaw_p: f32,
+    pub yaw_i: f32,
+    pub yaw_d: f32,
+    pub yaw_ff: f32,
 }
 
 impl HandshakeAck {

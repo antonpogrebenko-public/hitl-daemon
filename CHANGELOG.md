@@ -5,6 +5,18 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.3] - 2026-05-15
+
+### Fixed
+- Motor RPM oscillation / drone trembling on lightweight builds (<500g): added Ixx/Iyy inertia floor of 0.012 kg·m² so PX4's rate PIDs don't overshoot
+- Izz/Ixx ratio now always >= 1.7 to prevent unphysical gyroscopic coupling
+- Battery depletion no longer allows infinite hover: motor commands zeroed when SoC < 5%
+- Max speed unrealistically low (~4 m/s): drag coefficients now derived from frontal area (0.5×ρ×Cd×A) instead of hardcoded 0.25
+
+### Changed
+- Drag model uses physically-derived coefficients based on prop diameter (~0.016 for 5" lateral, ~0.022 vertical)
+- `hitl-physics` bumped to 0.5.0 (breaking: drag and inertia behavior changes for all `from_build_specs` configs)
+
 ## [0.6.2] - 2026-05-15
 
 ### Added

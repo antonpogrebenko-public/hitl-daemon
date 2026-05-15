@@ -9,6 +9,8 @@ Connects to a Pixhawk via USB serial, runs 400 Hz physics simulation, and:
 - Sends simulated sensor data (HIL_SENSOR, HIL_GPS)
 - Bridges to QGroundControl via UDP
 - Serves WebSocket for browser UI and NSH access
+- Accepts runtime build configuration (motor/prop/battery) from web UI
+- Simulates battery discharge with motor cutoff on depletion
 
 ## Quick Start
 
@@ -49,18 +51,46 @@ hitl-daemon/
 ├── crates/
 │   ├── mavlink-io/       # Serial port, MAVLink codec, async I/O
 │   ├── protocol/         # Shared types: ActuatorOutputs, FlightMode
-│   ├── simulation/       # Physics loop, thread-safe state
-│   └── websocket/        # Axum server, binary protocol, NSH handler
+│   ├── simulation/       # Physics loop, thread-safe state, battery
+│   └── websocket/        # Axum server, binary protocol, NSH, build config handler
 ```
 
 ## Key Files
 
 - `src/main.rs` — Thread spawning, channel plumbing, sensor config
 - `crates/protocol/src/lib.rs` — PX4 motor mapping (PX4_TO_SIM_MOTOR_MAP)
-- `crates/simulation/src/loop_runner.rs` — 400 Hz simulation loop
-- `crates/websocket/src/handler.rs` — WebSocket message handling, NSH
+- `crates/simulation/src/loop_runner.rs` — 400 Hz simulation loop, battery discharge
+- `crates/simulation/src/state.rs` — Thread-safe state (QuadrotorState + BatteryState)
+- `crates/websocket/src/handler.rs` — WebSocket message handling, NSH, recharge command
+- `crates/websocket/src/build_config.rs` — ConfigureBuild handler, physics reconfiguration
 
-## Configuration
+## Runtime Configuration
+
+The daemon accepts `ConfigureBuild` messages from the web UI via WebSocket:
+```json
+{
+  "type": "configure_build",
+  "motor_slug": "xing-2208-1800kv",
+  "prop_slug": "gemfan-5030",
+  "prop_diameter_inches": 5.0,
+  "frame_weight_g": 350.0,
+  "battery_voltage": 14.8,
+  "battery_capacity_mah": 1000,
+  "battery_cell_count": 4
+}
+```
+
+This triggers:
+1. New `PhysicsConfig` via `from_build_specs`
+2. New `BatteryConfig`
+3. Simulation state reset (position, battery recharged)
+4. EKF2 restart via NSH (`ekf2 stop` → `ekf2 start`)
+5. Response with applied config parameters and estimated flight time
+
+### Recharge Command
+The web UI can send a `Recharge` command to reset battery to 100% without resetting position/attitude. Handled in the websocket handler before forwarding to FC.
+
+## Sensor Configuration
 
 ### Sensor Noise (in main.rs)
 ```rust
@@ -109,6 +139,19 @@ ch2 → Motor 3 (FL, CW)
 ch3 → Motor 4 (BR, CW)
 ```
 
+## Simulation Loop Details
+
+The 400 Hz loop in `loop_runner.rs`:
+1. Check for new `(PhysicsConfig, BatteryConfig)` on config channel → reconfigure
+2. Drain actuator commands from PX4 (use latest)
+3. Convert throttle [0,1] → motor omega via `throttle_to_omega_with_config`
+4. Discharge battery based on total motor current (`total_motor_current`)
+5. If battery depleted → zero motor commands (drone falls)
+6. RK4 integration step
+7. Ground contact constraint (clamp Z, friction)
+8. Sample sensors (IMU@400Hz, mag/baro@50Hz, GPS@10Hz)
+9. Send HIL_SENSOR and HIL_GPS to PX4
+
 ## Building
 
 ```bash
@@ -139,17 +182,23 @@ When `ConfigureBuild` is received, the daemon automatically restarts EKF2 via NS
 ### Flight mode from HEARTBEAT
 The daemon extracts flight mode from `HEARTBEAT.custom_mode` bits 16-23 (PX4 main mode) and updates the simulation state. The frontend displays this in real-time. Note: PX4 may reject mode changes when EKF2 has preflight failures.
 
+### Battery depletion behavior
+When battery SoC drops below 5%, motor commands are zeroed regardless of PX4 actuator outputs. The drone will fall. Recharge via WebSocket `Recharge` command or `ConfigureBuild` (which resets the full state).
+
+### Config channel is non-blocking
+The simulation loop uses `try_recv` on the config channel. If multiple configs are sent rapidly, only the last one applied matters (earlier ones are processed sequentially on next ticks).
+
 ## WebSocket Protocol
 
 - Port: 9876
 - Endpoint: `ws://localhost:9876/ws`
-- Binary protocol for telemetry (30 Hz)
-- JSON for NSH commands
+- Binary protocol for telemetry (30 Hz) — includes battery voltage and percent
+- JSON for commands (NSH, ConfigureBuild, Recharge)
 
 ## Dependencies
 
 ```toml
 [dependencies]
-hitl-physics = { git = "https://github.com/antonpogrebenko-public/hitl-physics" }
-hitl-sensors = { git = "https://github.com/antonpogrebenko-public/hitl-sensors" }
+hitl-physics = { path = "../hitl-physics" }
+hitl-sensors = { path = "../hitl-sensors" }
 ```

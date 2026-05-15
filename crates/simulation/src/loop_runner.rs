@@ -224,7 +224,7 @@ impl SimulationLoop {
 
         if motors_active || !on_ground {
             // Convert motor commands (0-1) to angular velocities using config-aware max speed
-            let motor_omegas: [f64; 4] = std::array::from_fn(|i| {
+            let mut motor_omegas: [f64; 4] = std::array::from_fn(|i| {
                 throttle_to_omega_with_config(state.motor_commands[i] as f64, &self.config.physics)
             });
 
@@ -232,6 +232,8 @@ impl SimulationLoop {
             if motors_active && !state.battery.is_depleted() {
                 let current = total_motor_current(&motor_omegas, &self.config.physics);
                 state.battery.discharge(current, dt);
+            } else if state.battery.is_depleted() {
+                motor_omegas = [0.0; 4];
             }
 
             // Step physics using RK4 integration
