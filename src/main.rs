@@ -428,6 +428,14 @@ async fn main() {
     // Broadcast channel for vehicle messages (STATUSTEXT from PX4)
     let (vehicle_msg_tx, _) = tokio::sync::broadcast::channel::<VehicleMessage>(64);
 
+    // Broadcast channel for PARAM_VALUE acks from PX4. BuildConfigHandler
+    // subscribes after pushing PARAM_SETs so it can verify each parameter
+    // was actually applied before signalling the simulation "ready" stage.
+    // Capacity is generous because PX4 may emit unrelated PARAM_VALUE traffic
+    // during the wait window (e.g. QGC parameter pull).
+    let (param_value_tx, _) =
+        tokio::sync::broadcast::channel::<(String, f32)>(256);
+
     // Create WebSocket server
     let ws_config = WebSocketServerConfig {
         port: args.websocket_port,
@@ -441,10 +449,12 @@ async fn main() {
     // Set up build config handler to send PhysicsConfig updates to simulation
     // Pass NSH sender so it can restart EKF2 after config changes (clone before moving to ws_server)
     let nsh_tx_for_config = if sim_only_mode { None } else { Some(nsh_cmd_tx.clone()) };
+    let build_config_param_value_tx = if sim_only_mode { None } else { Some(param_value_tx.clone()) };
     let build_config_handler = std::sync::Arc::new(websocket::BuildConfigHandler::new(
         build_config_tx,
         nsh_tx_for_config,
         build_config_mav_tx,
+        build_config_param_value_tx,
     ));
     ws_server.set_build_config_handler(build_config_handler);
     let sim_state_for_recharge = sim_state.clone();
@@ -790,6 +800,7 @@ async fn main() {
         let qgc_socket_reconnect = qgc_socket.clone();
         let fc_model_reconnect = fc_model.clone();
         let sim_state_reconnect = sim_state.clone();
+        let param_value_tx_reconnect = param_value_tx.clone();
         let preferred_port = args.port.clone();
         let baud = args.baud;
 
@@ -912,6 +923,7 @@ async fn main() {
                         let vehicle_msg_tx_recv = vehicle_msg_tx.clone();
                         let fc_model_recv = fc_model_reconnect.clone();
                         let conn_status_tx_recv = conn_status_tx_reconnect.clone();
+                        let param_value_tx_recv = param_value_tx_reconnect.clone();
                         let port_path_recv = port_path.clone();
                         let sim_state_recv = sim_state_reconnect.clone();
                         let start_time = std::time::Instant::now();
@@ -944,6 +956,19 @@ async fn main() {
                                     if let MavMessage::HIL_ACTUATOR_CONTROLS(_) = &msg {
                                         if let Ok(actuator) = ActuatorOutputs::from_mavlink(&msg) {
                                             let _ = actuator_tx_recv.send(actuator);
+                                        }
+                                    }
+
+                                    // Process PARAM_VALUE (PX4 ack for PARAM_SET). Forward to
+                                    // BuildConfigHandler so it can verify each PID parameter
+                                    // was applied before transitioning the config to Ready.
+                                    if let MavMessage::PARAM_VALUE(pv) = &msg {
+                                        let name = std::str::from_utf8(&pv.param_id)
+                                            .unwrap_or("")
+                                            .trim_end_matches('\0')
+                                            .to_string();
+                                        if !name.is_empty() {
+                                            let _ = param_value_tx_recv.send((name, pv.param_value));
                                         }
                                     }
 

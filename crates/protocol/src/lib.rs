@@ -237,8 +237,20 @@ fn default_battery_voltage() -> f64 { 14.8 }
 fn default_battery_capacity_mah() -> f64 { 1500.0 }
 fn default_battery_cell_count() -> u8 { 4 }
 
+/// Lifecycle stage of a `ConfigureBuild` request. Mirrors
+/// `websocket::protocol::ConfigState` — kept in sync because both crates
+/// serialize the same wire format.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigState {
+    Configuring,
+    Ready,
+    Error,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfigResult {
+    pub state: ConfigState,
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -258,6 +270,8 @@ pub struct AppliedConfig {
     pub battery_voltage: f64,
     pub max_motor_rpm: f64,
     pub estimated_flight_time_min: f64,
+    /// Count of `PARAM_SET` PIDs whose `PARAM_VALUE` ack was confirmed.
+    pub verified_params: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]

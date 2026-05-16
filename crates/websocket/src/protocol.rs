@@ -339,8 +339,27 @@ impl ConfigureBuild {
     }
 }
 
+/// Lifecycle stage of a `ConfigureBuild` request. Two-stage so the UI can show
+/// "Configuring…" while we await `PARAM_VALUE` acks from PX4, then unlock the
+/// "Continue to simulator" button only on `Ready`.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigState {
+    /// Physics + PIDs computed, but `PARAM_SET` acks still pending. Simulation
+    /// has NOT been reconfigured yet — frontend must keep the user on the
+    /// configure screen.
+    Configuring,
+    /// All `PARAM_SET` messages acked by PX4 (or skipped in --sim-only). New
+    /// physics delivered to the sim loop and EKF2 restarted. Safe to fly.
+    Ready,
+    /// Something failed (PX4 unreachable, ack timeout, sim channel down).
+    /// Sim still runs the previous config; frontend should show the error.
+    Error,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfigResult {
+    pub state: ConfigState,
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -375,6 +394,9 @@ pub struct AppliedConfig {
     /// matched the previously-applied build (so we skipped the push).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub applied_pids: Option<Px4PidsView>,
+    /// Count of `PARAM_SET` messages confirmed via matching `PARAM_VALUE` ack
+    /// from PX4. Zero in --sim-only or on the initial `Configuring` stage.
+    pub verified_params: u32,
 }
 
 /// JSON-friendly view of `hitl_physics::px4_pids::Px4Pids` for transport over

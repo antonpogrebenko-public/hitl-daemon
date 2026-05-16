@@ -461,7 +461,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     while let Some(msg) = ws_receiver.next().await {
         match msg {
             Ok(Message::Binary(data)) => {
-                match recv_handler.handle_message(client_id, &data).await {
+                match recv_handler
+                    .handle_message(client_id, &data, &response_tx)
+                    .await
+                {
                     Ok(Some(response)) => {
                         // Send response via channel to the send task
                         if response_tx.send(response).await.is_err() {

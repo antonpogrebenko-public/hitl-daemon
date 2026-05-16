@@ -5,8 +5,8 @@
 
 use crate::build_config::BuildConfigHandler;
 use crate::protocol::{
-    Command, CommandAck, CommandType, ConfigResult, HandshakeAck, IncomingMessage, NshCommand,
-    NshResponse, OutgoingMessage, StateUpdate,
+    Command, CommandAck, CommandType, ConfigResult, ConfigState, HandshakeAck, IncomingMessage,
+    NshCommand, NshResponse, OutgoingMessage, StateUpdate,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -154,11 +154,17 @@ impl ConnectionHandler {
         })
     }
 
-    /// Handle an incoming message from a client
+    /// Handle an incoming message from a client.
+    ///
+    /// `progress_tx` is the per-client outgoing channel. Most handlers ignore
+    /// it and return their single response via `Ok(Some(...))`. ConfigureBuild
+    /// uses it to push an interim `state: Configuring` ConfigResult before
+    /// the final result is returned (two-stage flow — see `BuildConfigHandler::handle`).
     pub async fn handle_message(
         &self,
         client_id: u64,
         data: &[u8],
+        progress_tx: &mpsc::Sender<OutgoingMessage>,
     ) -> Result<Option<OutgoingMessage>, String> {
         let msg = IncomingMessage::from_bytes(data).map_err(|e| e.to_string())?;
 
@@ -181,6 +187,7 @@ impl ConnectionHandler {
                     Some(h) => h.clone(),
                     None => {
                         let result = ConfigResult {
+                            state: ConfigState::Error,
                             success: false,
                             error: Some("Build configuration not available".to_string()),
                             config: None,
@@ -188,7 +195,7 @@ impl ConnectionHandler {
                         return Ok(Some(OutgoingMessage::ConfigResult(result)));
                     }
                 };
-                let result = handler.handle(build).await;
+                let result = handler.handle(build, progress_tx.clone()).await;
                 Ok(Some(OutgoingMessage::ConfigResult(result)))
             }
             IncomingMessage::Shutdown => {

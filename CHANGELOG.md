@@ -5,6 +5,21 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-05-16
+
+### Fixed
+- Drone trembling / rate-controller oscillation on light builds: the Phase 6 PARAM_SET push to PX4 was commented out, so PX4 ran stock PIDs tuned for I_ref ≈ 0.005 against actual inertia of ~0.0037 — a ~34% over-gain that no manual tuning could stabilize.
+
+### Added
+- Two-stage `ConfigResult` lifecycle (`configuring` → `ready` | `error`). The simulation loop is no longer reconfigured until PX4 confirms every PID parameter.
+- Per-build PID PARAM_SET push with `PARAM_VALUE` ack verification. Per-parameter 800 ms timeout, 3 retries, value-match within 1e-4 epsilon.
+- `AppliedConfig.verified_params` and `AppliedConfig.applied_pids` surface what was actually written to PX4.
+- Frontend banner on `/simulator/run` shows "Verifying PX4 PIDs…", then a green "Continue to simulator" CTA on ready, or red error + retry on ack failure.
+
+### Changed
+- `BuildConfigHandler::push_pids_and_verify` replaces the fire-and-forget `push_pids_if_changed`. Fingerprint cache only updates on full verification — partial pushes retry the whole sequence on the next `ConfigureBuild`.
+- MAVLink receiver task taps `PARAM_VALUE` and broadcasts on a 256-deep tokio channel for the handler to subscribe to.
+
 ## [0.6.3] - 2026-05-15
 
 ### Fixed

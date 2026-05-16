@@ -6,10 +6,29 @@ use hitl_physics::{
 };
 use mavlink::ardupilotmega::{MavMessage, MavParamType, PARAM_SET_DATA};
 use std::sync::Mutex;
+use std::time::Duration;
 use crate::handler::ValidatedNshCommand;
-use crate::protocol::{AppliedConfig, ConfigResult, ConfigureBuild, Px4PidsView};
-use tokio::sync::mpsc;
+use crate::protocol::{
+    AppliedConfig, ConfigResult, ConfigState, ConfigureBuild, OutgoingMessage, Px4PidsView,
+};
+use tokio::sync::{broadcast, mpsc};
+use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
+
+/// Per-parameter ack budget. PX4 typically responds within 20-50 ms on a
+/// healthy 921600-baud link; 800 ms covers serial backpressure and busy
+/// EEPROM writes.
+const PARAM_ACK_TIMEOUT: Duration = Duration::from_millis(800);
+
+/// How many times we resend a single PARAM_SET before giving up and failing
+/// the whole `ConfigureBuild`. Three covers a transient drop without making
+/// the user wait minutes on a truly unreachable FC.
+const PARAM_RETRY_COUNT: u8 = 3;
+
+/// Float epsilon for matching PX4's `PARAM_VALUE` against the value we sent.
+/// PX4 stores rate-controller gains as `float32`, so any round-trip drift is
+/// well below this bound.
+const PARAM_ACK_EPSILON: f32 = 1.0e-4;
 
 const DEFAULT_API_URL: &str = "https://api.th3seus.net";
 
@@ -26,9 +45,15 @@ pub struct BuildConfigHandler {
     /// `HIL_SENSOR` / `HIL_GPS`. Phase 6 pushes `PARAM_SET` here.
     /// `None` in `--sim-only` mode (no PX4 attached, no point pushing).
     mav_tx: Option<Sender<MavMessage>>,
-    /// Fingerprint of the last set of PIDs successfully queued. When the next
-    /// `ConfigureBuild` yields the same fingerprint, we skip the param push
-    /// to avoid wearing PX4's EEPROM on rapid reconfigures.
+    /// Broadcast tap on incoming PARAM_VALUE messages — populated by the
+    /// MAVLink receiver task. We subscribe before sending PARAM_SETs so we
+    /// can verify each parameter was applied to PX4's running config.
+    /// `None` mirrors `mav_tx == None` (sim-only mode skips verification).
+    param_value_tx: Option<broadcast::Sender<(String, f32)>>,
+    /// Fingerprint of the last set of PIDs successfully *verified*. When the
+    /// next `ConfigureBuild` yields the same fingerprint, we skip the param
+    /// push to avoid wearing PX4's EEPROM on rapid reconfigures. Only set
+    /// after all PARAM_VALUE acks succeed.
     last_pid_fingerprint: Mutex<Option<u64>>,
 }
 
@@ -37,6 +62,7 @@ impl BuildConfigHandler {
         config_tx: Sender<(PhysicsConfig, BatteryConfig)>,
         nsh_tx: Option<mpsc::Sender<ValidatedNshCommand>>,
         mav_tx: Option<Sender<MavMessage>>,
+        param_value_tx: Option<broadcast::Sender<(String, f32)>>,
     ) -> Self {
         let api_url = std::env::var("RELEASE_API_URL")
             .unwrap_or_else(|_| DEFAULT_API_URL.to_string());
@@ -50,16 +76,33 @@ impl BuildConfigHandler {
             config_tx,
             nsh_tx,
             mav_tx,
+            param_value_tx,
             last_pid_fingerprint: Mutex::new(None),
         }
     }
 
-    pub async fn handle(&self, request: ConfigureBuild) -> ConfigResult {
+    /// Process a `ConfigureBuild` request through the two-stage lifecycle:
+    ///
+    /// 1. Early validation (fetch component specs from API). Failure here
+    ///    returns a single `state: Error` ConfigResult and aborts.
+    /// 2. Compute physics + PIDs, emit `state: Configuring` via `progress_tx`
+    ///    so the UI can show a spinner. The simulation has NOT been
+    ///    reconfigured at this point.
+    /// 3. Push PARAM_SET to PX4 and `await` matching PARAM_VALUE acks (per-
+    ///    param timeout + retry). Failure → `state: Error`, do NOT touch sim.
+    /// 4. On full ack success: deliver new physics to sim loop, restart EKF2,
+    ///    return `state: Ready`. The UI can now unlock "Continue to simulator".
+    pub async fn handle(
+        &self,
+        request: ConfigureBuild,
+        progress_tx: mpsc::Sender<OutgoingMessage>,
+    ) -> ConfigResult {
         let motor_specs = match self.fetch_motor_specs(&request.motor_slug).await {
             Ok(specs) => specs,
             Err(e) => {
                 error!(slug = %request.motor_slug, error = %e, "Failed to fetch motor specs");
                 return ConfigResult {
+                    state: ConfigState::Error,
                     success: false,
                     error: Some(format!("Failed to fetch motor: {e}")),
                     config: None,
@@ -71,6 +114,7 @@ impl BuildConfigHandler {
             Some(kv) => kv,
             None => {
                 return ConfigResult {
+                    state: ConfigState::Error,
                     success: false,
                     error: Some("Motor missing KV rating in specs".to_string()),
                     config: None,
@@ -208,15 +252,17 @@ impl BuildConfigHandler {
         let max_motor_rpm = physics.motor_kv * physics.battery_voltage;
         let flight_time = estimate_flight_time_min(&battery, &physics);
 
-        // Phase 6: derive per-build rate-controller PIDs and push them to PX4
-        // via MAVLink PARAM_SET so light airframes (whose real inertia is well
-        // below the legacy 0.012 floor) get controller gains scaled for their
-        // actual moments of inertia. Skipped if --sim-only (no PX4 attached)
-        // or if the fingerprint matches the last applied set.
+        // Phase 6: derive per-build rate-controller PIDs. Without this, light
+        // airframes (real inertia well below the legacy 0.012 floor) trigger
+        // PX4 rate-controller oscillation because the stock PIDs are tuned
+        // for I ≈ 0.005 kg·m².
         let pids = compute_pids(&physics);
-        let applied_pids = self.push_pids_if_changed(&pids);
 
-        let applied = AppliedConfig {
+        // Stage 1: emit "configuring" so the UI shows a spinner. applied_pids
+        // is None and verified_params is 0 because acks haven't returned yet.
+        // The sim loop has NOT been touched, so the user's current flight (if
+        // any) keeps running on the previous config.
+        let configuring_view = AppliedConfig {
             mass_kg: physics.mass_kg,
             kt: physics.kt,
             kq: physics.kq,
@@ -227,12 +273,45 @@ impl BuildConfigHandler {
             battery_voltage: physics.battery_voltage,
             max_motor_rpm,
             estimated_flight_time_min: flight_time,
-            applied_pids,
+            applied_pids: None,
+            verified_params: 0,
+        };
+        if progress_tx
+            .send(OutgoingMessage::ConfigResult(ConfigResult {
+                state: ConfigState::Configuring,
+                success: true,
+                error: None,
+                config: Some(configuring_view.clone()),
+            }))
+            .await
+            .is_err()
+        {
+            warn!("client disconnected before interim ConfigResult delivered");
+        }
+
+        // Stage 2: push PIDs and await per-param PARAM_VALUE acks. Fail-closed:
+        // any verification failure aborts before touching the sim loop, so the
+        // user can't accidentally fly with mismatched PIDs vs. physics.
+        let (applied_pids, verified_params) = match self.push_pids_and_verify(&pids).await {
+            Ok(view) => view,
+            Err(e) => {
+                error!(error = %e, "PID verification failed — aborting reconfigure");
+                return ConfigResult {
+                    state: ConfigState::Error,
+                    success: false,
+                    error: Some(format!("PID verification failed: {e}")),
+                    config: None,
+                };
+            }
         };
 
+        // Stage 3: hand new physics to the simulation loop. Only at this point
+        // is the running drone state reconfigured. PX4 already has matching
+        // PIDs; EKF2 is about to be reset to clear stale estimator state.
         if let Err(e) = self.config_tx.send((physics, battery)) {
             error!(error = %e, "Failed to send physics config to simulation");
             return ConfigResult {
+                state: ConfigState::Error,
                 success: false,
                 error: Some("Simulation thread unavailable".to_string()),
                 config: None,
@@ -240,48 +319,56 @@ impl BuildConfigHandler {
         }
 
         info!(
-            mass_kg = applied.mass_kg,
-            kt = applied.kt,
-            twr = applied.thrust_to_weight_ratio,
-            "Build configured successfully"
+            mass_kg = configuring_view.mass_kg,
+            kt = configuring_view.kt,
+            twr = configuring_view.thrust_to_weight_ratio,
+            verified_params,
+            "Build configured + PIDs verified"
         );
 
-        // Restart EKF2 to clear stale state from previous config
         self.restart_ekf2().await;
 
         ConfigResult {
+            state: ConfigState::Ready,
             success: true,
             error: None,
-            config: Some(applied),
+            config: Some(AppliedConfig {
+                applied_pids,
+                verified_params,
+                ..configuring_view
+            }),
         }
     }
 
-    /// Push the per-build PIDs as `PARAM_SET` MAVLink messages, but only if
-    /// they differ from the last set we successfully queued. Returns the view
-    /// to surface in `AppliedConfig.applied_pids`, or `None` when we skipped
-    /// (sim-only, or fingerprint unchanged).
+    /// Push the per-build PIDs as `PARAM_SET` and verify each one with a
+    /// matching `PARAM_VALUE` ack from PX4. Per-param retry up to
+    /// `PARAM_RETRY_COUNT` times with `PARAM_ACK_TIMEOUT` per attempt.
     ///
-    /// This is "fire and forget" — we don't await `PARAM_VALUE` acks. PX4
-    /// applies params synchronously on receipt; on the rare drop, the next
-    /// `ConfigureBuild` re-sends. Ack-tracking with retry is a follow-up.
-    fn push_pids_if_changed(&self, pids: &Px4Pids) -> Option<Px4PidsView> {
-        let Some(mav_tx) = self.mav_tx.as_ref() else {
-            debug!("sim-only mode: skipping PARAM_SET push for computed PIDs");
-            return None;
+    /// Returns `Ok((Some(view), N))` on full success (N = number of params
+    /// verified), `Ok((None, 0))` when skipped (sim-only or fingerprint
+    /// unchanged), or `Err(msg)` when any param could not be confirmed.
+    ///
+    /// Subscribes to the broadcast BEFORE sending so no acks are missed.
+    /// Fingerprint cache is only updated on full success — partial pushes
+    /// must retry the whole sequence on the next ConfigureBuild.
+    pub(crate) async fn push_pids_and_verify(
+        &self,
+        pids: &Px4Pids,
+    ) -> Result<(Option<Px4PidsView>, u32), String> {
+        let (Some(mav_tx), Some(param_value_tx)) =
+            (self.mav_tx.as_ref(), self.param_value_tx.as_ref())
+        else {
+            debug!("sim-only mode: skipping PARAM_SET push (no PX4 attached)");
+            return Ok((None, 0));
         };
 
         let fp = pid_fingerprint(pids);
         {
-            let mut cache = self.last_pid_fingerprint.lock().expect("PID cache poisoned");
+            let cache = self.last_pid_fingerprint.lock().expect("PID cache poisoned");
             if *cache == Some(fp) {
                 debug!(fingerprint = fp, "PID fingerprint unchanged — skipping PARAM_SET push");
-                // Return None on a skip so the UI can tell the difference between
-                // "freshly applied" and "no-op reconfigure".
-                return None;
+                return Ok((None, 0));
             }
-            // Optimistically record the new fingerprint. If a send fails below
-            // we'll wipe it so the next attempt retries the whole sequence.
-            *cache = Some(fp);
         }
 
         let params: [(&str, f32); 12] = [
@@ -299,28 +386,86 @@ impl BuildConfigHandler {
             ("MC_YAWRATE_FF",   pids.yaw_ff),
         ];
 
-        let mut queued = 0u32;
+        let mut verified = 0u32;
         for (name, value) in params {
-            match mav_tx.try_send(make_param_set(name, value)) {
-                Ok(()) => queued += 1,
-                Err(crossbeam_channel::TrySendError::Full(_)) => {
-                    warn!(param = name, "MAVLink tx channel full — dropping PARAM_SET");
-                }
-                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-                    error!(param = name, "MAVLink tx channel disconnected — aborting param push");
-                    // Clear the cache so the next reconfigure retries.
-                    *self.last_pid_fingerprint.lock().expect("PID cache poisoned") = None;
-                    return None;
-                }
-            }
-        }
-        info!(queued, fingerprint = fp, "Queued PARAM_SET sequence for per-build PIDs");
+            let mut rx = param_value_tx.subscribe();
+            let mut acked = false;
 
-        Some(Px4PidsView {
-            roll_p: pids.roll_p,    roll_i: pids.roll_i,    roll_d: pids.roll_d,    roll_ff: pids.roll_ff,
-            pitch_p: pids.pitch_p,  pitch_i: pids.pitch_i,  pitch_d: pids.pitch_d,  pitch_ff: pids.pitch_ff,
-            yaw_p: pids.yaw_p,      yaw_i: pids.yaw_i,      yaw_d: pids.yaw_d,      yaw_ff: pids.yaw_ff,
-        })
+            for attempt in 1..=PARAM_RETRY_COUNT {
+                // Resubscribe drains anything that arrived between attempts so
+                // stale acks don't false-positive a later send.
+                if attempt > 1 {
+                    rx = param_value_tx.subscribe();
+                }
+
+                match mav_tx.try_send(make_param_set(name, value)) {
+                    Ok(()) => {}
+                    Err(crossbeam_channel::TrySendError::Full(_)) => {
+                        warn!(
+                            param = name,
+                            attempt,
+                            "MAVLink tx channel full — retrying PARAM_SET"
+                        );
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                    Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                        return Err(format!(
+                            "MAVLink tx disconnected while sending {name}"
+                        ));
+                    }
+                }
+
+                if let Some((got_name, got_value)) =
+                    wait_for_param_ack(&mut rx, name, value).await
+                {
+                    debug!(
+                        param = %got_name,
+                        value = got_value,
+                        attempt,
+                        "PARAM_VALUE ack confirmed"
+                    );
+                    acked = true;
+                    break;
+                }
+                warn!(
+                    param = name,
+                    attempt,
+                    timeout_ms = PARAM_ACK_TIMEOUT.as_millis() as u64,
+                    "PARAM_VALUE ack timed out — retrying"
+                );
+            }
+
+            if !acked {
+                return Err(format!(
+                    "Failed to verify {name} after {PARAM_RETRY_COUNT} retries"
+                ));
+            }
+            verified += 1;
+        }
+
+        // Cache only after full verification — partial pushes must retry.
+        *self.last_pid_fingerprint.lock().expect("PID cache poisoned") = Some(fp);
+
+        info!(verified, fingerprint = fp, "All per-build PIDs verified on PX4");
+
+        Ok((
+            Some(Px4PidsView {
+                roll_p: pids.roll_p,
+                roll_i: pids.roll_i,
+                roll_d: pids.roll_d,
+                roll_ff: pids.roll_ff,
+                pitch_p: pids.pitch_p,
+                pitch_i: pids.pitch_i,
+                pitch_d: pids.pitch_d,
+                pitch_ff: pids.pitch_ff,
+                yaw_p: pids.yaw_p,
+                yaw_i: pids.yaw_i,
+                yaw_d: pids.yaw_d,
+                yaw_ff: pids.yaw_ff,
+            }),
+            verified,
+        ))
     }
 
     /// Restart EKF2 to clear stale estimator state after config change
@@ -437,6 +582,41 @@ fn parse_baro_chip(s: &str) -> BaroChip {
 /// Build a `PARAM_SET` MAVLink message targeting the autopilot. Param IDs
 /// are right-padded with NUL bytes inside the 16-byte buffer per the MAVLink
 /// spec; names longer than 16 chars are truncated.
+/// Drain `rx` until a `PARAM_VALUE` arrives whose name matches `name` and
+/// whose value is within `PARAM_ACK_EPSILON` of `expected`. Returns the
+/// matched (name, value) tuple, or `None` if `PARAM_ACK_TIMEOUT` elapses
+/// without a match. Lagged/closed receivers are treated as "no ack".
+async fn wait_for_param_ack(
+    rx: &mut broadcast::Receiver<(String, f32)>,
+    name: &str,
+    expected: f32,
+) -> Option<(String, f32)> {
+    let deadline = tokio::time::Instant::now() + PARAM_ACK_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        match timeout(remaining, rx.recv()).await {
+            Ok(Ok((got_name, got_value))) => {
+                if got_name == name && (got_value - expected).abs() <= PARAM_ACK_EPSILON {
+                    return Some((got_name, got_value));
+                }
+                // Unrelated PARAM_VALUE (QGC pull, other params) — keep draining.
+            }
+            Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
+                warn!(
+                    param = name,
+                    lagged = n,
+                    "PARAM_VALUE receiver lagged — continuing to wait"
+                );
+            }
+            Ok(Err(broadcast::error::RecvError::Closed)) => return None,
+            Err(_) => return None,
+        }
+    }
+}
+
 fn make_param_set(name: &str, value: f32) -> MavMessage {
     let mut param_id = [0u8; 16];
     let bytes = name.as_bytes();
@@ -466,5 +646,109 @@ fn parse_mag_chip(s: &str) -> MagChip {
         "lis3mdl" => MagChip::Lis3mdl,
         "none" | "" => MagChip::None,
         _ => MagChip::Other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossbeam_channel::bounded;
+    use hitl_physics::px4_pids::REF_PIDS;
+    use mavlink::ardupilotmega::MavMessage;
+
+    /// Spawn a fake PX4 ack responder: every PARAM_SET pulled from `mav_rx`
+    /// is mirrored back on `param_value_tx` as a successful ack. Optionally
+    /// drop the first `drop_first` PARAM_SETs entirely (simulates lossy link).
+    fn spawn_fake_px4(
+        mav_rx: crossbeam_channel::Receiver<MavMessage>,
+        param_value_tx: broadcast::Sender<(String, f32)>,
+        drop_first: usize,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::task::spawn_blocking(move || {
+            let mut dropped = 0;
+            while let Ok(msg) = mav_rx.recv() {
+                if let MavMessage::PARAM_SET(p) = msg {
+                    let name = std::str::from_utf8(&p.param_id)
+                        .unwrap_or("")
+                        .trim_end_matches('\0')
+                        .to_string();
+                    if dropped < drop_first {
+                        dropped += 1;
+                        continue;
+                    }
+                    let _ = param_value_tx.send((name, p.param_value));
+                }
+            }
+        })
+    }
+
+    fn make_handler(
+        mav_tx: Option<Sender<MavMessage>>,
+        param_value_tx: Option<broadcast::Sender<(String, f32)>>,
+    ) -> BuildConfigHandler {
+        let (config_tx, _config_rx) = bounded::<(PhysicsConfig, BatteryConfig)>(4);
+        BuildConfigHandler::new(config_tx, None, mav_tx, param_value_tx)
+    }
+
+    #[tokio::test]
+    async fn sim_only_mode_skips_verification() {
+        let handler = make_handler(None, None);
+        let result = handler.push_pids_and_verify(&REF_PIDS).await;
+        assert!(matches!(result, Ok((None, 0))));
+    }
+
+    #[tokio::test]
+    async fn happy_path_acks_all_twelve_params() {
+        let (mav_tx, mav_rx) = bounded::<MavMessage>(64);
+        let (pv_tx, _) = broadcast::channel::<(String, f32)>(64);
+        let _px4 = spawn_fake_px4(mav_rx, pv_tx.clone(), 0);
+
+        let handler = make_handler(Some(mav_tx), Some(pv_tx));
+        let (view, verified) = handler.push_pids_and_verify(&REF_PIDS).await.unwrap();
+        assert!(view.is_some());
+        assert_eq!(verified, 12);
+    }
+
+    #[tokio::test]
+    async fn one_dropped_ack_recovers_via_retry() {
+        let (mav_tx, mav_rx) = bounded::<MavMessage>(64);
+        let (pv_tx, _) = broadcast::channel::<(String, f32)>(64);
+        // Drop only the first PARAM_SET — the retry should land an ack.
+        let _px4 = spawn_fake_px4(mav_rx, pv_tx.clone(), 1);
+
+        let handler = make_handler(Some(mav_tx), Some(pv_tx));
+        let (view, verified) = handler.push_pids_and_verify(&REF_PIDS).await.unwrap();
+        assert!(view.is_some());
+        assert_eq!(verified, 12);
+    }
+
+    #[tokio::test]
+    async fn persistent_silence_returns_error() {
+        let (mav_tx, _mav_rx) = bounded::<MavMessage>(64);
+        let (pv_tx, _) = broadcast::channel::<(String, f32)>(64);
+        // No fake PX4 — every PARAM_SET sits in mav_rx forever and no ack ever
+        // comes back. Each param exhausts PARAM_RETRY_COUNT attempts.
+        let handler = make_handler(Some(mav_tx), Some(pv_tx));
+        let err = handler.push_pids_and_verify(&REF_PIDS).await.unwrap_err();
+        assert!(
+            err.contains("MC_ROLLRATE_P"),
+            "expected failure on the first param, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fingerprint_skips_second_call() {
+        let (mav_tx, mav_rx) = bounded::<MavMessage>(64);
+        let (pv_tx, _) = broadcast::channel::<(String, f32)>(64);
+        let _px4 = spawn_fake_px4(mav_rx, pv_tx.clone(), 0);
+
+        let handler = make_handler(Some(mav_tx), Some(pv_tx));
+        let (_, verified_first) = handler.push_pids_and_verify(&REF_PIDS).await.unwrap();
+        assert_eq!(verified_first, 12);
+
+        // Identical PIDs → fingerprint matches → no push, no acks needed.
+        let (view, verified_second) = handler.push_pids_and_verify(&REF_PIDS).await.unwrap();
+        assert!(view.is_none());
+        assert_eq!(verified_second, 0);
     }
 }
