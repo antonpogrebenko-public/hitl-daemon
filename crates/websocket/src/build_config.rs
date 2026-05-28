@@ -360,7 +360,9 @@ impl BuildConfigHandler {
             "Build configured + PIDs verified"
         );
 
-        self.restart_ekf2().await;
+        if let Err(e) = self.restart_ekf2_with_retry(3).await {
+            error!(error = %e, "EKF2 restart failed — PIDs are applied, EKF will converge on stale state");
+        }
 
         ConfigResult {
             state: ConfigState::Ready,
@@ -545,14 +547,15 @@ impl BuildConfigHandler {
         ))
     }
 
-    /// Restart EKF2 to clear stale estimator state after config change
-    async fn restart_ekf2(&self) {
+    /// Attempt a single EKF2 stop → start cycle via NSH.
+    ///
+    /// Returns `Ok(())` when both commands are queued, or `Err(msg)` if the
+    /// NSH channel is unavailable or either send fails.
+    async fn restart_ekf2(&self) -> Result<(), String> {
         let Some(ref nsh_tx) = self.nsh_tx else {
-            warn!("NSH not available, skipping EKF2 restart");
-            return;
+            return Err("NSH channel not available".to_string());
         };
 
-        // Send ekf2 stop command
         let stop_cmd = ValidatedNshCommand {
             request_id: 0xFFFF_FF01, // Special ID for internal commands
             command: "ekf2 stop".to_string(),
@@ -560,15 +563,14 @@ impl BuildConfigHandler {
             client_id: 0, // System client
         };
 
-        if let Err(e) = nsh_tx.send(stop_cmd).await {
-            warn!(error = %e, "Failed to send ekf2 stop command");
-            return;
-        }
+        nsh_tx
+            .send(stop_cmd)
+            .await
+            .map_err(|e| format!("Failed to send ekf2 stop: {e}"))?;
 
-        // Small delay to let EKF2 stop cleanly
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        // Small delay to let EKF2 stop cleanly before issuing start.
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Send ekf2 start command
         let start_cmd = ValidatedNshCommand {
             request_id: 0xFFFF_FF02,
             command: "ekf2 start".to_string(),
@@ -576,12 +578,44 @@ impl BuildConfigHandler {
             client_id: 0,
         };
 
-        if let Err(e) = nsh_tx.send(start_cmd).await {
-            warn!(error = %e, "Failed to send ekf2 start command");
-            return;
-        }
+        nsh_tx
+            .send(start_cmd)
+            .await
+            .map_err(|e| format!("Failed to send ekf2 start: {e}"))?;
 
-        info!("EKF2 restarted after config change");
+        Ok(())
+    }
+
+    /// Retry `restart_ekf2` up to `max_retries` times with 200 ms between
+    /// attempts.  Returns `Ok(())` on the first success.  If every attempt
+    /// fails, returns `Err` with the final error message; the caller is
+    /// responsible for deciding whether to propagate or merely log it.
+    async fn restart_ekf2_with_retry(&self, max_retries: u8) -> Result<(), String> {
+        for attempt in 0..max_retries {
+            match self.restart_ekf2().await {
+                Ok(()) => {
+                    info!(attempt = attempt + 1, "EKF2 restarted after config change");
+                    return Ok(());
+                }
+                Err(e) => {
+                    if attempt < max_retries - 1 {
+                        warn!(
+                            attempt = attempt + 1,
+                            max_retries,
+                            error = %e,
+                            "EKF2 restart attempt failed, retrying in 200 ms"
+                        );
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    } else {
+                        return Err(format!(
+                            "EKF2 restart failed after {max_retries} attempts: {e}"
+                        ));
+                    }
+                }
+            }
+        }
+        // `max_retries == 0` edge case: nothing to do, treat as success.
+        Ok(())
     }
 
     async fn fetch_motor_specs(&self, slug: &str) -> Result<serde_json::Value, String> {

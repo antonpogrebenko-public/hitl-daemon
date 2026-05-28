@@ -10,7 +10,7 @@ pub use protocol::SimulationStats;
 use protocol::ActuatorOutputs;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// How often the loop pushes a snapshot to `stats_tx`. The TUI redraws at
 /// ~2 Hz so anything faster is wasted, anything slower lags the header.
@@ -20,6 +20,15 @@ const STATS_PUBLISH_INTERVAL: Duration = Duration::from_millis(500);
 /// independent of the publish cadence — between window resets the snapshot
 /// carries the previously rolled-up values.
 const STATS_WINDOW_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Minimum interval between sensor-drop warning log lines. Prevents log spam
+/// at 400 Hz when the FC is slow to consume HIL_SENSOR messages.
+const DROP_WARN_INTERVAL: Duration = Duration::from_secs(5);
+
+/// If the HIL_SENSOR channel stays full continuously for this long, escalate
+/// to `error!` — the FC has likely disconnected without the serial layer
+/// detecting it yet.
+const DROP_ERROR_THRESHOLD: Duration = Duration::from_secs(2);
 
 
 /// Mag sensor update divider (400 Hz / 8 = 50 Hz)
@@ -68,6 +77,13 @@ pub struct SimulationLoop {
     last_mag: Option<hitl_sensors::MagReading>,
     /// Cached baro reading (only updated at BARO_UPDATE_DIVIDER rate)
     last_baro: Option<hitl_sensors::BaroReading>,
+    /// Last time a sensor-drop warning was emitted (rate-limits log spam).
+    last_drop_warning: Instant,
+    /// Number of drops accumulated since the last warning was emitted.
+    drop_count_since_last_warning: u64,
+    /// When the HIL_SENSOR channel first became full in the current
+    /// contiguous run. `None` when the channel is not full.
+    channel_full_since: Option<Instant>,
 }
 
 impl SimulationLoop {
@@ -92,6 +108,9 @@ impl SimulationLoop {
             build_configured: false,
             last_mag: None,
             last_baro: None,
+            last_drop_warning: Instant::now(),
+            drop_count_since_last_warning: 0,
+            channel_full_since: None,
         }
     }
 
@@ -251,12 +270,18 @@ impl SimulationLoop {
     fn step_physics(&mut self, dt: f64) {
         let mut state = self.state.write();
 
+        // NED: Z=0 is ground level; Z>0 is below ground (clamped).
+        // Single threshold shared with the ground-contact clamp below to
+        // avoid a dead zone where physics runs but ground forces do not.
+        const GROUND_CONTACT_Z: f64 = 0.0;
+
         // Skip physics only when disarmed on the ground (gyro calibration)
-        let on_ground = state.quadrotor.position[2] >= -0.01;
+        let on_ground = state.quadrotor.position[2] >= GROUND_CONTACT_Z;
         let motors_active = state.motor_commands.iter().any(|&c| c > 0.01);
 
         if motors_active || !on_ground {
-            // Convert motor commands (0-1) to angular velocities using config-aware max speed
+            // Convert motor commands (0-1) to angular velocities using config-aware max speed.
+            // Initial pass uses nominal voltage — needed to estimate current before we know sag.
             let mut motor_omegas: [f64; 4] = std::array::from_fn(|i| {
                 throttle_to_omega_with_config(state.motor_commands[i] as f64, &self.config.physics)
             });
@@ -265,6 +290,21 @@ impl SimulationLoop {
             if motors_active && !state.battery.is_depleted() {
                 let current = total_motor_current(&motor_omegas, &self.config.physics);
                 state.battery.discharge(current, dt);
+
+                // Scale motor speeds by the voltage-sag ratio so thrust reflects
+                // the terminal voltage the ESCs actually see, not nominal.
+                // V_terminal = V_OCV(soc) - I·R_internal; ratio < 1 under load or at low SoC.
+                let v_nominal = self.config.physics.battery_voltage;
+                let v_terminal = state.battery.v_terminal(
+                    current,
+                    self.config.battery.internal_resistance_ohm,
+                );
+                let voltage_ratio = if v_nominal > 0.0 {
+                    (v_terminal / v_nominal).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                motor_omegas = std::array::from_fn(|i| motor_omegas[i] * voltage_ratio);
             } else if state.battery.is_depleted() {
                 motor_omegas = [0.0; 4];
             }
@@ -273,10 +313,11 @@ impl SimulationLoop {
             state.quadrotor = rk4_step(&state.quadrotor, &self.config.physics, motor_omegas, dt);
         }
 
-        // Ground contact constraint: in NED, Z >= 0 means at or below ground.
-        // Clamp position, kill downward velocity, apply friction.
-        // Uses >= so that damping applies even when sitting exactly at Z=0.
-        if state.quadrotor.position[2] >= 0.0 {
+        // Ground contact constraint: in NED, Z >= GROUND_CONTACT_Z means at or
+        // below ground.  Clamp position, kill downward velocity, apply friction.
+        // Uses the same threshold as the on_ground flag above so there is no
+        // dead zone between the two checks.
+        if state.quadrotor.position[2] >= GROUND_CONTACT_Z {
             state.quadrotor.position[2] = 0.0;
 
             // Kill downward velocity (positive Z in NED = moving down)
@@ -284,13 +325,33 @@ impl SimulationLoop {
                 state.quadrotor.velocity[2] = 0.0;
             }
 
-            // Ground friction: dampen horizontal velocity and angular rates.
-            // Strong roll/pitch damping prevents tipping over on the ground.
-            state.quadrotor.velocity[0] *= 0.9;
-            state.quadrotor.velocity[1] *= 0.9;
-            state.quadrotor.angular_velocity[0] *= 0.8;
-            state.quadrotor.angular_velocity[1] *= 0.8;
-            state.quadrotor.angular_velocity[2] *= 0.9;
+            // Ground friction: dampen horizontal velocity and angular rates,
+            // scaled by how much weight remains on the ground.
+            //
+            // When motors produce enough thrust to nearly lift off, normal force
+            // approaches zero → friction approaches zero → smooth transition to
+            // flight. At idle (no thrust), full friction applies (same as before).
+            //
+            // Use motor_commands (0-1) to estimate thrust without needing
+            // motor_omegas, which are only computed inside the motors_active block.
+            let total_thrust: f64 = state.motor_commands.iter().map(|&cmd| {
+                let omega = throttle_to_omega_with_config(cmd as f64, &self.config.physics);
+                self.config.physics.kt * omega * omega
+            }).sum();
+            let weight = self.config.physics.mass_kg * 9.81;
+            let normal_force = (weight - total_thrust).max(0.0);
+            // 1.0 = full weight on ground (idle), 0.0 = about to lift off
+            let ground_contact_ratio = normal_force / weight;
+
+            let lateral_damping = 1.0 - (0.1 * ground_contact_ratio); // 0.9..1.0
+            let angular_damping = 1.0 - (0.2 * ground_contact_ratio); // 0.8..1.0
+            let yaw_damping = 1.0 - (0.1 * ground_contact_ratio);     // 0.9..1.0
+
+            state.quadrotor.velocity[0] *= lateral_damping;
+            state.quadrotor.velocity[1] *= lateral_damping;
+            state.quadrotor.angular_velocity[0] *= angular_damping;
+            state.quadrotor.angular_velocity[1] *= angular_damping;
+            state.quadrotor.angular_velocity[2] *= yaw_damping;
 
             // Auto-level when disarmed and resting. Without this, any in-sim
             // flip (crash, arm jolt, manual test) leaves the quaternion at a
@@ -449,11 +510,40 @@ impl SimulationLoop {
         // Build and send HIL_SENSOR message
         let hil_sensor = self.build_hil_sensor(&imu_reading, &baro_reading, &mag_reading, sim_time_us, fields_updated);
         match self.mav_tx.try_send(MavMessage::HIL_SENSOR(hil_sensor)) {
-            Ok(()) => { self.stats.hil_sensor_count += 1; }
+            Ok(()) => {
+                self.stats.hil_sensor_count += 1;
+                // Channel drained — reset the contiguous-full timer.
+                self.channel_full_since = None;
+            }
             Err(crossbeam_channel::TrySendError::Full(_)) => {
                 self.stats.sensor_drops += 1;
-                if self.stats.sensor_drops == 1 || self.stats.sensor_drops % 1000 == 0 {
-                    warn!(drops = self.stats.sensor_drops, "Sensor message channel full — FC not consuming");
+                self.drop_count_since_last_warning += 1;
+
+                // Track how long the channel has been continuously full.
+                let full_since = self.channel_full_since.get_or_insert_with(Instant::now);
+
+                // Escalate to error if full for more than DROP_ERROR_THRESHOLD —
+                // this typically means the FC is disconnected but the serial
+                // layer hasn't timed out yet.
+                if full_since.elapsed() >= DROP_ERROR_THRESHOLD {
+                    error!(
+                        drops_total = self.stats.sensor_drops,
+                        full_secs = full_since.elapsed().as_secs(),
+                        "HIL sensor channel full for >{}s — FC likely disconnected (serial has not timed out)",
+                        DROP_ERROR_THRESHOLD.as_secs(),
+                    );
+                    // Reset full_since so we error at most once per threshold period.
+                    self.channel_full_since = Some(Instant::now());
+                } else if self.last_drop_warning.elapsed() >= DROP_WARN_INTERVAL {
+                    // Rate-limited warning: at most once every DROP_WARN_INTERVAL.
+                    warn!(
+                        drops = self.drop_count_since_last_warning,
+                        "HIL sensor channel full — {} messages dropped in last {}s (FC may not be consuming fast enough)",
+                        self.drop_count_since_last_warning,
+                        DROP_WARN_INTERVAL.as_secs(),
+                    );
+                    self.last_drop_warning = Instant::now();
+                    self.drop_count_since_last_warning = 0;
                 }
             }
             Err(crossbeam_channel::TrySendError::Disconnected(_)) => {}
@@ -466,6 +556,7 @@ impl SimulationLoop {
                 Ok(()) => { self.stats.hil_gps_count += 1; }
                 Err(crossbeam_channel::TrySendError::Full(_)) => {
                     self.stats.sensor_drops += 1;
+                    self.drop_count_since_last_warning += 1;
                 }
                 Err(crossbeam_channel::TrySendError::Disconnected(_)) => {}
             }

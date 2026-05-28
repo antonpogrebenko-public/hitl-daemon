@@ -331,6 +331,8 @@ async fn main() {
             accel_noise_density: 0.006,   // Default: realistic noise level
             gyro_bias_sigma: 0.0,         // CRITICAL: No bias drift in HITL
             gyro_bias_tau: 1000.0,        // Long time constant (unused since sigma=0)
+            accel_bias_sigma: 0.0,        // No accel bias drift for HITL — gives EKF clean data
+            accel_bias_tau: 1000.0,       // Long time constant, effectively disabled
         },
         baro: hitl_sensors::BaroConfig::default(),
         gps: hitl_sensors::GpsConfig {

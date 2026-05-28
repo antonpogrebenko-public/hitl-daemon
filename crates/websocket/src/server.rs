@@ -17,10 +17,11 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc};
+use tokio::time::interval;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
 
@@ -315,6 +316,13 @@ async fn health_handler() -> impl IntoResponse {
 /// Maximum allowed incoming WebSocket message size (1 KB)
 const MAX_INCOMING_MESSAGE_SIZE: usize = 1024;
 
+/// How often the server sends a WebSocket Ping frame to each client
+const PING_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Maximum time allowed between any received message before the connection
+/// is considered a zombie and closed (3 missed pings)
+const PONG_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// WebSocket upgrade handler
 async fn ws_handler(
     ws: WebSocketUpgrade,
@@ -345,8 +353,22 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     // Channel for sending responses from the receive task to the send task
     let (response_tx, mut response_rx) = mpsc::channel::<OutgoingMessage>(32);
 
+    // Shared last-activity timestamp (seconds since UNIX_EPOCH).
+    // Updated by the receive task on every incoming frame; checked by the send task.
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let last_pong_ts = Arc::new(AtomicU64::new(now_secs));
+    let last_pong_ts_recv = Arc::clone(&last_pong_ts);
+
     // Task to send state updates and responses to client
     let send_task = tokio::spawn(async move {
+        let mut ping_ticker = interval(PING_INTERVAL);
+        // The first tick fires immediately; skip it so the first ping goes out after
+        // one full interval rather than at connection establishment.
+        ping_ticker.tick().await;
+
         loop {
             tokio::select! {
                 // Handle state updates from broadcast
@@ -452,6 +474,27 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         }
                     }
                 }
+                // Periodic ping — keep-alive heartbeat
+                _ = ping_ticker.tick() => {
+                    // Check for zombie connection before sending the ping
+                    let last_ts = last_pong_ts.load(Ordering::Relaxed);
+                    let now_ts = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let elapsed_secs = now_ts.saturating_sub(last_ts);
+                    if elapsed_secs >= PONG_TIMEOUT.as_secs() {
+                        warn!(
+                            client_id,
+                            elapsed_secs,
+                            "No pong received within timeout — closing zombie connection"
+                        );
+                        break;
+                    }
+                    if ws_sender.send(Message::Ping(vec![].into())).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -459,6 +502,13 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     // Handle incoming messages
     let recv_handler = handler.clone();
     while let Some(msg) = ws_receiver.next().await {
+        // Any frame from the client proves liveness — update the timestamp.
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        last_pong_ts_recv.store(ts, Ordering::Relaxed);
+
         match msg {
             Ok(Message::Binary(data)) => {
                 match recv_handler
@@ -484,8 +534,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             Ok(Message::Ping(_)) => {
                 // Pong is handled automatically by axum-ws
             }
+            Ok(Message::Pong(_)) => {
+                // Liveness already recorded above via last_pong_ts_recv
+            }
             Ok(_) => {
-                // Ignore text messages, pongs, etc.
+                // Ignore text messages, etc.
             }
             Err(e) => {
                 error!(client_id, error = %e, "WebSocket error");
