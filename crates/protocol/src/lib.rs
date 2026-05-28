@@ -262,16 +262,22 @@ pub enum WsProtocolError {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ConfigureBuild {
     pub motor_slug: String,
-    pub prop_diameter_inches: f64,
-    pub frame_weight_g: f64,
     #[serde(default)]
     pub prop_slug: Option<String>,
+    pub prop_diameter_inches: f64,
+    pub frame_weight_g: f64,
     #[serde(default = "default_battery_voltage")]
     pub battery_voltage: f64,
     #[serde(default = "default_battery_capacity_mah")]
     pub battery_capacity_mah: f64,
     #[serde(default = "default_battery_cell_count")]
     pub battery_cell_count: u8,
+    #[serde(default)]
+    pub esc_slug: Option<String>,
+    #[serde(default)]
+    pub fc_slug: Option<String>,
+    #[serde(default)]
+    pub frame_slug: Option<String>,
 }
 
 fn default_battery_voltage() -> f64 { 14.8 }

@@ -511,7 +511,10 @@ impl SimulationLoop {
         };
         let cog_positive = if cog < 0.0 { cog + 360.0 } else { cog };
 
-        // GPS altitude needs to be MSL, not AGL
+        // gps.alt is AGL (height above launch point = -ned_down, no reference_alt).
+        // HIL_GPS requires MSL in millimeters, so we add reference_alt here.
+        // This is NOT double-counting: the GPS sensor deliberately omits reference_alt
+        // so that the sensor library stays free of daemon-specific config.
         let alt_msl = gps.alt as f64 + self.config.reference_alt;
 
         HIL_GPS_DATA {

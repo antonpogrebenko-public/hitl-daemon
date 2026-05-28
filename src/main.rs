@@ -191,28 +191,64 @@ fn spawn_simulation_thread(
     (handle, state)
 }
 
-/// Simulation-only mode: generate fake actuator commands for testing
+/// Simulation-only mode: generate fake actuator commands for testing.
+///
+/// Battery awareness: when the simulation battery is depleted, motors are zeroed
+/// and mode switches to `Disarmed`. After `AUTO_RECHARGE_SECS` seconds the battery
+/// is automatically recharged so the simulation can continue without a daemon restart.
 fn spawn_sim_only_actuator_thread(
     actuator_tx: Sender<ActuatorOutputs>,
     shutdown: Arc<AtomicBool>,
+    sim_state: simulation::SimulationState,
 ) -> thread::JoinHandle<()> {
+    // Ticks at 400 Hz (2500 µs each). 3 seconds = 1200 ticks.
+    const AUTO_RECHARGE_TICKS: u64 = 1200;
+
     thread::Builder::new()
         .name("sim-actuator".to_string())
         .spawn(move || {
             info!("Simulation-only actuator thread started (generating hover commands)");
             let mut tick = 0u64;
+            let mut depleted_since: Option<u64> = None;
 
             while !shutdown.load(Ordering::Relaxed) {
-                // Generate hover throttle (~50%)
-                let actuator = ActuatorOutputs {
-                    timestamp_us: tick * 2500,
-                    motors: [0.5, 0.5, 0.5, 0.5],
-                    mode: protocol::FlightMode::HilArmed,
-                    controls: [0.0; 16],
-                };
+                let is_depleted = sim_state.read().battery.is_depleted();
 
-                if actuator_tx.send(actuator).is_err() {
-                    break;
+                if is_depleted {
+                    // Track how long we have been depleted
+                    let depleted_tick = *depleted_since.get_or_insert(tick);
+
+                    // Auto-recharge after AUTO_RECHARGE_TICKS ticks (~3 s)
+                    if tick - depleted_tick >= AUTO_RECHARGE_TICKS {
+                        info!("sim-only: battery depleted — auto-recharging for continued simulation");
+                        sim_state.recharge_battery();
+                        depleted_since = None;
+                    }
+
+                    // Send zeroed, disarmed actuator while depleted
+                    let actuator = ActuatorOutputs {
+                        timestamp_us: tick * 2500,
+                        motors: [0.0; 4],
+                        mode: protocol::FlightMode::Disarmed,
+                        controls: [0.0; 16],
+                    };
+                    if actuator_tx.send(actuator).is_err() {
+                        break;
+                    }
+                } else {
+                    // Battery healthy — clear any stale depletion marker
+                    depleted_since = None;
+
+                    // Generate hover throttle (~50%)
+                    let actuator = ActuatorOutputs {
+                        timestamp_us: tick * 2500,
+                        motors: [0.5, 0.5, 0.5, 0.5],
+                        mode: protocol::FlightMode::HilArmed,
+                        controls: [0.0; 16],
+                    };
+                    if actuator_tx.send(actuator).is_err() {
+                        break;
+                    }
                 }
 
                 tick += 1;
@@ -425,7 +461,7 @@ async fn main() {
     // In sim-only mode, always generate fake actuator commands
     // In normal mode, fake actuators run until FC connects
     if sim_only_mode {
-        let handle = spawn_sim_only_actuator_thread(actuator_tx.clone(), shutdown.clone());
+        let handle = spawn_sim_only_actuator_thread(actuator_tx.clone(), shutdown.clone(), sim_state.clone());
         thread_handles.push(handle);
     }
 

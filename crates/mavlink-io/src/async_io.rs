@@ -264,7 +264,9 @@ impl MavlinkIo {
                             size = parse_buffer.len(),
                             "Parse buffer exceeded limit — scanning for next frame start"
                         );
-                        Self::drain_to_next_frame(&mut parse_buffer);
+                        // Do NOT skip byte 0: if it's already 0xFD, preserve it as a
+                        // potential frame start (no parse attempt has been made yet).
+                        Self::drain_to_next_frame(&mut parse_buffer, false);
                     }
 
                     // Try to parse complete messages from the buffer
@@ -308,11 +310,13 @@ impl MavlinkIo {
                             }
                             None => {
                                 // No valid frame found — if buffer has data but starts
-                                // with a non-STX byte, skip to the next potential frame
+                                // with a non-STX byte, skip to the next potential frame.
+                                // skip_first=true because byte 0 is confirmed non-STX and
+                                // should be discarded before searching.
                                 if parse_buffer.len() >= 8
                                     && parse_buffer[0] != MAVLINK_V2_STX
                                 {
-                                    Self::drain_to_next_frame(&mut parse_buffer);
+                                    Self::drain_to_next_frame(&mut parse_buffer, true);
                                 }
                                 break;
                             }
@@ -513,9 +517,20 @@ impl MavlinkIo {
 
     /// Drain bytes up to the next MAVLink v2 start byte (0xFD).
     /// If no start byte found, clears the entire buffer.
-    fn drain_to_next_frame(buffer: &mut Vec<u8>) {
-        if let Some(pos) = buffer.iter().skip(1).position(|&b| b == MAVLINK_V2_STX) {
-            let drain_count = pos + 1; // skip(1) offset
+    ///
+    /// `skip_first`: when `true`, always skip byte 0 before searching (caller has
+    /// already confirmed byte 0 is not a valid frame start, e.g. it is not 0xFD).
+    /// When `false`, byte 0 is inspected first; if it is already 0xFD it is
+    /// preserved as the next frame candidate, otherwise the search begins from
+    /// byte 1 (byte 0 is discarded as garbage).
+    fn drain_to_next_frame(buffer: &mut Vec<u8>, skip_first: bool) {
+        let start = if skip_first || buffer.first() != Some(&MAVLINK_V2_STX) {
+            1
+        } else {
+            0
+        };
+        if let Some(pos) = buffer.iter().skip(start).position(|&b| b == MAVLINK_V2_STX) {
+            let drain_count = pos + start;
             debug!(drained = drain_count, "Skipped corrupt bytes to next frame start");
             buffer.drain(..drain_count);
         } else {
