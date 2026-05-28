@@ -84,8 +84,9 @@ This triggers:
 1. New `PhysicsConfig` via `from_build_specs`
 2. New `BatteryConfig`
 3. Simulation state reset (position, battery recharged)
-4. EKF2 restart via NSH (`ekf2 stop` → `ekf2 start`)
+4. EKF2 restart via NSH (`ekf2 stop` → `ekf2 start`) — up to 3 attempts with 200ms backoff
 5. Response with applied config parameters and estimated flight time
+6. Stores `LastVerifiedParams`; if `retry_count > 0`, `repush_if_configured()` re-pushes PID params 3s after reconnect
 
 ### Recharge Command
 The web UI can send a `Recharge` command to reset battery to 100% without resetting position/attitude. Handled in the websocket handler before forwarding to FC.
@@ -144,13 +145,15 @@ ch3 → Motor 4 (BR, CW)
 The 400 Hz loop in `loop_runner.rs`:
 1. Check for new `(PhysicsConfig, BatteryConfig)` on config channel → reconfigure
 2. Drain actuator commands from PX4 (use latest)
-3. Convert throttle [0,1] → motor omega via `throttle_to_omega_with_config`
-4. Discharge battery based on total motor current (`total_motor_current`)
-5. If battery depleted → zero motor commands (drone falls)
-6. RK4 integration step
-7. Ground contact constraint (clamp Z, friction)
-8. Sample sensors (IMU@400Hz, mag/baro@50Hz, GPS@10Hz)
-9. Send HIL_SENSOR and HIL_GPS to PX4
+3. **Stale actuator timeout**: if `ACTUATOR_STALE_TIMEOUT` (100ms) elapses with no FC commands while motors are active → zero motor commands and disarm
+4. Convert throttle [0,1] → motor omega via `throttle_to_omega_with_config`
+5. **Battery voltage sag**: motor omegas scaled by `v_terminal / v_nominal` ratio for accurate thrust at low SoC
+6. Discharge battery based on total motor current (`total_motor_current`)
+7. If battery depleted → zero motor commands (drone falls); **sim-only**: auto-recharge after 3s
+8. RK4 integration step
+9. **Ground contact**: unified threshold (no dead zone), thrust-proportional friction (no sticky ground)
+10. Sample sensors (IMU@400Hz, mag/baro@50Hz, GPS@10Hz)
+11. Send HIL_SENSOR and HIL_GPS to PX4
 
 ## Building
 
@@ -177,16 +180,31 @@ Reduce GPS noise: `horizontal_noise_sigma: 0.1` (was 1.0m)
 Use `nsh --ws` mode. Direct serial mode outputs garbage when daemon holds the port.
 
 ### EKF2 restart on config change
-When `ConfigureBuild` is received, the daemon automatically restarts EKF2 via NSH commands (`ekf2 stop` then `ekf2 start`) to clear stale estimator state. This causes a transient "ekf2 missing data" preflight warning that clears in ~2 seconds.
+When `ConfigureBuild` is received, the daemon automatically restarts EKF2 via NSH commands (`ekf2 stop` then `ekf2 start`) to clear stale estimator state. Up to 3 retry attempts with 200ms backoff. This causes a transient "ekf2 missing data" preflight warning that clears in ~2 seconds.
 
 ### Flight mode from HEARTBEAT
 The daemon extracts flight mode from `HEARTBEAT.custom_mode` bits 16-23 (PX4 main mode) and updates the simulation state. The frontend displays this in real-time. Note: PX4 may reject mode changes when EKF2 has preflight failures.
 
 ### Battery depletion behavior
-When battery SoC drops below 5%, motor commands are zeroed regardless of PX4 actuator outputs. The drone will fall. Recharge via WebSocket `Recharge` command or `ConfigureBuild` (which resets the full state).
+When battery SoC drops below 5%, motor commands are zeroed regardless of PX4 actuator outputs. The drone will fall. Recharge via WebSocket `Recharge` command or `ConfigureBuild` (which resets the full state). In `--sim-only` mode, the battery auto-recharges after 3s of depletion (no permanent crash state).
 
 ### Config channel is non-blocking
 The simulation loop uses `try_recv` on the config channel. If multiple configs are sent rapidly, only the last one applied matters (earlier ones are processed sequentially on next ticks).
+
+### Bootloader detection
+If no HEARTBEAT is received within 5s of connecting, the daemon suspects the FC is stuck in bootloader mode. The `bootloader_suspected` atomic flag is shared between the receiver task and the connection loop. Connection is retried with a 10s backoff. The current status is broadcast to WebSocket clients via `ConnectionStatus { bootloader_suspected: bool }`.
+
+### Stale actuator timeout
+`ACTUATOR_STALE_TIMEOUT` (100ms) in `loop_runner.rs`: if the simulation loop has active motors but receives no actuator commands from PX4 for 100ms, motor outputs are zeroed and the sim is disarmed. Prevents runaway physics when the FC crashes or disconnects mid-flight.
+
+### Auto PID re-push after reconnect
+`BuildConfigHandler::repush_if_configured()` triggers 3s after reconnect when `retry_count > 0`. It re-sends the last `LastVerifiedParams` to PX4 so PIDs do not reset to firmware defaults on a USB reconnect.
+
+### Serial link quality monitoring
+`MavlinkIo` tracks `parse_successes` and `parse_failures`. If link quality drops below 95% over any 5s window, a warning is logged. Persistent parse failures indicate cable quality issues or baud rate mismatch.
+
+### Sensor channel backpressure
+If a sensor channel is full (producer outpacing consumer), the daemon emits a rate-limited warn at 5s and escalates to error at 2s continuous. Indicates the simulation loop is overloaded or a consumer task has stalled.
 
 ## WebSocket Protocol
 
@@ -194,6 +212,8 @@ The simulation loop uses `try_recv` on the config channel. If multiple configs a
 - Endpoint: `ws://localhost:9876/ws`
 - Binary protocol for telemetry (30 Hz) — includes battery voltage and percent
 - JSON for commands (NSH, ConfigureBuild, Recharge)
+- **Ping/pong**: 5s ping interval, 15s pong timeout — zombie connections are detected and dropped
+- `ConnectionStatus` message includes `bootloader_suspected: bool` field
 
 ## Dependencies
 
