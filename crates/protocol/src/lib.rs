@@ -93,6 +93,47 @@ impl Default for DaemonStatus {
     }
 }
 
+/// Live snapshot of simulation state, published by the sim loop and read by
+/// the TUI header (and anything else that wants a low-rate metrics view).
+///
+/// The window-based loop stats (`tick_rate_hz`, `*_latency_us`) are rolled
+/// up every 5 s; the rest update at the publish cadence (~2 Hz). Everything
+/// here used to be logged at `info!` every 5 s — moving it to a watch
+/// channel keeps the log stream clean and lets the TUI show live values
+/// instead of waiting for the next print.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SimulationStats {
+    // ── Loop performance (rolled up over a 5 s window) ───────────────
+    pub tick_rate_hz: f32,
+    pub avg_latency_us: u32,
+    pub max_latency_us: u32,
+
+    // ── Cumulative message counts ────────────────────────────────────
+    pub hil_sensor_count: u64,
+    pub hil_gps_count: u64,
+    pub actuator_count: u64,
+    pub sensor_drops: u64,
+
+    // ── Live drone state (refreshed every publish) ───────────────────
+    pub sim_time_s: f32,
+    pub position_ned: [f32; 3],
+    /// Roll/pitch/yaw of the sim quaternion in degrees. Surfaced so the TUI
+    /// can warn when the drone is sitting non-level while disarmed — the
+    /// failure mode that prompted log100.ulg (inverted on the ground →
+    /// rate-loop trembling on arm).
+    pub attitude_rpy_deg: [f32; 3],
+    pub armed: bool,
+    pub flight_mode: u8,
+    pub motor_rpms: [f32; 4],
+    pub battery_voltage: f32,
+    pub battery_percent: f32,
+
+    // ── Last applied build (for header context) ──────────────────────
+    pub build_configured: bool,
+    pub mass_kg: f32,
+    pub thrust_to_weight: f32,
+}
+
 /// Actuator outputs from the flight controller
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActuatorOutputs {

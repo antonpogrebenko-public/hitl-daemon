@@ -389,6 +389,13 @@ pub struct AppliedConfig {
     pub battery_voltage: f64,
     pub max_motor_rpm: f64,
     pub estimated_flight_time_min: f64,
+    /// `MPC_THR_HOVER` pushed to PX4 — the `thr_desired` value (0-1, in
+    /// PX4's pre-THR_MDL_FAC-inversion units) that produces hover thrust.
+    /// Computed as `1/TWR` clamped to PX4's [0.1, 0.8] range. With the
+    /// daemon's `THR_MDL_FAC=1` push, PX4 will output `sqrt(thr_desired)`
+    /// to the actuator — matching the simulator's linear cmd→ω model and
+    /// real ESC behavior.
+    pub hover_cmd: f32,
     /// Per-build PX4 rate-controller gains pushed via `PARAM_SET` (Phase 6).
     /// Absent when the daemon ran in `--sim-only` mode or the fingerprint
     /// matched the previously-applied build (so we skipped the push).
@@ -396,6 +403,8 @@ pub struct AppliedConfig {
     pub applied_pids: Option<Px4PidsView>,
     /// Count of `PARAM_SET` messages confirmed via matching `PARAM_VALUE` ack
     /// from PX4. Zero in --sim-only or on the initial `Configuring` stage.
+    /// 15 on a fresh build (12 rate PIDs + `THR_MDL_FAC` + `MPC_THR_HOVER`
+    /// + `MPC_THR_MIN`).
     pub verified_params: u32,
 }
 

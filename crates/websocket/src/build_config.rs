@@ -4,7 +4,7 @@ use hitl_physics::{
     estimate_flight_time_min, BaroChip, BatteryConfig, BuildSpec, FrameMaterial, ImuChip,
     MagChip, PhysicsConfig,
 };
-use mavlink::ardupilotmega::{MavMessage, MavParamType, PARAM_SET_DATA};
+use mavlink::ardupilotmega::{COMMAND_LONG_DATA, MavCmd, MavMessage, MavParamType, PARAM_SET_DATA};
 use std::sync::Mutex;
 use std::time::Duration;
 use crate::handler::ValidatedNshCommand;
@@ -258,6 +258,38 @@ impl BuildConfigHandler {
         // for I ≈ 0.005 kg·m².
         let pids = compute_pids(&physics);
 
+        // Hover cmd for MPC_THR_HOVER. With the linear cmd→thrust motor model
+        // (ω²-space throttle interpolation), static hover cmd = 1/TWR.
+        //
+        // Sag correction: in flight the battery sags ~15% under load (loaded
+        // voltage ≈ 0.85 × unloaded for a typical mid-flight LiPo). Max prop
+        // thrust scales with V² → effective TWR is (0.85)² ≈ 0.7225 of static
+        // TWR, so true hover cmd = (1/TWR) / 0.7225 ≈ 1.384 × (1/TWR).
+        //
+        // Without this correction (log1.ulg, 2026-05-28): configured TWR=8.92
+        // gave hover_cmd=0.112, but observed hover during a 25 s steady-state
+        // window was 0.150 (effective TWR=6.68, voltage ratio=0.866). PX4's
+        // altitude controller was running a 34% feedforward deficit, which
+        // showed up as 18 cm altitude hunting at 0.12 Hz and 12 cm at 0.32 Hz.
+        // Clamped to PX4's accepted MPC_THR_HOVER range [0.1, 0.8].
+        const HOVER_SAG_THRUST_RATIO: f64 = 0.7225; // (0.85)² — V_loaded/V_unloaded squared
+        let hover_cmd = ((1.0 / thrust_to_weight_ratio) / HOVER_SAG_THRUST_RATIO)
+            .clamp(0.1, 0.8) as f32;
+
+        // MPC_THR_MIN — minimum thr_desired PX4's altitude controller is
+        // allowed to command. PX4's default 0.12 is sized for TWR≈2 builds
+        // where it's well below hover (0.5). For high-TWR racers (TWR=8 →
+        // hover=0.12), the default IS above hover, so the controller cannot
+        // command less thrust than hover → drone physically cannot descend,
+        // and position-mode lock-down devolves into a ~0.8 Hz limit cycle
+        // (log100.ulg, 2026-05-17: pitch_act swings ±300°/s while pitch_sp
+        // stays ±30°/s — that's the position loop fighting an unreachable
+        // altitude setpoint).
+        //
+        // 30% of hover gives ≥0.5 g of authority for controlled descent,
+        // clamped to PX4's accepted [0.05, 0.20] range.
+        let thr_min = (hover_cmd * 0.3).clamp(0.05, 0.20);
+
         // Stage 1: emit "configuring" so the UI shows a spinner. applied_pids
         // is None and verified_params is 0 because acks haven't returned yet.
         // The sim loop has NOT been touched, so the user's current flight (if
@@ -273,6 +305,7 @@ impl BuildConfigHandler {
             battery_voltage: physics.battery_voltage,
             max_motor_rpm,
             estimated_flight_time_min: flight_time,
+            hover_cmd,
             applied_pids: None,
             verified_params: 0,
         };
@@ -292,7 +325,8 @@ impl BuildConfigHandler {
         // Stage 2: push PIDs and await per-param PARAM_VALUE acks. Fail-closed:
         // any verification failure aborts before touching the sim loop, so the
         // user can't accidentally fly with mismatched PIDs vs. physics.
-        let (applied_pids, verified_params) = match self.push_pids_and_verify(&pids).await {
+        let (applied_pids, verified_params) =
+            match self.push_pids_and_verify(&pids, hover_cmd, thr_min).await {
             Ok(view) => view,
             Err(e) => {
                 error!(error = %e, "PID verification failed — aborting reconfigure");
@@ -354,6 +388,8 @@ impl BuildConfigHandler {
     pub(crate) async fn push_pids_and_verify(
         &self,
         pids: &Px4Pids,
+        hover_cmd: f32,
+        thr_min: f32,
     ) -> Result<(Option<Px4PidsView>, u32), String> {
         let (Some(mav_tx), Some(param_value_tx)) =
             (self.mav_tx.as_ref(), self.param_value_tx.as_ref())
@@ -362,16 +398,41 @@ impl BuildConfigHandler {
             return Ok((None, 0));
         };
 
-        let fp = pid_fingerprint(pids);
+        // Fingerprint mixes PID gains with hover_cmd in the high 32 bits and
+        // thr_min in the middle so a TWR change forces a re-push even when
+        // the rate PIDs are identical. (hover_cmd and thr_min both follow
+        // 1/TWR, so a TWR change always flips both — but XOR-mixing both
+        // keeps the fingerprint correct if either is ever pushed independently.)
+        let fp = pid_fingerprint(pids)
+            ^ ((hover_cmd.to_bits() as u64) << 32)
+            ^ ((thr_min.to_bits() as u64) << 16);
         {
             let cache = self.last_pid_fingerprint.lock().expect("PID cache poisoned");
             if *cache == Some(fp) {
-                debug!(fingerprint = fp, "PID fingerprint unchanged — skipping PARAM_SET push");
+                debug!(
+                    fingerprint = fp,
+                    "PID + hover_cmd fingerprint unchanged — skipping PARAM_SET push"
+                );
                 return Ok((None, 0));
             }
         }
 
-        let params: [(&str, f32); 12] = [
+        // Three thrust-curve params accompany the 12 rate PIDs:
+        // - THR_MDL_FAC=1 tells PX4 to invert the quadratic actuator response
+        //   by outputting `cmd = sqrt(thr_desired)`. This matches the sim's
+        //   linear cmd→ω model (and real ESC behavior), so the round-trip
+        //   PX4-controller→actuator→sim→thrust is linear in `thr_desired`.
+        // - MPC_THR_HOVER tells the position controller what `thr_desired`
+        //   produces hover. PX4's 0.5 default only matches TWR=2; high-TWR
+        //   racers (TWR=8 → hover≈0.12) leave the altitude integrator fighting
+        //   a 4× thrust overshoot on every position-hold cycle.
+        // - MPC_THR_MIN sets the lowest thrust PX4's altitude controller can
+        //   command. The 0.12 default is fine when hover≫0.12, but on a
+        //   high-TWR build hover *is* 0.12 — the floor pins thrust at or
+        //   above weight, the drone can't descend, position mode locks into
+        //   a ~0.8 Hz limit cycle. Scaled to 30% of hover (≥0.5 g descent
+        //   authority), clamped to PX4's [0.05, 0.20] range.
+        let params: [(&str, f32); 15] = [
             ("MC_ROLLRATE_P",   pids.roll_p),
             ("MC_ROLLRATE_I",   pids.roll_i),
             ("MC_ROLLRATE_D",   pids.roll_d),
@@ -384,6 +445,9 @@ impl BuildConfigHandler {
             ("MC_YAWRATE_I",    pids.yaw_i),
             ("MC_YAWRATE_D",    pids.yaw_d),
             ("MC_YAWRATE_FF",   pids.yaw_ff),
+            ("THR_MDL_FAC",     1.0),
+            ("MPC_THR_HOVER",   hover_cmd),
+            ("MPC_THR_MIN",     thr_min),
         ];
 
         let mut verified = 0u32;
@@ -446,6 +510,19 @@ impl BuildConfigHandler {
 
         // Cache only after full verification — partial pushes must retry.
         *self.last_pid_fingerprint.lock().expect("PID cache poisoned") = Some(fp);
+
+        // Persist to PX4 flash. PARAM_SET only writes RAM, so a Pixhawk
+        // reboot resets our PIDs / thrust-curve params back to PX4 defaults
+        // and the user sees "trembling is back" without knowing why. PX4
+        // doesn't ack the storage write reliably (EEPROM commit takes
+        // ~100 ms and the COMMAND_ACK is best-effort) — we fire-and-forget,
+        // because the worst case (silent failure) is identical to the
+        // current behaviour and a subsequent ConfigureBuild re-pushes
+        // everything anyway.
+        match mav_tx.try_send(make_param_save()) {
+            Ok(()) => debug!("Sent MAV_CMD_PREFLIGHT_STORAGE (write) — params will survive reboot"),
+            Err(e) => warn!(error = ?e, "Failed to send PARAM_SAVE — params live in RAM only"),
+        }
 
         info!(verified, fingerprint = fp, "All per-build PIDs verified on PX4");
 
@@ -631,6 +708,25 @@ fn make_param_set(name: &str, value: f32) -> MavMessage {
     })
 }
 
+/// MAV_CMD_PREFLIGHT_STORAGE with `param1 = 1.0` (write parameter storage).
+/// PX4 commits the in-RAM parameter table to flash so subsequent reboots
+/// keep the per-build PIDs / `MPC_THR_HOVER` / `THR_MDL_FAC` we just pushed.
+fn make_param_save() -> MavMessage {
+    MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
+        target_system: PX4_TARGET_SYSTEM,
+        target_component: PX4_TARGET_COMPONENT,
+        confirmation: 0,
+        command: MavCmd::MAV_CMD_PREFLIGHT_STORAGE,
+        param1: 1.0, // 1 = write to storage; 0 = read; 2 = reset to defaults
+        param2: 0.0, // mission storage: leave untouched
+        param3: 0.0, // logging rate: leave untouched
+        param4: 0.0,
+        param5: 0.0,
+        param6: 0.0,
+        param7: 0.0,
+    })
+}
+
 /// Parse a magnetometer chip string to MagChip (case-insensitive).
 fn parse_mag_chip(s: &str) -> MagChip {
     let normalized = s
@@ -690,23 +786,101 @@ mod tests {
         BuildConfigHandler::new(config_tx, None, mav_tx, param_value_tx)
     }
 
+    /// Hover throttle representative of a TWR≈2 build (1/2). Used by tests to
+    /// exercise the thrust-curve params alongside the rate PIDs.
+    const REF_HOVER_CMD: f32 = 0.5;
+    /// Slightly different hover cmd, used to verify a TWR change re-pushes
+    /// even when the rate PIDs are identical.
+    const REF_HOVER_CMD_ALT: f32 = 0.3;
+    /// MPC_THR_MIN representative of the same TWR≈2 build (30% of hover,
+    /// clamped — matches the production formula).
+    const REF_THR_MIN: f32 = 0.15;
+
+    /// Captured outbound MAVLink message — either a PARAM_SET (`name`, `value`)
+    /// or a COMMAND_LONG identified by command id. Tests use this to verify
+    /// the daemon pushes the right param set *and* the trailing PARAM_SAVE.
+    #[derive(Debug, Clone)]
+    enum CapturedMsg {
+        ParamSet(String, f32),
+        CommandLong(u32),
+    }
+
+    fn spawn_fake_px4_with_capture(
+        mav_rx: crossbeam_channel::Receiver<MavMessage>,
+        param_value_tx: broadcast::Sender<(String, f32)>,
+    ) -> (tokio::task::JoinHandle<()>, std::sync::Arc<Mutex<Vec<CapturedMsg>>>) {
+        let captured = std::sync::Arc::new(Mutex::new(Vec::<CapturedMsg>::new()));
+        let captured_clone = captured.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            while let Ok(msg) = mav_rx.recv() {
+                match msg {
+                    MavMessage::PARAM_SET(p) => {
+                        let name = std::str::from_utf8(&p.param_id)
+                            .unwrap_or("")
+                            .trim_end_matches('\0')
+                            .to_string();
+                        captured_clone
+                            .lock()
+                            .expect("capture mutex poisoned")
+                            .push(CapturedMsg::ParamSet(name.clone(), p.param_value));
+                        let _ = param_value_tx.send((name, p.param_value));
+                    }
+                    MavMessage::COMMAND_LONG(c) => {
+                        captured_clone
+                            .lock()
+                            .expect("capture mutex poisoned")
+                            .push(CapturedMsg::CommandLong(c.command as u32));
+                    }
+                    _ => {}
+                }
+            }
+        });
+        (handle, captured)
+    }
+
     #[tokio::test]
     async fn sim_only_mode_skips_verification() {
         let handler = make_handler(None, None);
-        let result = handler.push_pids_and_verify(&REF_PIDS).await;
+        let result = handler
+            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN)
+            .await;
         assert!(matches!(result, Ok((None, 0))));
     }
 
     #[tokio::test]
-    async fn happy_path_acks_all_twelve_params() {
+    async fn happy_path_acks_all_fifteen_params() {
         let (mav_tx, mav_rx) = bounded::<MavMessage>(64);
         let (pv_tx, _) = broadcast::channel::<(String, f32)>(64);
-        let _px4 = spawn_fake_px4(mav_rx, pv_tx.clone(), 0);
+        let (_px4, captured) = spawn_fake_px4_with_capture(mav_rx, pv_tx.clone());
 
         let handler = make_handler(Some(mav_tx), Some(pv_tx));
-        let (view, verified) = handler.push_pids_and_verify(&REF_PIDS).await.unwrap();
+        let (view, verified) = handler
+            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN)
+            .await
+            .unwrap();
         assert!(view.is_some());
-        assert_eq!(verified, 12);
+        assert_eq!(verified, 15);
+
+        let snapshot = captured.lock().unwrap().clone();
+        let param_names: Vec<&str> = snapshot
+            .iter()
+            .filter_map(|m| match m {
+                CapturedMsg::ParamSet(n, _) => Some(n.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(param_names.contains(&"MPC_THR_HOVER"));
+        assert!(param_names.contains(&"THR_MDL_FAC"));
+        assert!(param_names.contains(&"MPC_THR_MIN"));
+
+        let hover_value = snapshot
+            .iter()
+            .find_map(|m| match m {
+                CapturedMsg::ParamSet(n, v) if n == "MPC_THR_HOVER" => Some(*v),
+                _ => None,
+            })
+            .expect("MPC_THR_HOVER not pushed");
+        assert!((hover_value - REF_HOVER_CMD).abs() < 1e-4);
     }
 
     #[tokio::test]
@@ -717,9 +891,12 @@ mod tests {
         let _px4 = spawn_fake_px4(mav_rx, pv_tx.clone(), 1);
 
         let handler = make_handler(Some(mav_tx), Some(pv_tx));
-        let (view, verified) = handler.push_pids_and_verify(&REF_PIDS).await.unwrap();
+        let (view, verified) = handler
+            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN)
+            .await
+            .unwrap();
         assert!(view.is_some());
-        assert_eq!(verified, 12);
+        assert_eq!(verified, 15);
     }
 
     #[tokio::test]
@@ -729,7 +906,10 @@ mod tests {
         // No fake PX4 — every PARAM_SET sits in mav_rx forever and no ack ever
         // comes back. Each param exhausts PARAM_RETRY_COUNT attempts.
         let handler = make_handler(Some(mav_tx), Some(pv_tx));
-        let err = handler.push_pids_and_verify(&REF_PIDS).await.unwrap_err();
+        let err = handler
+            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN)
+            .await
+            .unwrap_err();
         assert!(
             err.contains("MC_ROLLRATE_P"),
             "expected failure on the first param, got: {err}"
@@ -743,12 +923,82 @@ mod tests {
         let _px4 = spawn_fake_px4(mav_rx, pv_tx.clone(), 0);
 
         let handler = make_handler(Some(mav_tx), Some(pv_tx));
-        let (_, verified_first) = handler.push_pids_and_verify(&REF_PIDS).await.unwrap();
-        assert_eq!(verified_first, 12);
+        let (_, verified_first) = handler
+            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN)
+            .await
+            .unwrap();
+        assert_eq!(verified_first, 15);
 
-        // Identical PIDs → fingerprint matches → no push, no acks needed.
-        let (view, verified_second) = handler.push_pids_and_verify(&REF_PIDS).await.unwrap();
+        // Identical PIDs + hover_cmd → fingerprint matches → no push, no acks needed.
+        let (view, verified_second) = handler
+            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN)
+            .await
+            .unwrap();
         assert!(view.is_none());
         assert_eq!(verified_second, 0);
+    }
+
+    #[tokio::test]
+    async fn happy_path_sends_param_save_after_verification() {
+        // MAV_CMD_PREFLIGHT_STORAGE — the command id we expect the daemon
+        // to send right after the 14 PARAM_SETs verify.
+        const MAV_CMD_PREFLIGHT_STORAGE: u32 = 245;
+
+        let (mav_tx, mav_rx) = bounded::<MavMessage>(64);
+        let (pv_tx, _) = broadcast::channel::<(String, f32)>(64);
+        let (_px4, captured) = spawn_fake_px4_with_capture(mav_rx, pv_tx.clone());
+
+        let handler = make_handler(Some(mav_tx), Some(pv_tx));
+        let (_, verified) = handler
+            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN)
+            .await
+            .unwrap();
+        assert_eq!(verified, 15);
+
+        // The PARAM_SAVE is `try_send`-d on the *same* mav channel that the
+        // fake PX4 drains. push_pids_and_verify returns as soon as the 14th
+        // PARAM_VALUE ack arrives; the PARAM_SAVE goes out right after but
+        // the fake's `recv` loop runs on a separate thread, so give it a
+        // tick to drain.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let snapshot = captured.lock().unwrap().clone();
+        let param_sets = snapshot
+            .iter()
+            .filter(|m| matches!(m, CapturedMsg::ParamSet(_, _)))
+            .count();
+        let saw_storage_write = snapshot.iter().any(|m| {
+            matches!(m, CapturedMsg::CommandLong(c) if *c == MAV_CMD_PREFLIGHT_STORAGE)
+        });
+        assert_eq!(param_sets, 15, "expected 15 PARAM_SETs");
+        assert!(
+            saw_storage_write,
+            "expected MAV_CMD_PREFLIGHT_STORAGE (245) after the PARAM_SETs — \
+             without this, a Pixhawk reboot drops our config to PX4 defaults"
+        );
+    }
+
+    #[tokio::test]
+    async fn hover_cmd_change_re_pushes_even_when_pids_unchanged() {
+        let (mav_tx, mav_rx) = bounded::<MavMessage>(64);
+        let (pv_tx, _) = broadcast::channel::<(String, f32)>(64);
+        let _px4 = spawn_fake_px4(mav_rx, pv_tx.clone(), 0);
+
+        let handler = make_handler(Some(mav_tx), Some(pv_tx));
+        let (_, verified_first) = handler
+            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN)
+            .await
+            .unwrap();
+        assert_eq!(verified_first, 15);
+
+        // Same PIDs but a different TWR — must re-push so PX4 picks up the
+        // new MPC_THR_HOVER. A TWR change without re-pushing was the original
+        // cause of position-mode oscillation.
+        let (view, verified_second) = handler
+            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD_ALT, REF_THR_MIN)
+            .await
+            .unwrap();
+        assert!(view.is_some());
+        assert_eq!(verified_second, 15);
     }
 }

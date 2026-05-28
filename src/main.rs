@@ -174,8 +174,10 @@ fn spawn_simulation_thread(
     mav_tx: Sender<MavMessage>,
     _shutdown: Arc<AtomicBool>,
     config_rx: Receiver<(PhysicsConfig, hitl_physics::BatteryConfig)>,
+    sim_stats_tx: tokio::sync::watch::Sender<protocol::SimulationStats>,
 ) -> (thread::JoinHandle<()>, SimulationState) {
-    let mut sim_loop = SimulationLoop::new(config, actuator_rx, config_rx, mav_tx);
+    let mut sim_loop = SimulationLoop::new(config, actuator_rx, config_rx, mav_tx)
+        .with_stats_publisher(sim_stats_tx);
     let state = sim_loop.state_handle();
 
     let handle = thread::Builder::new()
@@ -352,6 +354,13 @@ async fn main() {
     // DaemonStatus watch channel (TUI reads this at 2Hz)
     let (status_tx, status_rx) = watch::channel(DaemonStatus::default());
 
+    // SimulationStats watch channel — populated by the sim loop at 2Hz with
+    // a live snapshot of tick rate, position, motor RPMs, battery, etc.
+    // Moves the per-window `info!` log out of the scrolling log area and
+    // into the TUI header so the log stream stays readable.
+    let (sim_stats_tx, sim_stats_rx) =
+        watch::channel(protocol::SimulationStats::default());
+
     // Spawn TUI thread if in TUI mode
     let tui_handle = match tracing_mode {
         TracingMode::Tui { log_rx } => {
@@ -360,7 +369,7 @@ async fn main() {
                 thread::Builder::new()
                     .name("tui".to_string())
                     .spawn(move || {
-                        tui::run_tui(status_rx, log_rx, tui_shutdown);
+                        tui::run_tui(status_rx, sim_stats_rx, log_rx, tui_shutdown);
                     })
                     .expect("Failed to spawn TUI thread"),
             )
@@ -380,6 +389,7 @@ async fn main() {
         sim_mav_tx,
         shutdown.clone(),
         build_config_rx,
+        sim_stats_tx,
     );
 
     // Thread handles to join later

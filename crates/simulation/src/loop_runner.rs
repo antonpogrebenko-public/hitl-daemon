@@ -6,30 +6,21 @@ use hitl_physics::{rk4_step, throttle_to_omega_with_config, total_motor_current,
 use mavlink::ardupilotmega::{
     MavMessage, HIL_GPS_DATA, HIL_SENSOR_DATA, HilSensorUpdatedFlags,
 };
+pub use protocol::SimulationStats;
 use protocol::ActuatorOutputs;
 use std::time::{Duration, Instant};
-use tracing::{info, trace, warn};
+use tokio::sync::watch;
+use tracing::{debug, info, trace, warn};
 
-/// Simulation statistics
-#[derive(Debug, Clone, Default)]
-pub struct SimulationStats {
-    /// Total ticks executed
-    pub total_ticks: u64,
-    /// Actual tick rate (Hz)
-    pub actual_tick_rate: f64,
-    /// Average loop latency (microseconds)
-    pub avg_latency_us: f64,
-    /// Maximum loop latency (microseconds)
-    pub max_latency_us: u64,
-    /// HIL_SENSOR messages sent
-    pub hil_sensor_count: u64,
-    /// HIL_GPS messages sent
-    pub hil_gps_count: u64,
-    /// Actuator messages received
-    pub actuator_count: u64,
-    /// Sensor messages dropped (channel full)
-    pub sensor_drops: u64,
-}
+/// How often the loop pushes a snapshot to `stats_tx`. The TUI redraws at
+/// ~2 Hz so anything faster is wasted, anything slower lags the header.
+const STATS_PUBLISH_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How often the rolling tick-rate / latency window resets. The window is
+/// independent of the publish cadence — between window resets the snapshot
+/// carries the previously rolled-up values.
+const STATS_WINDOW_INTERVAL: Duration = Duration::from_secs(5);
+
 
 /// Mag sensor update divider (400 Hz / 8 = 50 Hz)
 const MAG_UPDATE_DIVIDER: u64 = 8;
@@ -63,6 +54,16 @@ pub struct SimulationLoop {
     config_rx: Receiver<(PhysicsConfig, BatteryConfig)>,
     mav_tx: Sender<MavMessage>,
     stats: SimulationStats,
+    /// Watch channel used by the TUI / web status widget to render live
+    /// loop + drone state. `None` when nothing subscribes (tests, benches).
+    stats_tx: Option<watch::Sender<SimulationStats>>,
+    /// Total ticks executed since startup — used to identify the first
+    /// tick for sensor-value logging, not surfaced in `SimulationStats`
+    /// because the cumulative HIL counts already convey progress.
+    total_ticks: u64,
+    /// Tracks whether `ConfigureBuild` has been applied at least once so the
+    /// header can show "no build configured" vs default values.
+    build_configured: bool,
     /// Cached mag reading (only updated at MAG_UPDATE_DIVIDER rate)
     last_mag: Option<hitl_sensors::MagReading>,
     /// Cached baro reading (only updated at BARO_UPDATE_DIVIDER rate)
@@ -86,9 +87,19 @@ impl SimulationLoop {
             config_rx,
             mav_tx,
             stats: SimulationStats::default(),
+            stats_tx: None,
+            total_ticks: 0,
+            build_configured: false,
             last_mag: None,
             last_baro: None,
         }
+    }
+
+    /// Attach a `watch::Sender` so the loop publishes live stats every
+    /// `STATS_PUBLISH_INTERVAL`. Call once before `run()`.
+    pub fn with_stats_publisher(mut self, tx: watch::Sender<SimulationStats>) -> Self {
+        self.stats_tx = Some(tx);
+        self
     }
 
     /// Get shared state handle for other threads
@@ -109,13 +120,14 @@ impl SimulationLoop {
             "Starting simulation loop"
         );
 
-        let stats_interval = Duration::from_secs(5);
-
         // Window-based stats — reset every interval so reported values reflect recent behaviour.
         let mut window_start = Instant::now();
         let mut window_ticks: u64 = 0;
         let mut window_latency_us: u64 = 0;
         let mut window_max_latency_us: u64 = 0;
+
+        // Last time we pushed a snapshot to `stats_tx`.
+        let mut last_stats_publish = Instant::now();
 
         // Absolute scheduling: advance next_tick by one period each iteration so overruns
         // don't accumulate (a single 8s spike won't cause 8s of catch-up busy-looping).
@@ -132,6 +144,9 @@ impl SimulationLoop {
                     self.state.reconfigure();
                     self.last_mag = None;
                     self.last_baro = None;
+                    self.build_configured = true;
+                    // Reset cumulative counters so the header reflects the new build,
+                    // not aggregate counts across builds.
                     self.stats = SimulationStats::default();
                 }
                 Err(TryRecvError::Empty) => {}
@@ -147,7 +162,7 @@ impl SimulationLoop {
             // Sample sensors and send HIL messages
             self.sample_and_send_sensors(dt);
 
-            self.stats.total_ticks += 1;
+            self.total_ticks += 1;
             window_ticks += 1;
 
             let latency_us = tick_start.elapsed().as_micros() as u64;
@@ -156,19 +171,37 @@ impl SimulationLoop {
                 window_max_latency_us = latency_us;
             }
 
-            // Print per-window stats every 5 seconds
-            if window_start.elapsed() >= stats_interval {
+            // Roll up window stats every STATS_WINDOW_INTERVAL.
+            if window_start.elapsed() >= STATS_WINDOW_INTERVAL {
                 let window_secs = window_start.elapsed().as_secs_f64();
-                self.stats.actual_tick_rate = window_ticks as f64 / window_secs;
-                self.stats.avg_latency_us = window_latency_us as f64 / window_ticks as f64;
-                self.stats.max_latency_us = window_max_latency_us;
+                self.stats.tick_rate_hz =
+                    (window_ticks as f64 / window_secs) as f32;
+                self.stats.avg_latency_us =
+                    (window_latency_us as f64 / window_ticks as f64) as u32;
+                self.stats.max_latency_us = window_max_latency_us as u32;
 
-                self.print_stats();
+                // Keep the formatted log line as `debug!` for users who tail
+                // logs at debug level. The TUI gets the same data via watch.
+                debug!(
+                    tick_rate_hz = self.stats.tick_rate_hz,
+                    avg_latency_us = self.stats.avg_latency_us,
+                    max_latency_us = self.stats.max_latency_us,
+                    hil_sensor = self.stats.hil_sensor_count,
+                    hil_gps = self.stats.hil_gps_count,
+                    actuators = self.stats.actuator_count,
+                    "sim window stats"
+                );
 
                 window_start = Instant::now();
                 window_ticks = 0;
                 window_latency_us = 0;
                 window_max_latency_us = 0;
+            }
+
+            // Publish a live snapshot to the TUI / status subscribers.
+            if last_stats_publish.elapsed() >= STATS_PUBLISH_INTERVAL {
+                self.publish_stats();
+                last_stats_publish = Instant::now();
             }
 
             // Absolute-deadline sleep: skip ticks we're already past rather than catching up.
@@ -258,6 +291,31 @@ impl SimulationLoop {
             state.quadrotor.angular_velocity[0] *= 0.8;
             state.quadrotor.angular_velocity[1] *= 0.8;
             state.quadrotor.angular_velocity[2] *= 0.9;
+
+            // Auto-level when disarmed and resting. Without this, any in-sim
+            // flip (crash, arm jolt, manual test) leaves the quaternion at a
+            // non-trivial attitude for the rest of the session — the friction
+            // above damps angular *velocity* but never restores *orientation*.
+            // PX4's EKF2 reads the resulting tilted gravity vector, decides
+            // the drone is at e.g. roll≈180°, and the attitude controller
+            // dumps a huge rate setpoint trying to flip it back. The motor
+            // thrash we debugged in May 2026 (log100.ulg: accel_z=+9.80,
+            // rate_sp_roll=-220°/s while sitting on the ground) was exactly
+            // this — armed pre-takeoff, drone got stuck inverted from a
+            // prior crash, "trembling" was the rate loop saturating against
+            // a phantom 178° attitude error.
+            //
+            // Slerp toward (0 roll, 0 pitch, current yaw) at ~0.02 per tick
+            // (~190 ms time constant at 400 Hz) — fast enough to settle
+            // between flights, slow enough to be invisible during normal
+            // touchdown dynamics.
+            if !state.armed {
+                let (_, _, yaw) = state.quadrotor.quaternion.euler_angles();
+                let level =
+                    nalgebra::UnitQuaternion::from_euler_angles(0.0, 0.0, yaw);
+                state.quadrotor.quaternion =
+                    state.quadrotor.quaternion.slerp(&level, 0.02);
+            }
         }
 
         // Update simulation time
@@ -316,7 +374,7 @@ impl SimulationLoop {
         };
 
         // Compute which sensors to update this tick
-        let tick = self.stats.total_ticks;
+        let tick = self.total_ticks;
         let update_mag = tick % MAG_UPDATE_DIVIDER == 0;
         let update_baro = tick % BARO_UPDATE_DIVIDER == 0;
 
@@ -367,7 +425,7 @@ impl SimulationLoop {
         // IMU (accel + gyro) updates every tick at 400 Hz.
         // Mag and baro update at ~50 Hz to match PX4's expected sensor rates.
         // On first tick, always include all flags so PX4 sees all sensors immediately.
-        let first_tick = self.stats.total_ticks == 0;
+        let first_tick = self.total_ticks == 0;
         let mut fields_updated = IMU_FLAGS;
         if update_mag || first_tick {
             fields_updated = fields_updated.union(MAG_FLAGS);
@@ -473,24 +531,79 @@ impl SimulationLoop {
         }
     }
 
-    /// Print current simulation statistics
-    fn print_stats(&self) {
+    /// Snapshot the loop's current state + windowed stats and push it onto
+    /// `stats_tx`. Cheap to skip when no subscriber is attached.
+    fn publish_stats(&mut self) {
+        let Some(tx) = self.stats_tx.as_ref() else {
+            return;
+        };
+
         let state = self.state.read();
-        info!(
-            tick_rate = format!("{:.1} Hz", self.stats.actual_tick_rate),
-            avg_latency = format!("{:.1} us", self.stats.avg_latency_us),
-            max_latency = format!("{} us", self.stats.max_latency_us),
-            hil_sensor = self.stats.hil_sensor_count,
-            hil_gps = self.stats.hil_gps_count,
-            actuators = self.stats.actuator_count,
-            sim_time = format!("{:.1} s", state.sim_time_us as f64 / 1_000_000.0),
-            pos_ned = format!("[{:.2}, {:.2}, {:.2}]",
-                state.quadrotor.position[0],
-                state.quadrotor.position[1],
-                state.quadrotor.position[2]
-            ),
-            "Simulation stats"
-        );
+        let physics = &self.config.physics;
+
+        // Motor RPM = ω · 60 / (2π). We surface the *actual* simulated rotor
+        // speed (which trails the command through tau_motor), not the
+        // commanded one — that's what the user sees in the 3D viewer and
+        // what matters for diagnosing trembling.
+        let rpm_scale = 60.0 / (2.0 * std::f64::consts::PI);
+        let omegas = state.quadrotor.motor_speeds;
+        let motor_rpms = [
+            (omegas[0] * rpm_scale) as f32,
+            (omegas[1] * rpm_scale) as f32,
+            (omegas[2] * rpm_scale) as f32,
+            (omegas[3] * rpm_scale) as f32,
+        ];
+
+        // TWR snapshot — derived per-publish so it stays consistent with the
+        // currently-applied physics config without touching the reconfigure
+        // channel signature.
+        let max_omega = physics.max_motor_speed_from_voltage();
+        let max_thrust_n = 4.0 * physics.kt * max_omega * max_omega;
+        let weight_n = physics.mass_kg * physics.gravity;
+        let twr = if weight_n > 0.0 { (max_thrust_n / weight_n) as f32 } else { 0.0 };
+
+        // Roll/pitch/yaw of the sim quaternion in degrees. The TUI lights up
+        // the attitude row red when |roll|+|pitch| is large while disarmed —
+        // that's the inverted-on-ground state we want to catch *before* the
+        // user arms and sees motor thrash.
+        let (roll, pitch, yaw) = state.quadrotor.quaternion.euler_angles();
+        let attitude_rpy_deg = [
+            roll.to_degrees() as f32,
+            pitch.to_degrees() as f32,
+            yaw.to_degrees() as f32,
+        ];
+
+        let snapshot = SimulationStats {
+            // Window stats — carried verbatim from the last 5 s roll-up.
+            tick_rate_hz: self.stats.tick_rate_hz,
+            avg_latency_us: self.stats.avg_latency_us,
+            max_latency_us: self.stats.max_latency_us,
+            // Cumulative counts since last reconfigure.
+            hil_sensor_count: self.stats.hil_sensor_count,
+            hil_gps_count: self.stats.hil_gps_count,
+            actuator_count: self.stats.actuator_count,
+            sensor_drops: self.stats.sensor_drops,
+            // Live values.
+            sim_time_s: (state.sim_time_us as f64 / 1_000_000.0) as f32,
+            position_ned: [
+                state.quadrotor.position[0] as f32,
+                state.quadrotor.position[1] as f32,
+                state.quadrotor.position[2] as f32,
+            ],
+            attitude_rpy_deg,
+            armed: state.armed,
+            flight_mode: state.flight_mode,
+            motor_rpms,
+            battery_voltage: state.battery.voltage() as f32,
+            battery_percent: f32::from(state.battery.percent()),
+            build_configured: self.build_configured,
+            mass_kg: physics.mass_kg as f32,
+            thrust_to_weight: twr,
+        };
+
+        // send_replace silently drops the previous value — no subscriber lag
+        // and the TUI always sees the latest snapshot.
+        let _ = tx.send(snapshot);
     }
 
     /// Get current statistics

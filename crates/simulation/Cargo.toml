@@ -13,4 +13,5 @@ nalgebra = { workspace = true }
 crossbeam-channel = { workspace = true }
 parking_lot = "0.12"
 spin_sleep = "1.2"
+tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }

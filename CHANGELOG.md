@@ -5,6 +5,68 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.7] - 2026-05-28
+
+### Fixed
+- **`MPC_THR_HOVER` ignored battery sag, causing altitude hunting** (log1.ulg, 2026-05-28: configured TWR=8.92 gave `MPC_THR_HOVER=0.112`, but a 25 s steady-state hover at 28-30 m showed observed hover thrust = 0.150 — effective TWR = 6.68, voltage ratio = 0.866). PX4's altitude controller ran a 34% feedforward deficit; the integrator made it up but left visible 18 cm altitude hunting at 0.12 Hz and 12 cm at 0.32 Hz. Also blocked the land detector from tripping in position mode near ground, because the controller never settled. The 0.7.6 `MPC_THR_MIN` fix was correct and necessary but the feedforward was still wrong.
+
+### Changed
+- `BuildConfigHandler::handle` now derates `hover_cmd` by `(0.85)² = 0.7225` to reflect typical mid-flight battery sag (loaded V ≈ 0.85 × unloaded; thrust ∝ V²). For TWR=8.92 → `hover_cmd` goes from 0.112 to 0.155 (matches observed 0.150 within 3%). `MPC_THR_MIN` is unchanged (still clamped to 0.05 floor for the same TWR). Param count stays at 15 — no new params pushed, since this PR deliberately keeps `MPC_Z_VEL_MAX_DN/UP` at PX4 defaults so position-mode descent behavior matches real-life PX4 (rate-limited to 1.5 m/s on full down stick — that's PX4 by design, not a HITL artifact).
+
+## [0.7.6] - 2026-05-17
+
+### Fixed
+- **Position-mode 0.8 Hz limit cycle on high-TWR builds** (log100.ulg follow-up: pitch_act swings ±300°/s while pitch_sp stays ±30°/s, motors cycle 0.00→0.71). PX4's default `MPC_THR_MIN=0.12` is sized for typical TWR≈2 builds (where 0.12 ≪ 0.5 hover). For a TWR=8.92 racer, hover ≈ 0.112 ≤ MPC_THR_MIN, so the floor pins thrust at or above weight — the drone physically cannot descend, position control devolves into an altitude limit cycle that drives violent attitude oscillation. The earlier 0.7.3-0.7.5 fixes (params, attitude, auto-level) were all necessary but not sufficient; this is the last layer of the stack.
+
+### Added
+- `BuildConfigHandler::push_pids_and_verify` now pushes 15 params (was 14): adds `MPC_THR_MIN = (hover_cmd × 0.3).clamp(0.05, 0.20)` — 30% of hover gives ≥0.5 g of descent authority, clamped to PX4's accepted range. For TWR=8.92 → `MPC_THR_MIN = 0.05`. For TWR=2 → `0.15`, close to PX4 default so low-TWR builds aren't affected.
+
+### Changed
+- Fingerprint cache now mixes in `thr_min` (bits 16-47) alongside `hover_cmd` (bits 32-63) — a TWR change forces a re-push of all thrust-curve params even when rate PIDs happen to be unchanged.
+
+## [0.7.5] - 2026-05-17
+
+### Fixed
+- **Pre-takeoff trembling caused by inverted sim quaternion** (log100.ulg: `accel_z=+9.80`, `attitude_roll≈+178.55°`, `rate_sp_roll=-220°/s` on the ground). The 0.7.1-0.7.4 controller/thrust-curve fixes were all treating the symptom — the rate loop was correctly fighting a real 178° attitude error because a previous crash/flip had left the simulator's quaternion non-trivial, and ground friction only damps angular *velocity*, never restores *orientation*. Auto-level fix lives in the sim loop (see below).
+- **Params didn't survive PX4 reboots.** `PARAM_SET` only writes to RAM. A FC power-cycle silently dropped all 14 per-build params back to PX4 defaults, with no log indication.
+
+### Added
+- Sim loop auto-levels the quaternion when on-ground + disarmed via a 0.02-per-tick slerp toward `(0, 0, current_yaw)` (~190 ms time constant at 400 Hz). Invisible during normal touchdown dynamics, fast enough to clear a stuck-inverted state between flights.
+- After the 14-param push verifies, the daemon sends `MAV_CMD_PREFLIGHT_STORAGE` (cmd 245, param1=1) to commit the in-RAM param table to PX4 flash. Fire-and-forget — PX4's storage ack is best-effort and a subsequent ConfigureBuild re-pushes everything if it didn't take.
+- `SimulationStats.attitude_rpy_deg` exposes sim roll/pitch/yaw in degrees.
+- TUI surfaces an `Att` row showing roll/pitch/yaw. When `|roll|>5°` or `|pitch|>5°` while disarmed, the row turns red and shows `⚠ inverted on ground — reconfigure` so this exact failure mode is visible at a glance instead of buried in a ULOG analysis.
+
+## [0.7.4] - 2026-05-17
+
+### Fixed
+- Pre-takeoff motor trembling — the 0.7.3 fix paired with `hitl-physics` 0.9.0's ω²-space throttle interpolation amplified tiny rate-controller PID outputs (cmd ≈ 0.005-0.02) into massive motor RPM swings (2300-4300 RPM at idle vs the expected ~1000-1500). PX4's rate PIDs are tuned assuming linear cmd→ω (matching real ESCs); the ω² model gave a ~16× steeper `dω/dcmd` slope at idle, so the rate loop oscillated whenever the integrator nudged the motors. Confirmed via NSH `param show` that the 0.7.3 params landed; the trembling was downstream of the motor model itself, not the param push.
+
+### Changed
+- `THR_MDL_FAC` push flipped from `0.0` → `1.0`. With `hitl-physics` 0.9.1 reverted to linear cmd→ω, PX4 outputs `cmd = sqrt(thr_desired)` to compensate for the resulting quadratic cmd→thrust curve. End-to-end round-trip is still linear in `thr_desired`, but the actuator-side response is now stable at idle and matches how real drones behave.
+- `MPC_THR_HOVER` semantics unchanged (still `1/TWR` clamped to [0.1, 0.8]) — PX4 stores it in pre-THR_MDL_FAC-inversion units, so it doesn't depend on which side of the contract owns the sqrt.
+
+## [0.7.3] - 2026-05-17
+
+### Fixed
+- Position-mode trembling and slow descent on light racers (TWR > 2). PX4's default `MPC_THR_HOVER=0.5` only matches a TWR=2 build; with the new linear cmd→thrust motor model (hitl-physics 0.9.0), a TWR=5 racer needs `MPC_THR_HOVER=0.2`. The default left the altitude integrator fighting a 2.5× thrust overshoot on every position-hold cycle, which the position controller turned into visible "trembling".
+
+### Added
+- `BuildConfigHandler::push_pids_and_verify` now pushes 14 params instead of 12: the 12 rate PIDs plus `THR_MDL_FAC=0` (locks PX4's forward thrust model to linear, matching the sim's ω²-space throttle interpolation) and `MPC_THR_HOVER=1/TWR` (clamped to PX4's [0.1, 0.8] range).
+- `AppliedConfig.hover_cmd` surfaces the actual pushed hover throttle so the UI can show it.
+
+### Changed
+- PID fingerprint cache now keys on `pid_fingerprint XOR (hover_cmd_bits << 32)`, so a TWR change re-pushes even when the rate PIDs themselves are unchanged.
+
+## [0.7.2] - 2026-05-16
+
+### Changed
+- TUI header expanded from 2 lines to 7: now surfaces tick rate (color-coded by health), avg/max latency, sensor drops, armed/mode/sim-time/position, motor RPMs, HIL message counts, battery V/% (color-coded), build mass + TWR, uptime.
+- Periodic `Simulation stats` `info!` log (fired every 5 s) demoted to `debug!`. Same data now lives in the TUI header and is updated at 2 Hz via a `tokio::sync::watch` channel.
+
+### Added
+- `protocol::SimulationStats` carries the live snapshot (loop perf, cumulative counts, drone state, applied build summary). `serde`-friendly so future web/HTTP status endpoints can consume the same shape.
+- `SimulationLoop::with_stats_publisher(tx)` builder so the loop publishes a snapshot every 500 ms to anything that subscribes (TUI today, web status panel later).
+
 ## [0.7.1] - 2026-05-16
 
 ### Fixed
