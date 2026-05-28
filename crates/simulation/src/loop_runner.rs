@@ -25,6 +25,13 @@ const STATS_WINDOW_INTERVAL: Duration = Duration::from_secs(5);
 /// at 400 Hz when the FC is slow to consume HIL_SENSOR messages.
 const DROP_WARN_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How long without an actuator command before we consider the FC disconnected
+/// and zero all motor commands. At 400 Hz, 100 ms = 40 missed commands.
+const ACTUATOR_STALE_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Minimum interval between stale-actuator warning log lines.
+const STALE_WARN_INTERVAL: Duration = Duration::from_secs(5);
+
 /// If the HIL_SENSOR channel stays full continuously for this long, escalate
 /// to `error!` — the FC has likely disconnected without the serial layer
 /// detecting it yet.
@@ -84,6 +91,12 @@ pub struct SimulationLoop {
     /// When the HIL_SENSOR channel first became full in the current
     /// contiguous run. `None` when the channel is not full.
     channel_full_since: Option<Instant>,
+    /// Last time an actuator command was received from the FC. Used to detect
+    /// FC disconnection: if no command arrives within ACTUATOR_STALE_TIMEOUT
+    /// while motors are active, commands are zeroed and armed is cleared.
+    last_actuator_time: Instant,
+    /// Last time a stale-actuator warning was emitted (rate-limits log spam).
+    last_stale_warning: Instant,
 }
 
 impl SimulationLoop {
@@ -111,6 +124,8 @@ impl SimulationLoop {
             last_drop_warning: Instant::now(),
             drop_count_since_last_warning: 0,
             channel_full_since: None,
+            last_actuator_time: Instant::now(),
+            last_stale_warning: Instant::now(),
         }
     }
 
@@ -253,6 +268,7 @@ impl SimulationLoop {
         }
 
         if let Some(actuator) = latest {
+            self.last_actuator_time = Instant::now();
             self.state.set_motor_commands(actuator.motors);
             self.state.set_armed(actuator.is_armed());
 
@@ -262,6 +278,22 @@ impl SimulationLoop {
                     armed = actuator.is_armed(),
                     "Received actuator commands"
                 );
+            }
+        } else {
+            // No command received this tick — check for staleness while motors are active.
+            let motors_active = self.state.read().motor_commands.iter().any(|&c| c > 0.01);
+            if motors_active && self.last_actuator_time.elapsed() > ACTUATOR_STALE_TIMEOUT {
+                // Zero motors and disarm: FC is gone, let gravity take over.
+                self.state.set_motor_commands([0.0; 4]);
+                self.state.set_armed(false);
+
+                if self.last_stale_warning.elapsed() >= STALE_WARN_INTERVAL {
+                    warn!(
+                        stale_ms = self.last_actuator_time.elapsed().as_millis(),
+                        "Actuator commands stale for >100ms — zeroing motors (FC disconnected?)"
+                    );
+                    self.last_stale_warning = Instant::now();
+                }
             }
         }
     }

@@ -504,6 +504,8 @@ async fn main() {
         build_config_mav_tx,
         build_config_param_value_tx,
     ));
+    // Keep a clone for the reconnect task so it can re-push PIDs after FC power cycles.
+    let build_config_handler_for_reconnect = build_config_handler.clone();
     ws_server.set_build_config_handler(build_config_handler);
     let sim_state_for_recharge = sim_state.clone();
     ws_server.set_recharge_callback(std::sync::Arc::new(move || {
@@ -647,6 +649,20 @@ async fn main() {
                     pps_for_status.store(count, Ordering::Relaxed);
                 } else {
                     pps_for_status.store(0, Ordering::Relaxed);
+                }
+            }
+
+            // Every 5 seconds (every 10 ticks at 500ms), check serial link quality
+            if tick_count % 10 == 0 {
+                if let Some(ref mav) = *mav_io_status.read().await {
+                    let (successes, failures) = mav.take_parse_stats();
+                    let total = successes + failures;
+                    if total > 0 {
+                        let quality = (successes * 100) / total;
+                        if quality < 95 {
+                            warn!(quality_pct = quality, failures, "Serial link quality degraded — check USB cable");
+                        }
+                    }
                 }
             }
 
@@ -851,6 +867,12 @@ async fn main() {
         let param_value_tx_reconnect = param_value_tx.clone();
         let preferred_port = args.port.clone();
         let baud = args.baud;
+        let build_config_handler_reconnect = build_config_handler_for_reconnect;
+
+        // Shared flag: set true when the heartbeat watchdog fires (bootloader suspected).
+        // The connection loop reads this to apply a longer backoff so the port is
+        // free for firmware-flashing tools during the 30-60 s bootloader window.
+        let bootloader_suspected = Arc::new(AtomicBool::new(false));
 
         Some(tokio::spawn(async move {
             info!("Connection manager started");
@@ -867,6 +889,7 @@ async fn main() {
                 retry_count: 0,
                 serial_port: String::new(),
                 fc_model: None,
+                bootloader_suspected: false,
             });
 
             loop {
@@ -902,17 +925,32 @@ async fn main() {
 
                     if retry_count < 255 { retry_count += 1; }
 
+                    let is_bootloader = bootloader_suspected.load(Ordering::SeqCst);
                     let _ = conn_status_tx_reconnect.send(ConnectionStatus {
                         connected: false,
                         reconnecting: true,
                         retry_count,
                         serial_port: String::new(),
                         fc_model: None,
+                        bootloader_suspected: is_bootloader,
                     });
 
-                    // Cooldown before reconnect — gives OS time to release port
-                    let delay = reconnect_delay(retry_count);
-                    tokio::time::sleep(delay).await;
+                    // Cooldown before reconnect — gives OS time to release port.
+                    // If the heartbeat watchdog fired (bootloader suspected), use a 10s
+                    // backoff so firmware-flashing tools have uncontested access to the
+                    // serial port during the 30-60 s bootloader window.
+                    if bootloader_suspected.load(Ordering::SeqCst) {
+                        let bootloader_backoff = Duration::from_secs(10);
+                        warn!(
+                            "Bootloader suspected — waiting {}s before reconnect to free serial port",
+                            bootloader_backoff.as_secs()
+                        );
+                        bootloader_suspected.store(false, Ordering::SeqCst);
+                        tokio::time::sleep(bootloader_backoff).await;
+                    } else {
+                        let delay = reconnect_delay(retry_count);
+                        tokio::time::sleep(delay).await;
+                    }
                 }
 
                 // Try to find a Pixhawk
@@ -933,6 +971,7 @@ async fn main() {
                         retry_count,
                         serial_port: String::new(),
                         fc_model: None,
+                        bootloader_suspected: false,
                     });
 
                     tokio::time::sleep(delay).await;
@@ -948,7 +987,10 @@ async fn main() {
                 match new_mav_io.spawn(&port_path, baud, tx_to_app, rx_from_app, nsh_resp_tx.clone(), nsh_req_rx).await {
                     Ok(()) => {
                         info!(port = %port_path, "Connected to FC!");
+                        let was_reconnect = retry_count > 0;
                         retry_count = 0;
+                        // Successful connection — clear any stale bootloader flag.
+                        bootloader_suspected.store(false, Ordering::SeqCst);
 
                         let new_mav_io = Arc::new(new_mav_io);
                         current_mav_io = Some(new_mav_io.clone());
@@ -961,7 +1003,22 @@ async fn main() {
                             retry_count: 0,
                             serial_port: port_path.clone(),
                             fc_model: None,
+                            bootloader_suspected: false,
                         });
+
+                        // After a reconnect (not the initial connection), re-push
+                        // PIDs to PX4 — a power cycle resets PX4's RAM parameters.
+                        // We wait 3 s for PX4 to boot and EKF2 to start accepting
+                        // PARAM_SET before attempting the push.
+                        if was_reconnect {
+                            let handler_clone = build_config_handler_reconnect.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_secs(3)).await;
+                                if let Err(e) = handler_clone.repush_if_configured().await {
+                                    warn!(error = %e, "PID re-push after FC reconnect failed — user may need to reconfigure manually");
+                                }
+                            });
+                        }
 
                         // Spawn receiver task (Pixhawk -> simulation + QGC)
                         let mav_io_recv = new_mav_io.clone();
@@ -974,6 +1031,7 @@ async fn main() {
                         let param_value_tx_recv = param_value_tx_reconnect.clone();
                         let port_path_recv = port_path.clone();
                         let sim_state_recv = sim_state_reconnect.clone();
+                        let bootloader_suspected_recv = bootloader_suspected.clone();
                         let start_time = std::time::Instant::now();
                         receiver_handle = Some(tokio::spawn(async move {
                             info!("MAVLink receiver task started");
@@ -984,9 +1042,21 @@ async fn main() {
                                     break;
                                 }
 
-                                // Watchdog: if no heartbeat within timeout, FC is likely in bootloader
+                                // Watchdog: if no heartbeat within timeout, FC is likely in bootloader.
+                                // Set the flag so the connection loop uses a long backoff (10s) to keep
+                                // the serial port free for firmware-flashing tools. Also broadcast the
+                                // status so the frontend can show "FC is booting, please wait...".
                                 if !heartbeat_received && start_time.elapsed() > heartbeat_timeout {
                                     warn!("No heartbeat received within {}s — FC may be in bootloader mode", heartbeat_timeout.as_secs());
+                                    bootloader_suspected_recv.store(true, Ordering::SeqCst);
+                                    let _ = conn_status_tx_recv.send(ConnectionStatus {
+                                        connected: false,
+                                        reconnecting: true,
+                                        retry_count: 0,
+                                        serial_port: String::new(),
+                                        fc_model: None,
+                                        bootloader_suspected: true,
+                                    });
                                     mav_io_recv.signal_disconnect();
                                     break;
                                 }
@@ -1070,6 +1140,7 @@ async fn main() {
                                                     retry_count: 0,
                                                     serial_port: port_path_recv.clone(),
                                                     fc_model: Some(name.to_string()),
+                                                    bootloader_suspected: false,
                                                 });
                                             }
                                         }
@@ -1143,6 +1214,7 @@ async fn main() {
             retry_count: 0,
             serial_port: "simulation".to_string(),
             fc_model: None,
+            bootloader_suspected: false,
         });
         None
     };

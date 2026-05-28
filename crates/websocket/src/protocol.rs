@@ -228,6 +228,7 @@ pub struct HandshakeAck {
 /// - `[3]`: retry_count (u8)
 /// - `[4-N]`: serial_port string (null-terminated, empty if not connected)
 /// - `[N+1-M]`: fc_model string (null-terminated, empty if unknown)
+/// - `[M+1]`: bootloader_suspected (u8 bool) — appended after fc_model for backwards compat
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionStatus {
     /// Whether Pixhawk is currently connected
@@ -240,13 +241,15 @@ pub struct ConnectionStatus {
     pub serial_port: String,
     /// FC model string from HEARTBEAT autopilot version (None if unknown)
     pub fc_model: Option<String>,
+    /// True when the heartbeat watchdog timed out — FC is likely in bootloader mode
+    pub bootloader_suspected: bool,
 }
 
 impl ConnectionStatus {
     /// Serialize to binary format
     pub fn to_bytes(&self) -> Vec<u8> {
         let fc_model_str = self.fc_model.as_deref().unwrap_or("");
-        let mut buf = Vec::with_capacity(5 + self.serial_port.len() + 1 + fc_model_str.len() + 1);
+        let mut buf = Vec::with_capacity(5 + self.serial_port.len() + 1 + fc_model_str.len() + 1 + 1);
         buf.push(MSG_TYPE_CONNECTION_STATUS);
         buf.push(self.connected as u8);
         buf.push(self.reconnecting as u8);
@@ -255,6 +258,7 @@ impl ConnectionStatus {
         buf.push(0); // null terminator for serial_port
         buf.extend_from_slice(fc_model_str.as_bytes());
         buf.push(0); // null terminator for fc_model
+        buf.push(self.bootloader_suspected as u8); // appended last for backwards compat
         buf
     }
 }
@@ -796,6 +800,7 @@ mod tests {
             retry_count: 0,
             serial_port: "/dev/tty.usb".to_string(),
             fc_model: Some("Pixhawk 6C".to_string()),
+            bootloader_suspected: false,
         };
         let bytes = status.to_bytes();
         assert_eq!(bytes[0], MSG_TYPE_CONNECTION_STATUS);
@@ -812,6 +817,9 @@ mod tests {
         let model_null = bytes[model_start..].iter().position(|&b| b == 0).unwrap() + model_start;
         let model_str = std::str::from_utf8(&bytes[model_start..model_null]).unwrap();
         assert_eq!(model_str, "Pixhawk 6C");
+
+        // bootloader_suspected byte is appended after fc_model null terminator
+        assert_eq!(bytes[model_null + 1], 0); // not bootloader_suspected
     }
 
     #[test]
@@ -822,6 +830,7 @@ mod tests {
             retry_count: 3,
             serial_port: String::new(),
             fc_model: None,
+            bootloader_suspected: false,
         };
         let bytes = status.to_bytes();
         assert_eq!(bytes[1], 0); // not connected
@@ -831,6 +840,25 @@ mod tests {
         assert_eq!(bytes[4], 0);
         // Empty fc_model: null terminator at index 5
         assert_eq!(bytes[5], 0);
+        // bootloader_suspected at index 6
+        assert_eq!(bytes[6], 0);
+    }
+
+    #[test]
+    fn test_connection_status_bootloader_suspected() {
+        let status = ConnectionStatus {
+            connected: false,
+            reconnecting: true,
+            retry_count: 1,
+            serial_port: String::new(),
+            fc_model: None,
+            bootloader_suspected: true,
+        };
+        let bytes = status.to_bytes();
+        assert_eq!(bytes[1], 0); // not connected
+        assert_eq!(bytes[2], 1); // reconnecting
+        // bootloader_suspected byte is at index 6 (after two empty null-terminated strings)
+        assert_eq!(bytes[6], 1); // bootloader_suspected = true
     }
 
     #[test]

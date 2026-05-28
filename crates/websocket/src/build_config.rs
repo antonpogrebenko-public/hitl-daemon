@@ -55,6 +55,23 @@ pub struct BuildConfigHandler {
     /// push to avoid wearing PX4's EEPROM on rapid reconfigures. Only set
     /// after all PARAM_VALUE acks succeed.
     last_pid_fingerprint: Mutex<Option<u64>>,
+    /// The last successfully verified PID set + thrust params. Used by
+    /// `repush_if_configured` to re-push on FC reconnect without requiring
+    /// a new `ConfigureBuild` from the browser.
+    last_verified_params: Mutex<Option<LastVerifiedParams>>,
+    /// Broadcast channel for system-initiated `ConfigResult` messages (e.g.
+    /// those emitted by `repush_if_configured` on FC reconnect). The
+    /// WebSocket server subscribes and forwards to all connected clients.
+    system_config_tx: broadcast::Sender<OutgoingMessage>,
+}
+
+/// Snapshot of the parameters that were last successfully verified on PX4.
+/// Stored so `repush_if_configured` can re-push them after a FC power cycle.
+#[derive(Clone)]
+struct LastVerifiedParams {
+    pids: Px4Pids,
+    hover_cmd: f32,
+    thr_min: f32,
 }
 
 impl BuildConfigHandler {
@@ -67,6 +84,8 @@ impl BuildConfigHandler {
         let api_url = std::env::var("RELEASE_API_URL")
             .unwrap_or_else(|_| DEFAULT_API_URL.to_string());
 
+        let (system_config_tx, _) = broadcast::channel(16);
+
         Self {
             api_url,
             http_client: reqwest::Client::builder()
@@ -78,7 +97,16 @@ impl BuildConfigHandler {
             mav_tx,
             param_value_tx,
             last_pid_fingerprint: Mutex::new(None),
+            last_verified_params: Mutex::new(None),
+            system_config_tx,
         }
+    }
+
+    /// Subscribe to system-initiated `ConfigResult` messages.  The WebSocket
+    /// server calls this once during setup so reconnect-triggered results are
+    /// forwarded to all connected browsers.
+    pub fn subscribe_system_config(&self) -> broadcast::Receiver<OutgoingMessage> {
+        self.system_config_tx.subscribe()
     }
 
     /// Process a `ConfigureBuild` request through the two-stage lifecycle:
@@ -512,6 +540,15 @@ impl BuildConfigHandler {
 
         // Cache only after full verification — partial pushes must retry.
         *self.last_pid_fingerprint.lock().expect("PID cache poisoned") = Some(fp);
+        // Persist the verified param snapshot so repush_if_configured can
+        // re-push the same values after a FC power cycle without needing a
+        // new ConfigureBuild from the browser.
+        *self.last_verified_params.lock().expect("PID params cache poisoned") =
+            Some(LastVerifiedParams {
+                pids: pids.clone(),
+                hover_cmd,
+                thr_min,
+            });
 
         // Persist to PX4 flash. PARAM_SET only writes RAM, so a Pixhawk
         // reboot resets our PIDs / thrust-curve params back to PX4 defaults
@@ -616,6 +653,78 @@ impl BuildConfigHandler {
         }
         // `max_retries == 0` edge case: nothing to do, treat as success.
         Ok(())
+    }
+
+    /// Re-push the last verified PID + thrust-curve parameters to PX4 after a
+    /// FC power cycle / reconnect.
+    ///
+    /// Behaviour:
+    /// - If no config was ever applied during this session, returns `Ok(())`
+    ///   immediately — nothing to push.
+    /// - Clears the PID fingerprint cache before pushing so the dedup check
+    ///   inside `push_pids_and_verify` does not skip the re-push.
+    /// - Broadcasts `ConfigState::Configuring` on `system_config_tx` so all
+    ///   connected browser clients can show a spinner, then `ConfigState::Ready`
+    ///   on success (or `ConfigState::Error` on failure).  Broadcasts silently
+    ///   drop when no clients are subscribed.
+    /// - Only re-pushes PIDs to PX4 — does NOT resend `PhysicsConfig` to the
+    ///   simulation loop (physics are already correct in the running sim).
+    /// - Returns `Err` only if the PARAM_SET sequence fails, so the caller
+    ///   can log a warning; the sim continues with whatever PX4 has loaded.
+    pub async fn repush_if_configured(&self) -> Result<(), String> {
+        // Snapshot the last verified params under the lock, then release.
+        let params = {
+            self.last_verified_params
+                .lock()
+                .expect("PID params cache poisoned")
+                .clone()
+        };
+
+        let Some(p) = params else {
+            debug!("repush_if_configured: no prior config in this session — nothing to push");
+            return Ok(());
+        };
+
+        info!(
+            hover_cmd = p.hover_cmd,
+            thr_min = p.thr_min,
+            "FC reconnected — re-pushing last verified PIDs"
+        );
+
+        // Notify the frontend that re-configuration is in progress.
+        let _ = self.system_config_tx.send(OutgoingMessage::ConfigResult(ConfigResult {
+            state: ConfigState::Configuring,
+            success: true,
+            error: None,
+            config: None,
+        }));
+
+        // Clear the fingerprint cache so push_pids_and_verify doesn't skip
+        // the push — PX4 just reset its RAM on power cycle.
+        *self.last_pid_fingerprint.lock().expect("PID cache poisoned") = None;
+
+        match self.push_pids_and_verify(&p.pids, p.hover_cmd, p.thr_min).await {
+            Ok(_) => {
+                info!("PIDs re-verified on reconnected FC");
+                let _ = self.system_config_tx.send(OutgoingMessage::ConfigResult(ConfigResult {
+                    state: ConfigState::Ready,
+                    success: true,
+                    error: None,
+                    config: None,
+                }));
+                Ok(())
+            }
+            Err(e) => {
+                error!(error = %e, "PID re-push failed after FC reconnect");
+                let _ = self.system_config_tx.send(OutgoingMessage::ConfigResult(ConfigResult {
+                    state: ConfigState::Error,
+                    success: false,
+                    error: Some(format!("PID re-push after reconnect failed: {e}")),
+                    config: None,
+                }));
+                Err(e)
+            }
+        }
     }
 
     async fn fetch_motor_specs(&self, slug: &str) -> Result<serde_json::Value, String> {

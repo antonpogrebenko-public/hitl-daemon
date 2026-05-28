@@ -57,6 +57,10 @@ struct AppState {
     conn_status_tx: Option<broadcast::Sender<ConnectionStatus>>,
     /// Vehicle message sender for broadcasting to clients
     vehicle_msg_tx: Option<broadcast::Sender<VehicleMessage>>,
+    /// System-initiated `ConfigResult` messages (e.g. from `repush_if_configured`
+    /// on FC reconnect). Forwarded to all connected clients so the browser can
+    /// display the spinner / ready state without requiring a manual re-configure.
+    system_config_tx: Option<broadcast::Sender<OutgoingMessage>>,
 }
 
 /// WebSocket server for browser communication
@@ -174,10 +178,30 @@ impl WebSocketServer {
         if let Some(nsh_tx) = self.nsh_tx {
             handler.set_nsh_sender(nsh_tx);
         }
-        // Enable build config handler if set
-        if let Some(build_config_handler) = self.build_config_handler {
-            handler.set_build_config_handler(build_config_handler);
-        }
+        // Enable build config handler if set; subscribe to its system-config broadcast
+        // so reconnect-triggered ConfigResult messages reach all connected clients.
+        let system_config_tx: Option<broadcast::Sender<OutgoingMessage>> =
+            if let Some(build_config_handler) = self.build_config_handler {
+                let rx = build_config_handler.subscribe_system_config();
+                // Bridge the broadcast::Receiver into a new broadcast::Sender so
+                // handle_socket can subscribe independently per client.
+                let (tx, _) = broadcast::channel::<OutgoingMessage>(16);
+                let tx_clone = tx.clone();
+                tokio::spawn(async move {
+                    let mut rx = rx;
+                    loop {
+                        match rx.recv().await {
+                            Ok(msg) => { let _ = tx_clone.send(msg); }
+                            Err(broadcast::error::RecvError::Closed) => break,
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        }
+                    }
+                });
+                handler.set_build_config_handler(build_config_handler);
+                Some(tx)
+            } else {
+                None
+            };
         // Enable recharge callback
         if let Some(recharge_fn) = self.recharge_fn {
             handler.set_recharge_callback(recharge_fn);
@@ -269,6 +293,7 @@ impl WebSocketServer {
             nsh_resp_tx,
             conn_status_tx,
             vehicle_msg_tx,
+            system_config_tx,
         });
 
         // Build CORS layer — restrict origins in production, allow localhost for dev
@@ -349,6 +374,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
     // Subscribe to vehicle messages if available
     let mut vehicle_msg_rx = state.vehicle_msg_tx.as_ref().map(|tx| tx.subscribe());
+
+    // Subscribe to system-initiated config results (reconnect re-push) if available
+    let mut system_config_rx = state.system_config_tx.as_ref().map(|tx| tx.subscribe());
 
     // Channel for sending responses from the receive task to the send task
     let (response_tx, mut response_rx) = mpsc::channel::<OutgoingMessage>(32);
@@ -471,6 +499,28 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         }
                         Err(broadcast::error::RecvError::Closed) => {
                             vehicle_msg_rx = None;
+                        }
+                    }
+                }
+                // Handle system-initiated config results (e.g. reconnect re-push)
+                result = async {
+                    match system_config_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match result {
+                        Ok(msg) => {
+                            let bytes = msg.to_bytes();
+                            if ws_sender.send(Message::Binary(bytes.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            warn!(client_id, lagged = n, "System config receiver lagged");
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            system_config_rx = None;
                         }
                     }
                 }

@@ -2,7 +2,7 @@
 
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
 use mavlink::{ardupilotmega::MavMessage, MavHeader};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -93,6 +93,10 @@ pub struct MavlinkIo {
     shutdown: Arc<AtomicBool>,
     /// Count of MAVLink messages successfully parsed from serial
     pub packets_received: Arc<AtomicU32>,
+    /// Count of successfully parsed MAVLink frames (for link quality tracking)
+    parse_successes: Arc<AtomicU64>,
+    /// Count of corrupted/dropped frames detected via drain_to_next_frame (for link quality tracking)
+    parse_failures: Arc<AtomicU64>,
     /// Reader task handle
     reader_handle: Option<JoinHandle<()>>,
     /// Writer task handle
@@ -121,6 +125,8 @@ impl MavlinkIo {
             nsh_rx,
             shutdown: Arc::new(AtomicBool::new(false)),
             packets_received: Arc::new(AtomicU32::new(0)),
+            parse_successes: Arc::new(AtomicU64::new(0)),
+            parse_failures: Arc::new(AtomicU64::new(0)),
             reader_handle: None,
             writer_handle: None,
         };
@@ -170,10 +176,12 @@ impl MavlinkIo {
         let shutdown_reader = self.shutdown.clone();
         let shutdown_writer = self.shutdown.clone();
         let packets_counter = self.packets_received.clone();
+        let parse_successes = self.parse_successes.clone();
+        let parse_failures = self.parse_failures.clone();
 
         // Spawn reader task
         let reader_handle = tokio::spawn(async move {
-            Self::reader_task(reader, tx_to_app, nsh_tx_to_app, shutdown_reader, packets_counter).await;
+            Self::reader_task(reader, tx_to_app, nsh_tx_to_app, shutdown_reader, packets_counter, parse_successes, parse_failures).await;
         });
 
         // Spawn writer task
@@ -228,6 +236,8 @@ impl MavlinkIo {
         nsh_tx: Sender<NshResponseData>,
         shutdown: Arc<AtomicBool>,
         packets_received: Arc<AtomicU32>,
+        parse_successes: Arc<AtomicU64>,
+        parse_failures: Arc<AtomicU64>,
     ) {
         info!("Reader task started");
         let mut buffer = [0u8; 1024];
@@ -266,6 +276,7 @@ impl MavlinkIo {
                         );
                         // Do NOT skip byte 0: if it's already 0xFD, preserve it as a
                         // potential frame start (no parse attempt has been made yet).
+                        parse_failures.fetch_add(1, Ordering::Relaxed);
                         Self::drain_to_next_frame(&mut parse_buffer, false);
                     }
 
@@ -275,6 +286,7 @@ impl MavlinkIo {
                             Some((header, message, consumed)) => {
                                 parse_buffer.drain(..consumed);
                                 packets_received.fetch_add(1, Ordering::Relaxed);
+                                parse_successes.fetch_add(1, Ordering::Relaxed);
 
                                 // Check for SERIAL_CONTROL responses (NSH data)
                                 if let MavMessage::SERIAL_CONTROL(ref sc) = message {
@@ -316,6 +328,7 @@ impl MavlinkIo {
                                 if parse_buffer.len() >= 8
                                     && parse_buffer[0] != MAVLINK_V2_STX
                                 {
+                                    parse_failures.fetch_add(1, Ordering::Relaxed);
                                     Self::drain_to_next_frame(&mut parse_buffer, true);
                                 }
                                 break;
@@ -563,6 +576,27 @@ impl MavlinkIo {
     /// Signal disconnection (called when I/O error detected)
     pub fn signal_disconnect(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
+    }
+
+    /// Returns the serial link quality as a percentage (0–100).
+    /// 100 means no parse failures observed since last reset (or no data yet).
+    pub fn link_quality_percent(&self) -> u8 {
+        let successes = self.parse_successes.load(Ordering::Relaxed);
+        let failures = self.parse_failures.load(Ordering::Relaxed);
+        let total = successes + failures;
+        if total == 0 {
+            return 100;
+        }
+        ((successes * 100) / total).min(100) as u8
+    }
+
+    /// Atomically swap parse success and failure counters to zero and return
+    /// their previous values as `(successes, failures)`.
+    /// Call periodically (e.g. every 5 s) to get a rolling window of link quality.
+    pub fn take_parse_stats(&self) -> (u64, u64) {
+        let s = self.parse_successes.swap(0, Ordering::Relaxed);
+        let f = self.parse_failures.swap(0, Ordering::Relaxed);
+        (s, f)
     }
 }
 
