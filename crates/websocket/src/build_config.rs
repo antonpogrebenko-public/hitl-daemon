@@ -283,8 +283,8 @@ impl BuildConfigHandler {
                         .unwrap_or(hitl_physics::build::GpsChipset::Other);
                     let update_rate_hz = specs.get("updateRateHz").and_then(|v| v.as_f64())
                         .unwrap_or(10.0);
-                    let has_compass = specs.get("hasCompass").and_then(|v| v.as_bool())
-                        .unwrap_or(false);
+                    let has_compass = specs.get("compass").or_else(|| specs.get("hasCompass"))
+                        .and_then(|v| v.as_bool()).unwrap_or(false);
                     let weight_g = specs.get("weightG").and_then(|v| v.as_f64())
                         .unwrap_or(12.0);
                     spec.gps = Some(hitl_physics::build::GpsSpec {
@@ -954,15 +954,25 @@ fn parse_mag_chip(s: &str) -> MagChip {
 fn parse_gps_chipset(s: &str) -> hitl_physics::build::GpsChipset {
     use hitl_physics::build::GpsChipset;
     let normalized = s.to_lowercase().replace(['-', '_', ' '], "");
-    match normalized.as_str() {
-        "ubloxm8n" | "m8n" | "neom8n" => GpsChipset::UbloxM8N,
-        "ubloxm9n" | "m9n" | "neom9n" => GpsChipset::UbloxM9N,
-        "ubloxm10" | "m10" | "neom10" => GpsChipset::UbloxM10,
-        "ubloxf9p" | "f9p" | "zed f9p" | "zedf9p" => GpsChipset::UbloxF9P,
-        "septentriomosaic" | "mosaic" => GpsChipset::SeptentrioMosaic,
-        "here3" | "here3+" => GpsChipset::Here3,
-        _ => GpsChipset::Other,
+    if normalized.contains("f9p") || normalized.contains("zedf9p") {
+        return GpsChipset::UbloxF9P;
     }
+    if normalized.contains("m10") {
+        return GpsChipset::UbloxM10;
+    }
+    if normalized.contains("m9") {
+        return GpsChipset::UbloxM9N;
+    }
+    if normalized.contains("m8") {
+        return GpsChipset::UbloxM8N;
+    }
+    if normalized.contains("mosaic") || normalized.contains("septentrio") {
+        return GpsChipset::SeptentrioMosaic;
+    }
+    if normalized.contains("here3") {
+        return GpsChipset::Here3;
+    }
+    GpsChipset::Other
 }
 
 /// Construct a `SensorsConfig` from the build's FC sensor profiles and GPS profile.
