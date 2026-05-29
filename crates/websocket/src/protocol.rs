@@ -311,7 +311,16 @@ pub struct ConfigureBuild {
     pub fc_slug: Option<String>,
     #[serde(default)]
     pub frame_slug: Option<String>,
+    #[serde(default)]
+    pub battery_slug: Option<String>,
+    #[serde(default)]
+    pub gps_slug: Option<String>,
+    /// 1 = 4-in-1 ESC (weighs once), 4 = individual ESCs (weight × 4).
+    #[serde(default = "default_esc_count")]
+    pub esc_count: u8,
 }
+
+fn default_esc_count() -> u8 { 1 }
 
 fn default_battery_voltage() -> f64 { 14.8 }
 fn default_battery_capacity_mah() -> f64 { 1500.0 }

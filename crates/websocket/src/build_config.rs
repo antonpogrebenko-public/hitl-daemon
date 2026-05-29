@@ -39,7 +39,7 @@ const PX4_TARGET_COMPONENT: u8 = 1;
 pub struct BuildConfigHandler {
     api_url: String,
     http_client: reqwest::Client,
-    config_tx: Sender<(PhysicsConfig, BatteryConfig)>,
+    config_tx: Sender<(PhysicsConfig, BatteryConfig, hitl_sensors::SensorsConfig)>,
     nsh_tx: Option<mpsc::Sender<ValidatedNshCommand>>,
     /// MAVLink output channel — same one the simulation loop uses for
     /// `HIL_SENSOR` / `HIL_GPS`. Phase 6 pushes `PARAM_SET` here.
@@ -76,7 +76,7 @@ struct LastVerifiedParams {
 
 impl BuildConfigHandler {
     pub fn new(
-        config_tx: Sender<(PhysicsConfig, BatteryConfig)>,
+        config_tx: Sender<(PhysicsConfig, BatteryConfig, hitl_sensors::SensorsConfig)>,
         nsh_tx: Option<mpsc::Sender<ValidatedNshCommand>>,
         mav_tx: Option<Sender<MavMessage>>,
         param_value_tx: Option<broadcast::Sender<(String, f32)>>,
@@ -190,23 +190,21 @@ impl BuildConfigHandler {
         spec.battery.cell_count = request.battery_cell_count;
         spec.battery.capacity_mah = request.battery_capacity_mah;
 
-        // Fetch frame specs if frame_slug provided — overrides frame_weight_g
+        // Fetch frame specs if frame_slug provided — gets wheelbase/material
+        // but frame_weight_g from the request always takes priority (user-tunable).
         if let Some(ref frame_slug) = request.frame_slug {
             match self.fetch_component_specs(frame_slug).await {
                 Ok(specs) => {
-                    if let Some(weight) = specs.get("weightG").and_then(|v| v.as_f64()) {
-                        spec.frame.weight_g = weight;
-                    }
                     if let Some(wheelbase) = specs.get("wheelbaseMm").and_then(|v| v.as_f64()) {
                         spec.frame.wheelbase_mm = wheelbase;
                     }
                     if let Some(material_str) = specs.get("material").and_then(|v| v.as_str()) {
                         spec.frame.material = Some(parse_frame_material(material_str));
                     }
-                    info!(slug = %frame_slug, weight_g = spec.frame.weight_g, wheelbase_mm = spec.frame.wheelbase_mm, "Loaded frame specs");
+                    info!(slug = %frame_slug, weight_g = spec.frame.weight_g, wheelbase_mm = spec.frame.wheelbase_mm, "Loaded frame specs (weight from user override)");
                 }
                 Err(e) => {
-                    warn!(slug = %frame_slug, error = %e, "Failed to fetch frame specs, using frame_weight_g fallback");
+                    warn!(slug = %frame_slug, error = %e, "Failed to fetch frame specs, using defaults");
                 }
             }
         }
@@ -261,6 +259,62 @@ impl BuildConfigHandler {
             }
         }
 
+        // Fetch battery specs if battery_slug provided — sets weight for correct mass
+        if let Some(ref battery_slug) = request.battery_slug {
+            match self.fetch_component_specs(battery_slug).await {
+                Ok(specs) => {
+                    if let Some(weight) = specs.get("weightG").and_then(|v| v.as_f64()) {
+                        spec.battery.weight_g = weight;
+                    }
+                    info!(slug = %battery_slug, weight_g = spec.battery.weight_g, "Loaded battery specs");
+                }
+                Err(e) => {
+                    warn!(slug = %battery_slug, error = %e, "Failed to fetch battery specs, using default weight");
+                }
+            }
+        }
+
+        // Fetch GPS specs if gps_slug provided
+        if let Some(ref gps_slug) = request.gps_slug {
+            match self.fetch_component_specs(gps_slug).await {
+                Ok(specs) => {
+                    let chipset = specs.get("chipset").and_then(|v| v.as_str())
+                        .map(parse_gps_chipset)
+                        .unwrap_or(hitl_physics::build::GpsChipset::Other);
+                    let update_rate_hz = specs.get("updateRateHz").and_then(|v| v.as_f64())
+                        .unwrap_or(10.0);
+                    let has_compass = specs.get("hasCompass").and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let weight_g = specs.get("weightG").and_then(|v| v.as_f64())
+                        .unwrap_or(12.0);
+                    spec.gps = Some(hitl_physics::build::GpsSpec {
+                        chipset,
+                        update_rate_hz,
+                        has_compass,
+                        weight_g,
+                    });
+                    info!(slug = %gps_slug, weight_g, update_rate_hz, "Loaded GPS specs");
+                }
+                Err(e) => {
+                    warn!(slug = %gps_slug, error = %e, "Failed to fetch GPS specs, using defaults");
+                }
+            }
+        }
+
+        // ESC count: 4-in-1 (count=1) weighs once, individual (count=4) weight × 4
+        if request.esc_count > 1 {
+            if let Some(per_unit) = spec.escs.weight_g {
+                spec.escs.weight_g = Some(per_unit * request.esc_count as f64);
+            }
+        }
+
+        // Build sensor config from FC/GPS chip profiles.
+        // For HITL: disable bias drift (causes EKF divergence) but use chip-specific
+        // noise densities for realistic sensor behavior.
+        let sensor_profiles = spec.to_sensor_profiles();
+        let gps_profile = spec.to_gps_profile();
+        let sensors_config = build_sensors_config(&sensor_profiles, gps_profile.as_ref());
+
         let mut physics = spec.to_physics_config();
         // The request may carry a non-nominal voltage (e.g. fully-charged 16.8 V on
         // a 4S pack). Preserve that — `to_physics_config()` derives nominal from
@@ -280,12 +334,6 @@ impl BuildConfigHandler {
         let max_motor_rpm = physics.motor_kv * physics.battery_voltage;
         let flight_time = estimate_flight_time_min(&battery, &physics);
 
-        // Phase 6: derive per-build rate-controller PIDs. Without this, light
-        // airframes (real inertia well below the legacy 0.012 floor) trigger
-        // PX4 rate-controller oscillation because the stock PIDs are tuned
-        // for I ≈ 0.005 kg·m².
-        let pids = compute_pids(&physics);
-
         // Hover cmd for MPC_THR_HOVER. With the linear cmd→thrust motor model
         // (ω²-space throttle interpolation), static hover cmd = 1/TWR.
         //
@@ -303,6 +351,11 @@ impl BuildConfigHandler {
         const HOVER_SAG_THRUST_RATIO: f64 = 0.7225; // (0.85)² — V_loaded/V_unloaded squared
         let hover_cmd = ((1.0 / thrust_to_weight_ratio) / HOVER_SAG_THRUST_RATIO)
             .clamp(0.1, 0.8) as f32;
+
+        // Phase 6: derive per-build rate-controller PIDs. Scales by inertia AND
+        // by hover authority — high-TWR builds get attenuated gains to prevent
+        // motor-saturation limit cycles.
+        let pids = compute_pids(&physics, hover_cmd);
 
         // MPC_THR_MIN — minimum thr_desired PX4's altitude controller is
         // allowed to command. PX4's default 0.12 is sized for TWR≈2 builds
@@ -370,7 +423,7 @@ impl BuildConfigHandler {
         // Stage 3: hand new physics to the simulation loop. Only at this point
         // is the running drone state reconfigured. PX4 already has matching
         // PIDs; EKF2 is about to be reset to clear stale estimator state.
-        if let Err(e) = self.config_tx.send((physics, battery)) {
+        if let Err(e) = self.config_tx.send((physics, battery, sensors_config)) {
             error!(error = %e, "Failed to send physics config to simulation");
             return ConfigResult {
                 state: ConfigState::Error,
@@ -462,7 +515,7 @@ impl BuildConfigHandler {
         //   above weight, the drone can't descend, position mode locks into
         //   a ~0.8 Hz limit cycle. Scaled to 30% of hover (≥0.5 g descent
         //   authority), clamped to PX4's [0.05, 0.20] range.
-        let params: [(&str, f32); 15] = [
+        let params: [(&str, f32); 21] = [
             ("MC_ROLLRATE_P",   pids.roll_p),
             ("MC_ROLLRATE_I",   pids.roll_i),
             ("MC_ROLLRATE_D",   pids.roll_d),
@@ -478,6 +531,16 @@ impl BuildConfigHandler {
             ("THR_MDL_FAC",     1.0),
             ("MPC_THR_HOVER",   hover_cmd),
             ("MPC_THR_MIN",     thr_min),
+            // Zero accel/gyro calibration offsets: the simulated IMU has no
+            // physical mounting bias. Real-hardware offsets create a persistent
+            // lateral accel bias (~0.05 m/s²) that the EKF integrates into
+            // position drift.
+            ("CAL_ACC0_XOFF",   0.0),
+            ("CAL_ACC0_YOFF",   0.0),
+            ("CAL_ACC0_ZOFF",   0.0),
+            ("CAL_GYRO0_XOFF",  0.0),
+            ("CAL_GYRO0_YOFF",  0.0),
+            ("CAL_GYRO0_ZOFF",  0.0),
         ];
 
         let mut verified = 0u32;
@@ -888,6 +951,79 @@ fn parse_mag_chip(s: &str) -> MagChip {
     }
 }
 
+fn parse_gps_chipset(s: &str) -> hitl_physics::build::GpsChipset {
+    use hitl_physics::build::GpsChipset;
+    let normalized = s.to_lowercase().replace(['-', '_', ' '], "");
+    match normalized.as_str() {
+        "ubloxm8n" | "m8n" | "neom8n" => GpsChipset::UbloxM8N,
+        "ubloxm9n" | "m9n" | "neom9n" => GpsChipset::UbloxM9N,
+        "ubloxm10" | "m10" | "neom10" => GpsChipset::UbloxM10,
+        "ubloxf9p" | "f9p" | "zed f9p" | "zedf9p" => GpsChipset::UbloxF9P,
+        "septentriomosaic" | "mosaic" => GpsChipset::SeptentrioMosaic,
+        "here3" | "here3+" => GpsChipset::Here3,
+        _ => GpsChipset::Other,
+    }
+}
+
+/// Construct a `SensorsConfig` from the build's FC sensor profiles and GPS profile.
+///
+/// For HITL: bias drift is always disabled (causes EKF divergence in sim) but
+/// chip-specific noise densities are preserved for realistic sensor behavior.
+fn build_sensors_config(
+    profiles: &hitl_physics::build::SensorProfiles,
+    gps_profile: Option<&hitl_physics::build::GpsProfile>,
+) -> hitl_sensors::SensorsConfig {
+    use hitl_sensors::{ImuConfig, GpsConfig, BaroConfig, MagConfig, SensorsConfig};
+
+    let imu = ImuConfig {
+        gyro_noise_density: profiles.imu.gyro_noise_density,
+        accel_noise_density: profiles.imu.accel_noise_density,
+        gyro_bias_sigma: 0.0,   // CRITICAL: no drift in HITL
+        gyro_bias_tau: 1000.0,
+        accel_bias_sigma: 0.0,  // CRITICAL: no drift in HITL
+        accel_bias_tau: 1000.0,
+    };
+
+    let gps = if let Some(gp) = gps_profile {
+        GpsConfig {
+            horizontal_noise_sigma: gp.horizontal_noise_sigma_m,
+            altitude_noise_sigma: gp.altitude_noise_sigma_m,
+            velocity_noise_sigma: gp.velocity_noise_sigma_mps,
+            position_drift_sigma: 0.0, // No drift in HITL
+            position_drift_tau: 1000.0,
+            update_rate_hz: gp.update_rate_hz,
+            delay_ms: gp.delay_ms,
+        }
+    } else {
+        // No GPS module selected — use tight defaults for HITL
+        GpsConfig {
+            horizontal_noise_sigma: 0.1,
+            altitude_noise_sigma: 0.3,
+            velocity_noise_sigma: 0.05,
+            position_drift_sigma: 0.0,
+            position_drift_tau: 1000.0,
+            update_rate_hz: 10.0,
+            delay_ms: 80.0,
+        }
+    };
+
+    let baro = BaroConfig {
+        noise_sigma: profiles.baro.noise_sigma_m,
+        ..BaroConfig::default()
+    };
+
+    let mag = if let Some(mp) = profiles.mag {
+        MagConfig {
+            noise_sigma_gauss: mp.noise_sigma_gauss,
+            ..MagConfig::default()
+        }
+    } else {
+        MagConfig::default()
+    };
+
+    SensorsConfig { imu, gps, baro, mag }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -925,7 +1061,7 @@ mod tests {
         mav_tx: Option<Sender<MavMessage>>,
         param_value_tx: Option<broadcast::Sender<(String, f32)>>,
     ) -> BuildConfigHandler {
-        let (config_tx, _config_rx) = bounded::<(PhysicsConfig, BatteryConfig)>(4);
+        let (config_tx, _config_rx) = bounded::<(PhysicsConfig, BatteryConfig, hitl_sensors::SensorsConfig)>(4);
         BuildConfigHandler::new(config_tx, None, mav_tx, param_value_tx)
     }
 
@@ -1002,7 +1138,7 @@ mod tests {
             .await
             .unwrap();
         assert!(view.is_some());
-        assert_eq!(verified, 15);
+        assert_eq!(verified, 21);
 
         let snapshot = captured.lock().unwrap().clone();
         let param_names: Vec<&str> = snapshot
@@ -1039,7 +1175,7 @@ mod tests {
             .await
             .unwrap();
         assert!(view.is_some());
-        assert_eq!(verified, 15);
+        assert_eq!(verified, 21);
     }
 
     #[tokio::test]
@@ -1070,7 +1206,7 @@ mod tests {
             .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN)
             .await
             .unwrap();
-        assert_eq!(verified_first, 15);
+        assert_eq!(verified_first, 21);
 
         // Identical PIDs + hover_cmd → fingerprint matches → no push, no acks needed.
         let (view, verified_second) = handler
@@ -1096,7 +1232,7 @@ mod tests {
             .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN)
             .await
             .unwrap();
-        assert_eq!(verified, 15);
+        assert_eq!(verified, 21);
 
         // The PARAM_SAVE is `try_send`-d on the *same* mav channel that the
         // fake PX4 drains. push_pids_and_verify returns as soon as the 14th
@@ -1113,7 +1249,7 @@ mod tests {
         let saw_storage_write = snapshot.iter().any(|m| {
             matches!(m, CapturedMsg::CommandLong(c) if *c == MAV_CMD_PREFLIGHT_STORAGE)
         });
-        assert_eq!(param_sets, 15, "expected 15 PARAM_SETs");
+        assert_eq!(param_sets, 21, "expected 21 PARAM_SETs (15 PID/thrust + 6 cal offsets)");
         assert!(
             saw_storage_write,
             "expected MAV_CMD_PREFLIGHT_STORAGE (245) after the PARAM_SETs — \
@@ -1132,7 +1268,7 @@ mod tests {
             .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN)
             .await
             .unwrap();
-        assert_eq!(verified_first, 15);
+        assert_eq!(verified_first, 21);
 
         // Same PIDs but a different TWR — must re-push so PX4 picks up the
         // new MPC_THR_HOVER. A TWR change without re-pushing was the original
@@ -1142,6 +1278,6 @@ mod tests {
             .await
             .unwrap();
         assert!(view.is_some());
-        assert_eq!(verified_second, 15);
+        assert_eq!(verified_second, 21);
     }
 }

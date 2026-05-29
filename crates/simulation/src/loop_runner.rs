@@ -67,7 +67,7 @@ pub struct SimulationLoop {
     state: SimulationState,
     config: SimulationConfig,
     actuator_rx: Receiver<ActuatorOutputs>,
-    config_rx: Receiver<(PhysicsConfig, BatteryConfig)>,
+    config_rx: Receiver<(PhysicsConfig, BatteryConfig, hitl_sensors::SensorsConfig)>,
     mav_tx: Sender<MavMessage>,
     stats: SimulationStats,
     /// Watch channel used by the TUI / web status widget to render live
@@ -97,6 +97,14 @@ pub struct SimulationLoop {
     last_actuator_time: Instant,
     /// Last time a stale-actuator warning was emitted (rate-limits log spam).
     last_stale_warning: Instant,
+    /// Set by step_physics when the ground clamp fires or the quad is at z=0.
+    /// Read by sample_and_send_sensors to produce clean [0,0,-g] accel on ground.
+    ground_contact_active: bool,
+    /// Remaining ticks of ground impact deceleration impulse. When > 0, the
+    /// accelerometer reports the deceleration force instead of gravity-only.
+    ground_impact_ticks_remaining: u32,
+    /// Body-frame deceleration acceleration to report during ground impact (m/s²).
+    ground_impact_accel: [f64; 3],
 }
 
 impl SimulationLoop {
@@ -104,7 +112,7 @@ impl SimulationLoop {
     pub fn new(
         config: SimulationConfig,
         actuator_rx: Receiver<ActuatorOutputs>,
-        config_rx: Receiver<(PhysicsConfig, BatteryConfig)>,
+        config_rx: Receiver<(PhysicsConfig, BatteryConfig, hitl_sensors::SensorsConfig)>,
         mav_tx: Sender<MavMessage>,
     ) -> Self {
         let state = SimulationState::new(config.clone());
@@ -126,6 +134,9 @@ impl SimulationLoop {
             channel_full_since: None,
             last_actuator_time: Instant::now(),
             last_stale_warning: Instant::now(),
+            ground_contact_active: true,
+            ground_impact_ticks_remaining: 0,
+            ground_impact_accel: [0.0; 3],
         }
     }
 
@@ -171,10 +182,11 @@ impl SimulationLoop {
             let tick_start = Instant::now();
 
             match self.config_rx.try_recv() {
-                Ok((new_physics, new_battery)) => {
+                Ok((new_physics, new_battery, new_sensors)) => {
                     info!("Reconfiguring simulation");
                     self.config.physics = new_physics;
                     self.config.battery = new_battery;
+                    self.config.sensors = new_sensors;
                     self.state.reconfigure();
                     self.last_mag = None;
                     self.last_baro = None;
@@ -345,70 +357,88 @@ impl SimulationLoop {
             state.quadrotor = rk4_step(&state.quadrotor, &self.config.physics, motor_omegas, dt);
         }
 
-        // Ground contact constraint: in NED, Z >= GROUND_CONTACT_Z means at or
-        // below ground.  Clamp position, kill downward velocity, apply friction.
-        // Uses the same threshold as the on_ground flag above so there is no
-        // dead zone between the two checks.
-        if state.quadrotor.position[2] >= GROUND_CONTACT_Z {
+        // Ground contact model with impact deceleration.
+        //
+        // Three concerns:
+        // 1. Physics clamp (z >= 0): hard constraint preventing penetration,
+        //    zeroes roll/pitch rates, forces level attitude.
+        // 2. Impact deceleration: when the drone hits the ground with
+        //    significant velocity, generate an accelerometer impulse over
+        //    IMPACT_DURATION_TICKS so the EKF can reconcile the velocity change.
+        //    Without this, the EKF dead-reckons underground.
+        // 3. Sensor ground mode (hysteresis): keeps accel at [0,0,-g] until
+        //    the quad is clearly airborne (z < -0.10m). This prevents EKF
+        //    contamination during the liftoff bounce phase.
+        const IMPACT_DURATION_TICKS: u32 = 40; // 40 ticks @ 400Hz = 100ms
+        const IMPACT_VEL_THRESHOLD: f64 = 0.5; // m/s — only generate impulse for hard landings
+
+        let velocity_before_clamp = [
+            state.quadrotor.velocity[0],
+            state.quadrotor.velocity[1],
+            state.quadrotor.velocity[2],
+        ];
+
+        let physics_on_ground = state.quadrotor.position[2] >= GROUND_CONTACT_Z;
+        if physics_on_ground {
             state.quadrotor.position[2] = 0.0;
 
-            // Kill downward velocity (positive Z in NED = moving down)
+            // Trigger impact deceleration if hitting ground with significant downward velocity.
+            // Deceleration is spread over IMPACT_DURATION_TICKS to give the EKF
+            // a physical impulse it can fuse (instead of an instantaneous velocity
+            // discontinuity with no corresponding acceleration).
+            if velocity_before_clamp[2] > IMPACT_VEL_THRESHOLD
+                && self.ground_impact_ticks_remaining == 0
+            {
+                let impact_dt = IMPACT_DURATION_TICKS as f64 * dt;
+                // Deceleration needed to bring velocity to zero over impact_dt.
+                // In NED: vz>0 means downward, so deceleration is negative-Z (upward).
+                // Body-frame accel reported to IMU = deceleration + gravity reaction.
+                let decel_z = -velocity_before_clamp[2] / impact_dt;
+                let decel_x = -velocity_before_clamp[0] / impact_dt;
+                let decel_y = -velocity_before_clamp[1] / impact_dt;
+                // Accelerometer measures specific force: normal force - gravity.
+                // On impact: F_ground/m = decel + g (ground pushes up harder than gravity).
+                // Specific force (what accel measures) = F_ground/m - g = decel.
+                // In body FRD frame: z-accel = decel_z + (-g) = -(vz/dt) - g
+                let gravity = self.config.physics.gravity;
+                self.ground_impact_accel = [decel_x, decel_y, decel_z - gravity];
+                self.ground_impact_ticks_remaining = IMPACT_DURATION_TICKS;
+                debug!(
+                    vz = velocity_before_clamp[2],
+                    impact_ms = (impact_dt * 1000.0) as u32,
+                    decel_z,
+                    "Ground impact: generating deceleration impulse"
+                );
+            }
+
             if state.quadrotor.velocity[2] > 0.0 {
                 state.quadrotor.velocity[2] = 0.0;
             }
 
-            // Ground friction: dampen horizontal velocity and angular rates,
-            // scaled by how much weight remains on the ground.
-            //
-            // When motors produce enough thrust to nearly lift off, normal force
-            // approaches zero → friction approaches zero → smooth transition to
-            // flight. At idle (no thrust), full friction applies (same as before).
-            //
-            // Use motor_commands (0-1) to estimate thrust without needing
-            // motor_omegas, which are only computed inside the motors_active block.
-            let total_thrust: f64 = state.motor_commands.iter().map(|&cmd| {
-                let omega = throttle_to_omega_with_config(cmd as f64, &self.config.physics);
-                self.config.physics.kt * omega * omega
-            }).sum();
-            let weight = self.config.physics.mass_kg * 9.81;
-            let normal_force = (weight - total_thrust).max(0.0);
-            // 1.0 = full weight on ground (idle), 0.0 = about to lift off
-            let ground_contact_ratio = normal_force / weight;
+            state.quadrotor.velocity[0] *= 0.9;
+            state.quadrotor.velocity[1] *= 0.9;
 
-            let lateral_damping = 1.0 - (0.1 * ground_contact_ratio); // 0.9..1.0
-            let angular_damping = 1.0 - (0.2 * ground_contact_ratio); // 0.8..1.0
-            let yaw_damping = 1.0 - (0.1 * ground_contact_ratio);     // 0.9..1.0
+            state.quadrotor.angular_velocity[0] = 0.0;
+            state.quadrotor.angular_velocity[1] = 0.0;
+            state.quadrotor.angular_velocity[2] *= 0.95;
 
-            state.quadrotor.velocity[0] *= lateral_damping;
-            state.quadrotor.velocity[1] *= lateral_damping;
-            state.quadrotor.angular_velocity[0] *= angular_damping;
-            state.quadrotor.angular_velocity[1] *= angular_damping;
-            state.quadrotor.angular_velocity[2] *= yaw_damping;
+            let (_, _, yaw) = state.quadrotor.quaternion.euler_angles();
+            state.quadrotor.quaternion =
+                nalgebra::UnitQuaternion::from_euler_angles(0.0, 0.0, yaw);
+        }
 
-            // Auto-level when disarmed and resting. Without this, any in-sim
-            // flip (crash, arm jolt, manual test) leaves the quaternion at a
-            // non-trivial attitude for the rest of the session — the friction
-            // above damps angular *velocity* but never restores *orientation*.
-            // PX4's EKF2 reads the resulting tilted gravity vector, decides
-            // the drone is at e.g. roll≈180°, and the attitude controller
-            // dumps a huge rate setpoint trying to flip it back. The motor
-            // thrash we debugged in May 2026 (log100.ulg: accel_z=+9.80,
-            // rate_sp_roll=-220°/s while sitting on the ground) was exactly
-            // this — armed pre-takeoff, drone got stuck inverted from a
-            // prior crash, "trembling" was the rate loop saturating against
-            // a phantom 178° attitude error.
-            //
-            // Slerp toward (0 roll, 0 pitch, current yaw) at ~0.02 per tick
-            // (~190 ms time constant at 400 Hz) — fast enough to settle
-            // between flights, slow enough to be invisible during normal
-            // touchdown dynamics.
-            if !state.armed {
-                let (_, _, yaw) = state.quadrotor.quaternion.euler_angles();
-                let level =
-                    nalgebra::UnitQuaternion::from_euler_angles(0.0, 0.0, yaw);
-                state.quadrotor.quaternion =
-                    state.quadrotor.quaternion.slerp(&level, 0.02);
-            }
+        // Decrement impact counter (ticks down whether on ground or not)
+        if self.ground_impact_ticks_remaining > 0 {
+            self.ground_impact_ticks_remaining -= 1;
+        }
+
+        // Sensor ground mode with hysteresis: latches ON when physics clamp
+        // fires, only releases when clearly airborne. This ensures the EKF
+        // gets clean [0,0,-g] accel through the entire liftoff transition.
+        if physics_on_ground {
+            self.ground_contact_active = true;
+        } else if state.quadrotor.position[2] < -0.10 {
+            self.ground_contact_active = false;
         }
 
         // Update simulation time
@@ -437,15 +467,20 @@ impl SimulationLoop {
             let drag_body = q.compute_drag(&self.config.physics);
             let mut force_body = thrust_body + drag_body;
 
-            // Ground contact: when on ground (Z >= 0) and not ascending significantly,
-            // the accelerometer measures only the ground normal force (gravity reaction),
-            // independent of motor thrust. Replace (not add) the force to avoid
-            // double-counting thrust + gravity when motors are running on the ground.
-            let on_ground = q.position[2] >= -0.01 && q.velocity[2] >= -0.1;
-            if on_ground {
+            // Ground contact accelerometer model:
+            // - During impact deceleration: report the impact force so the EKF
+            //   can reconcile the velocity change with a physical acceleration.
+            // - At rest on ground: report [0, 0, -g] (gravity reaction only).
+            if self.ground_impact_ticks_remaining > 0 {
+                let mass = self.config.physics.mass_kg;
+                force_body = nalgebra::Vector3::new(
+                    self.ground_impact_accel[0] * mass,
+                    self.ground_impact_accel[1] * mass,
+                    self.ground_impact_accel[2] * mass,
+                );
+            } else if self.ground_contact_active {
                 let gravity = self.config.physics.gravity;
-                let gravity_force_ned = nalgebra::Vector3::new(0.0, 0.0, -self.config.physics.mass_kg * gravity);
-                force_body = q.quaternion.inverse() * gravity_force_ned;
+                force_body = nalgebra::Vector3::new(0.0, 0.0, -self.config.physics.mass_kg * gravity);
             }
 
             // Accelerometer reading = specific force = non-gravitational acceleration

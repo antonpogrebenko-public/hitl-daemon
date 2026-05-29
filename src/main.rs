@@ -173,7 +173,7 @@ fn spawn_simulation_thread(
     actuator_rx: Receiver<ActuatorOutputs>,
     mav_tx: Sender<MavMessage>,
     _shutdown: Arc<AtomicBool>,
-    config_rx: Receiver<(PhysicsConfig, hitl_physics::BatteryConfig)>,
+    config_rx: Receiver<(PhysicsConfig, hitl_physics::BatteryConfig, hitl_sensors::SensorsConfig)>,
     sim_stats_tx: tokio::sync::watch::Sender<protocol::SimulationStats>,
 ) -> (thread::JoinHandle<()>, SimulationState) {
     let mut sim_loop = SimulationLoop::new(config, actuator_rx, config_rx, mav_tx)
@@ -373,10 +373,10 @@ async fn main() {
     // Create channels
     // actuator_tx/rx: MAVLink receiver -> Simulation (HIL_ACTUATOR_CONTROLS)
     // sim_mav_tx/rx: Simulation -> MAVLink sender (HIL_SENSOR, HIL_GPS)
-    // build_config_tx/rx: WebSocket -> Simulation (PhysicsConfig + BatteryConfig updates)
+    // build_config_tx/rx: WebSocket -> Simulation (PhysicsConfig + BatteryConfig + SensorsConfig)
     let (actuator_tx, actuator_rx) = bounded::<ActuatorOutputs>(16);
-    let (sim_mav_tx, sim_mav_rx) = bounded::<MavMessage>(64);
-    let (build_config_tx, build_config_rx) = bounded::<(PhysicsConfig, hitl_physics::BatteryConfig)>(1);
+    let (sim_mav_tx, sim_mav_rx) = bounded::<MavMessage>(512);
+    let (build_config_tx, build_config_rx) = bounded::<(PhysicsConfig, hitl_physics::BatteryConfig, hitl_sensors::SensorsConfig)>(1);
 
     // Shutdown signal
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -1159,38 +1159,84 @@ async fn main() {
                         let qgc_socket_send = qgc_socket_reconnect.clone();
                         sender_handle = Some(tokio::spawn(async move {
                             info!("MAVLink sender task started");
-                            let mut qgc_recv_buf = [0u8; 280]; // MAVLink v2 max frame size
+
+                            // Bridge crossbeam → tokio mpsc so we can use select!
+                            let (sim_tx, mut sim_rx) = tokio::sync::mpsc::channel::<MavMessage>(128);
+                            let bridge_shutdown = shutdown_send.clone();
+                            let bridge_rx = sim_mav_rx_send.clone();
+                            let bridge_handle = tokio::task::spawn_blocking(move || {
+                                while !bridge_shutdown.load(Ordering::Relaxed) {
+                                    match bridge_rx.recv_timeout(Duration::from_millis(5)) {
+                                        Ok(msg) => {
+                                            if sim_tx.blocking_send(msg).is_err() {
+                                                break;
+                                            }
+                                        }
+                                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                                    }
+                                }
+                            });
+
+                            // Convert QGC std::net::UdpSocket to tokio async socket
+                            let qgc_async_socket = qgc_socket_send.as_ref().and_then(|s| {
+                                let std_socket = s.try_clone().ok()?;
+                                std_socket.set_nonblocking(true).ok()?;
+                                tokio::net::UdpSocket::from_std(std_socket).ok()
+                            });
+
+                            let mut qgc_recv_buf = [0u8; 280];
+
                             loop {
                                 if shutdown_send.load(Ordering::Relaxed) || mav_io_send.is_disconnected() {
                                     break;
                                 }
 
-                                // Poll for messages from QGC (parameters, commands)
-                                if let Some(ref socket) = qgc_socket_send {
-                                    while let Ok((len, _addr)) = socket.recv_from(&mut qgc_recv_buf) {
-                                        use mavlink::peek_reader::PeekReader;
-                                        let cursor = std::io::Cursor::new(&qgc_recv_buf[..len]);
-                                        let mut reader = PeekReader::new(cursor);
-                                        if let Ok((_header, msg)) = mavlink::read_v2_msg::<MavMessage, _>(&mut reader) {
-                                            trace!("QGC -> Pixhawk: {:?}", msg);
-                                            if mav_io_send.send(msg).is_err() {
+                                let first_msg = if let Some(ref qgc_sock) = qgc_async_socket {
+                                    tokio::select! {
+                                        biased;
+                                        sim_msg = sim_rx.recv() => {
+                                            match sim_msg {
+                                                Some(m) => m,
+                                                None => break,
+                                            }
+                                        }
+                                        qgc_result = qgc_sock.recv_from(&mut qgc_recv_buf) => {
+                                            if let Ok((len, _addr)) = qgc_result {
+                                                use mavlink::peek_reader::PeekReader;
+                                                let cursor = std::io::Cursor::new(&qgc_recv_buf[..len]);
+                                                let mut reader = PeekReader::new(cursor);
+                                                if let Ok((_header, qgc_msg)) = mavlink::read_v2_msg::<MavMessage, _>(&mut reader) {
+                                                    trace!("QGC -> Pixhawk: {:?}", qgc_msg);
+                                                    qgc_msg
+                                                } else {
+                                                    continue;
+                                                }
+                                            } else {
                                                 break;
                                             }
                                         }
                                     }
+                                } else {
+                                    match sim_rx.recv().await {
+                                        Some(m) => m,
+                                        None => break,
+                                    }
+                                };
+
+                                if mav_io_send.send(first_msg).is_err() {
+                                    break;
                                 }
 
-                                // Forward simulation sensor messages to Pixhawk
-                                match sim_mav_rx_send.recv_timeout(Duration::from_millis(10)) {
-                                    Ok(msg) => {
-                                        if mav_io_send.send(msg).is_err() {
-                                            break;
-                                        }
+                                // Drain all remaining buffered sim messages without blocking
+                                while let Ok(msg) = sim_rx.try_recv() {
+                                    if mav_io_send.send(msg).is_err() {
+                                        break;
                                     }
-                                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                                 }
                             }
+
+                            bridge_handle.abort();
                             info!("MAVLink sender task exiting");
                         }));
                     }

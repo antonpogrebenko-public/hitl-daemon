@@ -206,6 +206,15 @@ If no HEARTBEAT is received within 5s of connecting, the daemon suspects the FC 
 ### Sensor channel backpressure
 If a sensor channel is full (producer outpacing consumer), the daemon emits a rate-limited warn at 5s and escalates to error at 2s continuous. Indicates the simulation loop is overloaded or a consumer task has stalled.
 
+### Ground accelerometer must NOT use quaternion rotation
+In `loop_runner.rs`, the on-ground accelerometer override must produce `[0, 0, -mg]` directly in body frame. Do NOT rotate the NED gravity vector by the quaternion — any residual quaternion tilt (even 0.25°) creates a persistent accel lateral bias that the EKF integrates into massive position drift (76m in 77s observed). This also prevents landing detection because the EKF altitude estimate diverges.
+
+### ConfigureBuild zeroes accel/gyro calibration offsets
+`push_pids_and_verify()` sends `CAL_ACC0_XOFF/YOFF/ZOFF=0` and `CAL_GYRO0_XOFF/YOFF/ZOFF=0` alongside PIDs. The real FC has calibration offsets from hardware mounting (e.g., +0.05 m/s² X-axis). PX4 subtracts these from raw readings. Since the simulated IMU has no physical bias, these offsets create a persistent ~0.05 m/s² lateral acceleration that the EKF integrates into 1.6m/8s of drift. Zeroing them eliminates the bias.
+
+### Ground impact deceleration prevents EKF underground divergence
+When the drone hits the ground at speed (>0.5 m/s), the simulation generates a 100ms deceleration impulse on the accelerometer (`ground_impact_accel`). Without this, the ground clamp instantly zeros velocity but reports only gravity — the EKF sees no force to explain the velocity change, rejects GPS, and dead-reckons underground (37m observed in a 6.4 m/s impact). The impulse gives the EKF a physical event it can reconcile with the sudden velocity change.
+
 ## WebSocket Protocol
 
 - Port: 9876
