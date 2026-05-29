@@ -282,7 +282,8 @@ impl BuildConfigHandler {
                         .map(parse_gps_chipset)
                         .unwrap_or(hitl_physics::build::GpsChipset::Other);
                     let update_rate_hz = specs.get("updateRateHz").and_then(|v| v.as_f64())
-                        .unwrap_or(10.0);
+                        .unwrap_or(10.0)
+                        .clamp(1.0, 100.0);
                     let has_compass = specs.get("compass").or_else(|| specs.get("hasCompass"))
                         .and_then(|v| v.as_bool()).unwrap_or(false);
                     let weight_g = specs.get("weightG").and_then(|v| v.as_f64())
@@ -312,7 +313,14 @@ impl BuildConfigHandler {
         // For HITL: disable bias drift (causes EKF divergence) but use chip-specific
         // noise densities for realistic sensor behavior.
         let sensor_profiles = spec.to_sensor_profiles();
-        let gps_profile = spec.to_gps_profile();
+        // Override chipset default update_rate_hz with the API-reported value
+        // from the specific GPS product listing.
+        let gps_profile = spec.to_gps_profile().map(|mut p| {
+            if let Some(gps) = &spec.gps {
+                p.update_rate_hz = gps.update_rate_hz;
+            }
+            p
+        });
         let sensors_config = build_sensors_config(&sensor_profiles, gps_profile.as_ref());
 
         let mut physics = spec.to_physics_config();
