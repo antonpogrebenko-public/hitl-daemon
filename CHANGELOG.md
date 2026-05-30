@@ -5,6 +5,11 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-05-30
+
+### Changed
+- **Breaking: WebSocket handshake protocol now includes version_patch byte.** HandshakeAck binary format is now `[0x02, major, minor, patch, fc_connected, ...serial_port, 0x00]`. The web UI can now display and enforce full semver (e.g., `0.9.0` instead of `0.8`). Older web clients will misinterpret the patch byte as `fc_connected` — update the web frontend alongside this daemon release.
+
 ## [0.8.5] - 2026-05-30
 
 ### Fixed
