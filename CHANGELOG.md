@@ -5,6 +5,20 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.5] - 2026-05-30
+
+### Fixed
+- **MPC_THR_HOVER now matches actual sim hover** (sess113 bug: position mode couldn't take off after landing). The old code computed hover from `(1/TWR) / 0.7225` — a sag correction calibrated for the legacy inflated-thrust model. With the recalibrated physics (TWR~2 instead of ~8), this pushed 62.5% while actual sim hover was 44%. PX4's position controller couldn't generate enough thrust to lift off. Now uses `physics.hover_throttle_percent()` directly — guaranteed to match the sim.
+- **Battery weight estimated from capacity** when no `battery_slug` is provided in `ConfigureBuild`. Previously defaulted to 180g regardless of actual capacity — a 4S 4500mAh pack weighing ~630g was modeled as 180g, making the sim 40% too light and hover feedforward 21pp too high. Estimate: `capacity_mah × cell_count × 0.035` (overridden by exact API weight when `battery_slug` is present).
+
+### Changed
+- Rebuild against `hitl-physics` 0.10.0 (torque-balance loaded-RPM model, physical-CT recalibration).
+
+## [0.8.4] - 2026-05-29
+
+### Fixed
+- **Armed-on-ground motor RPM "jump" fixed at its source; enables the ESC-idle limit-cycle fix.** The 400 Hz physics step was gated on `motors_active = any(cmd > 0.01)`, so while armed at idle the step toggled on/off as PX4's micro-corrections crossed 0.01 — snapping motor speeds between 0 and the idle floor. The step now runs continuously whenever the vehicle is **armed**, holding the idle steady. This lets `hitl-physics` 0.9.5 reintroduce a realistic armed ESC idle (removing the braking dead zone behind the ~14 Hz rate-loop limit cycle on high-TWR builds) without the cosmetic jump returning. Motor omegas are forced to zero when disarmed, so a disarmed or killed motor still produces no thrust.
+
 ## [0.7.7] - 2026-05-28
 
 ### Fixed

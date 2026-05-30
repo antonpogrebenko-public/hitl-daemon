@@ -189,6 +189,10 @@ impl BuildConfigHandler {
         spec.propellers.blade_count = blade_count;
         spec.battery.cell_count = request.battery_cell_count;
         spec.battery.capacity_mah = request.battery_capacity_mah;
+        // Estimate battery weight from capacity when no battery_slug will provide
+        // an exact value. Regression across FPV packs: ~7g per cell per 100mAh
+        // (4S 1500mAh ≈ 210g, 4S 4500mAh ≈ 630g, 6S 1100mAh ≈ 230g).
+        spec.battery.weight_g = request.battery_capacity_mah * request.battery_cell_count as f64 * 0.035;
 
         // Fetch frame specs if frame_slug provided — gets wheelbase/material
         // but frame_weight_g from the request always takes priority (user-tunable).
@@ -342,23 +346,21 @@ impl BuildConfigHandler {
         let max_motor_rpm = physics.motor_kv * physics.battery_voltage;
         let flight_time = estimate_flight_time_min(&battery, &physics);
 
-        // Hover cmd for MPC_THR_HOVER. With the linear cmd→thrust motor model
-        // (ω²-space throttle interpolation), static hover cmd = 1/TWR.
+        // Hover cmd for MPC_THR_HOVER. The torque-balance model in
+        // `max_motor_speed_from_voltage()` already accounts for prop loading,
+        // so `hover_throttle_percent()` = hover_omega / max_omega gives the
+        // correct motor command fraction at static (full-charge) voltage.
         //
-        // Sag correction: in flight the battery sags ~15% under load (loaded
-        // voltage ≈ 0.85 × unloaded for a typical mid-flight LiPo). Max prop
-        // thrust scales with V² → effective TWR is (0.85)² ≈ 0.7225 of static
-        // TWR, so true hover cmd = (1/TWR) / 0.7225 ≈ 1.384 × (1/TWR).
+        // No sag correction: the sim starts at full voltage and applies
+        // voltage-sag scaling (`v_terminal / v_nominal`) in the physics loop
+        // as the battery discharges. PX4's velocity-controller integral adapts
+        // to the slowly changing plant gain — a static feedforward is correct.
         //
-        // Without this correction (log1.ulg, 2026-05-28): configured TWR=8.92
-        // gave hover_cmd=0.112, but observed hover during a 25 s steady-state
-        // window was 0.150 (effective TWR=6.68, voltage ratio=0.866). PX4's
-        // altitude controller was running a 34% feedforward deficit, which
-        // showed up as 18 cm altitude hunting at 0.12 Hz and 12 cm at 0.32 Hz.
-        // Clamped to PX4's accepted MPC_THR_HOVER range [0.1, 0.8].
-        const HOVER_SAG_THRUST_RATIO: f64 = 0.7225; // (0.85)² — V_loaded/V_unloaded squared
-        let hover_cmd = ((1.0 / thrust_to_weight_ratio) / HOVER_SAG_THRUST_RATIO)
-            .clamp(0.1, 0.8) as f32;
+        // The previous 0.7225 sag factor was sized for the legacy inflated-thrust
+        // model (TWR~8, hover~12%); with the recalibrated model (TWR~2, hover~45%)
+        // it inflated MPC_THR_HOVER to 62% vs actual 44%, making the position
+        // controller unable to take off after landing (sess113).
+        let hover_cmd = physics.hover_throttle_percent().clamp(0.1, 0.8) as f32;
 
         // Phase 6: derive per-build rate-controller PIDs. Scales by inertia AND
         // by hover authority — high-TWR builds get attenuated gains to prevent
