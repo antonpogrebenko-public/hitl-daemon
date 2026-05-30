@@ -530,13 +530,14 @@ async fn main() {
     let ws_handle = tokio::spawn(async move {
         let version_parts: Vec<u8> = VERSION
             .split('.')
-            .take(2)
+            .take(3)
             .filter_map(|s| s.parse().ok())
             .collect();
         let version_major = version_parts.first().copied().unwrap_or(0);
         let version_minor = version_parts.get(1).copied().unwrap_or(1);
+        let version_patch = version_parts.get(2).copied().unwrap_or(0);
 
-        if let Err(e) = ws_server.run(version_major, version_minor, serial_port_label).await {
+        if let Err(e) = ws_server.run(version_major, version_minor, version_patch, serial_port_label).await {
             error!("WebSocket server error: {}", e);
         }
     });

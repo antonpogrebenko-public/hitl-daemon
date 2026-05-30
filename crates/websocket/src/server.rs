@@ -162,12 +162,14 @@ impl WebSocketServer {
         self,
         version_major: u8,
         version_minor: u8,
+        version_patch: u8,
         serial_port: String,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let state_rx = self.state_tx.subscribe();
         let mut handler = ConnectionHandler::new(
             version_major,
             version_minor,
+            version_patch,
             serial_port,
             self.command_tx.clone(),
             state_rx,

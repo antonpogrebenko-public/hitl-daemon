@@ -211,10 +211,19 @@ impl StateUpdate {
 }
 
 /// Handshake acknowledgment sent to browser
+///
+/// ## Binary format (0x02)
+/// - `[0]`: 0x02 message type
+/// - `[1]`: version_major (u8)
+/// - `[2]`: version_minor (u8)
+/// - `[3]`: version_patch (u8)
+/// - `[4]`: pixhawk_connected (u8 bool)
+/// - `[5-N]`: serial_port string (null-terminated)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandshakeAck {
     pub version_major: u8,
     pub version_minor: u8,
+    pub version_patch: u8,
     pub pixhawk_connected: bool,
     pub serial_port: String,
 }
@@ -443,10 +452,11 @@ pub struct Px4PidsView {
 impl HandshakeAck {
     /// Serialize to binary format
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(5 + self.serial_port.len() + 1);
+        let mut buf = Vec::with_capacity(6 + self.serial_port.len() + 1);
         buf.push(MSG_TYPE_HANDSHAKE_ACK);
         buf.push(self.version_major);
         buf.push(self.version_minor);
+        buf.push(self.version_patch);
         buf.push(self.pixhawk_connected as u8);
         buf.extend_from_slice(self.serial_port.as_bytes());
         buf.push(0); // null terminator
@@ -874,7 +884,8 @@ mod tests {
     fn test_handshake_ack_to_bytes() {
         let ack = HandshakeAck {
             version_major: 1,
-            version_minor: 0,
+            version_minor: 2,
+            version_patch: 3,
             pixhawk_connected: true,
             serial_port: "/dev/ttyACM0".to_string(),
         };
@@ -882,10 +893,11 @@ mod tests {
         let bytes = ack.to_bytes();
         assert_eq!(bytes[0], MSG_TYPE_HANDSHAKE_ACK);
         assert_eq!(bytes[1], 1);
-        assert_eq!(bytes[2], 0);
-        assert_eq!(bytes[3], 1);
-        assert_eq!(&bytes[4..16], b"/dev/ttyACM0");
-        assert_eq!(bytes[16], 0);
+        assert_eq!(bytes[2], 2);
+        assert_eq!(bytes[3], 3);
+        assert_eq!(bytes[4], 1);
+        assert_eq!(&bytes[5..17], b"/dev/ttyACM0");
+        assert_eq!(bytes[17], 0);
     }
 
     #[test]

@@ -57,6 +57,7 @@ pub struct ConnectionHandler {
     /// Daemon version
     version_major: u8,
     version_minor: u8,
+    version_patch: u8,
     /// Current serial port
     serial_port: String,
     /// Whether Pixhawk is connected
@@ -84,6 +85,7 @@ impl ConnectionHandler {
     pub fn new(
         version_major: u8,
         version_minor: u8,
+        version_patch: u8,
         serial_port: String,
         command_tx: mpsc::Sender<ValidatedCommand>,
         state_rx: broadcast::Receiver<StateUpdate>,
@@ -92,6 +94,7 @@ impl ConnectionHandler {
         Self {
             version_major,
             version_minor,
+            version_patch,
             serial_port,
             pixhawk_connected: Arc::new(RwLock::new(false)),
             command_tx,
@@ -149,6 +152,7 @@ impl ConnectionHandler {
         OutgoingMessage::HandshakeAck(HandshakeAck {
             version_major: self.version_major,
             version_minor: self.version_minor,
+            version_patch: self.version_patch,
             pixhawk_connected,
             serial_port: self.serial_port.clone(),
         })
@@ -445,6 +449,7 @@ impl Clone for ConnectionHandler {
         Self {
             version_major: self.version_major,
             version_minor: self.version_minor,
+            version_patch: self.version_patch,
             serial_port: self.serial_port.clone(),
             pixhawk_connected: Arc::clone(&self.pixhawk_connected),
             command_tx: self.command_tx.clone(),
@@ -470,7 +475,7 @@ mod tests {
         drop(state_tx); // We don't need to send states in these tests
         let shutdown = Arc::new(AtomicBool::new(false));
 
-        let handler = ConnectionHandler::new(1, 0, "/dev/test".to_string(), cmd_tx, state_rx, shutdown);
+        let handler = ConnectionHandler::new(1, 0, 0, "/dev/test".to_string(), cmd_tx, state_rx, shutdown);
 
         (handler, cmd_rx)
     }
