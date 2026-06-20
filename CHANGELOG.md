@@ -5,6 +5,13 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] - 2026-06-21
+
+### Fixed
+- **kt KV-floor clamp** — large low-KV builds (8"+, 500 KV) no longer inflate kt quadratically via unclamped `(2300/kv)²`. Effective KV floored at 1500 (matching TS physics-model `KT_KV_FLOOR`). Eliminates phantom ~20:1 TWR on big-prop configs.
+- **Two-sided PID authority scaling** — `compute_pids()` now attenuates for both braking (down) and boost (up) headroom. Overloaded builds (high hover_cmd) previously got full P/D despite limited upward authority, causing oscillation.
+- **Actuator-bandwidth PID derating** — P/D scaled by `REF_TAU_MOTOR / tau_motor` so slow large-prop / low-KV actuators don't outrun their motor pole. Prevents phase-lag limit cycles on 8"+ builds.
+
 ## [0.9.0] - 2026-05-30
 
 ### Changed

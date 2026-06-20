@@ -231,3 +231,10 @@ When the drone hits the ground at speed (>0.5 m/s), the simulation generates a 1
 hitl-physics = { path = "../hitl-physics" }
 hitl-sensors = { path = "../hitl-sensors" }
 ```
+
+## Approach
+- Read existing files before writing. Don't re-read unless changed.
+- Thorough in reasoning, concise in output.
+- No sycophantic openers or closing fluff.
+- No emojis or em-dashes.
+- Do not guess APIs, versions, flags, commit SHAs, or package names. Verify by reading code or docs before asserting.
