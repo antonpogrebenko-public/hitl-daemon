@@ -267,6 +267,7 @@ struct TerrainCacheInner {
     origin_lat: f64,
     origin_lon: f64,
     reference_alt: f64,
+    origin_elevation: Option<f64>,
 }
 
 impl TerrainCache {
@@ -278,6 +279,7 @@ impl TerrainCache {
                 origin_lat: 0.0,
                 origin_lon: 0.0,
                 reference_alt: 0.0,
+                origin_elevation: None,
             }),
         }
     }
@@ -339,6 +341,9 @@ impl TerrainCache {
         }
 
         let tile_count = tiles.len();
+
+        let origin_elevation = Self::sample_elevation_raw(&tiles, &meta, lat, lon);
+
         {
             let mut inner = self.inner.write();
             inner.meta = Some(meta);
@@ -346,21 +351,72 @@ impl TerrainCache {
             inner.origin_lat = lat;
             inner.origin_lon = lon;
             inner.reference_alt = reference_alt;
+            inner.origin_elevation = origin_elevation;
         }
 
-        info!(
-            "Terrain cache loaded: {} tiles around ({}, {})",
-            tile_count, lat, lon
-        );
+        if let Some(elev) = origin_elevation {
+            info!(
+                "Terrain cache loaded: {} tiles around ({}, {}), origin elevation: {:.1}m MSL",
+                tile_count, lat, lon, elev
+            );
+        } else {
+            warn!(
+                "Terrain cache loaded: {} tiles around ({}, {}) but origin outside tile coverage",
+                tile_count, lat, lon
+            );
+        }
+
         tile_count > 0
     }
 
-    /// Sample ground elevation in NED coordinates (positive = below reference).
+    fn sample_elevation_raw(
+        tiles: &HashMap<TileCoord, Vec<f32>>,
+        meta: &TileMeta,
+        lat: f64,
+        lon: f64,
+    ) -> Option<f64> {
+        let coord = TileCoord::from_lon_lat(lon, lat, meta.zoom);
+        let heights = tiles.get(&coord)?;
+
+        let (nw_lon, nw_lat) = tile_to_lon_lat(coord.x, coord.y, coord.z);
+        let (se_lon, se_lat) = tile_to_lon_lat(coord.x + 1, coord.y + 1, coord.z);
+
+        let fx = ((lon - nw_lon) / (se_lon - nw_lon) * (TILE_SIZE - 1) as f64)
+            .clamp(0.0, (TILE_SIZE - 1) as f64);
+        let fy = ((nw_lat - lat) / (nw_lat - se_lat) * (TILE_SIZE - 1) as f64)
+            .clamp(0.0, (TILE_SIZE - 1) as f64);
+
+        let x0 = fx.floor() as usize;
+        let y0 = fy.floor() as usize;
+        let x1 = (x0 + 1).min(TILE_SIZE - 1);
+        let y1 = (y0 + 1).min(TILE_SIZE - 1);
+        let dx = fx - x0 as f64;
+        let dy = fy - y0 as f64;
+
+        let h00 = heights[y0 * TILE_SIZE + x0] as f64;
+        let h10 = heights[y0 * TILE_SIZE + x1] as f64;
+        let h01 = heights[y1 * TILE_SIZE + x0] as f64;
+        let h11 = heights[y1 * TILE_SIZE + x1] as f64;
+
+        let elevation = h00 * (1.0 - dx) * (1.0 - dy)
+            + h10 * dx * (1.0 - dy)
+            + h01 * (1.0 - dx) * dy
+            + h11 * dx * dy;
+
+        Some(elevation)
+    }
+
+    /// Sample ground elevation in NED coordinates relative to origin terrain.
+    /// Returns the NED "down" coordinate of the ground at (north, east).
+    /// Positive = below origin ground level, negative = above.
+    /// Uses origin_elevation (terrain at lat/lon origin) as vertical reference
+    /// so ground_z=0 at origin, matching the frontend 3D mesh (Y=0 at origin).
     /// Returns None if terrain not loaded or position outside cached tiles.
     /// Call from sync physics loop.
     pub fn sample_ground_ned(&self, north: f64, east: f64) -> Option<f32> {
         let inner = self.inner.read();
         let meta = inner.meta.as_ref()?;
+        let origin_elev = inner.origin_elevation?;
 
         let (lat, lon) = ned_to_lat_lon(north, east, inner.origin_lat, inner.origin_lon);
 
@@ -392,7 +448,11 @@ impl TerrainCache {
             + h01 * (1.0 - dx) * dy
             + h11 * dx * dy;
 
-        let ned_ground = inner.reference_alt - msl_elevation;
+        // Ground in NED: how far below origin ground level is this point.
+        // origin_elev - msl_elevation: positive if point is lower than origin,
+        // negative if point is higher (e.g., a hill).
+        // At origin (north=0, east=0), this returns 0.0 (ground = NED zero).
+        let ned_ground = origin_elev - msl_elevation;
         Some(ned_ground as f32)
     }
 
@@ -400,6 +460,12 @@ impl TerrainCache {
     pub fn is_loaded(&self) -> bool {
         let inner = self.inner.read();
         inner.meta.is_some() && !inner.tiles.is_empty()
+    }
+
+    /// Get the MSL elevation at the origin point.
+    /// Returns None if terrain not loaded or origin outside tile coverage.
+    pub fn origin_elevation_msl(&self) -> Option<f64> {
+        self.inner.read().origin_elevation
     }
 }
 
