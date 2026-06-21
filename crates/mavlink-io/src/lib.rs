@@ -9,7 +9,9 @@ pub mod heartbeat;
 pub mod messages;
 pub mod serial;
 
-pub use async_io::{MavlinkIo, NshRequest, NshResponseData, SerialConnectionState, reconnect_delay};
+pub use async_io::{
+    reconnect_delay, MavlinkIo, NshRequest, NshResponseData, SerialConnectionState,
+};
 pub use codec::MavCodec;
 pub use heartbeat::{ConnectionState, HeartbeatManager};
 pub use messages::{make_hil_gps, make_hil_sensor};

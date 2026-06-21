@@ -181,7 +181,16 @@ impl MavlinkIo {
 
         // Spawn reader task
         let reader_handle = tokio::spawn(async move {
-            Self::reader_task(reader, tx_to_app, nsh_tx_to_app, shutdown_reader, packets_counter, parse_successes, parse_failures).await;
+            Self::reader_task(
+                reader,
+                tx_to_app,
+                nsh_tx_to_app,
+                shutdown_reader,
+                packets_counter,
+                parse_successes,
+                parse_failures,
+            )
+            .await;
         });
 
         // Spawn writer task
@@ -250,10 +259,8 @@ impl MavlinkIo {
             }
 
             // Timeout read so we can check shutdown flag periodically
-            let read_result = tokio::time::timeout(
-                Duration::from_secs(1),
-                reader.read(&mut buffer),
-            ).await;
+            let read_result =
+                tokio::time::timeout(Duration::from_secs(1), reader.read(&mut buffer)).await;
 
             let read_result = match read_result {
                 Ok(result) => result,
@@ -325,9 +332,7 @@ impl MavlinkIo {
                                 // with a non-STX byte, skip to the next potential frame.
                                 // skip_first=true because byte 0 is confirmed non-STX and
                                 // should be discarded before searching.
-                                if parse_buffer.len() >= 8
-                                    && parse_buffer[0] != MAVLINK_V2_STX
-                                {
+                                if parse_buffer.len() >= 8 && parse_buffer[0] != MAVLINK_V2_STX {
                                     parse_failures.fetch_add(1, Ordering::Relaxed);
                                     Self::drain_to_next_frame(&mut parse_buffer, true);
                                 }
@@ -494,7 +499,9 @@ impl MavlinkIo {
     }
 
     /// Serialize a GCS heartbeat message, advancing the sequence counter.
-    fn serialize_heartbeat(sequence: &mut u8) -> Result<Vec<u8>, mavlink::error::MessageWriteError> {
+    fn serialize_heartbeat(
+        sequence: &mut u8,
+    ) -> Result<Vec<u8>, mavlink::error::MessageWriteError> {
         use crate::heartbeat::HeartbeatManager;
 
         let header = MavHeader {
@@ -544,7 +551,10 @@ impl MavlinkIo {
         };
         if let Some(pos) = buffer.iter().skip(start).position(|&b| b == MAVLINK_V2_STX) {
             let drain_count = pos + start;
-            debug!(drained = drain_count, "Skipped corrupt bytes to next frame start");
+            debug!(
+                drained = drain_count,
+                "Skipped corrupt bytes to next frame start"
+            );
             buffer.drain(..drain_count);
         } else {
             let drained = buffer.len();

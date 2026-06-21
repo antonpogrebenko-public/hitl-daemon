@@ -259,7 +259,8 @@ impl ConnectionStatus {
     /// Serialize to binary format
     pub fn to_bytes(&self) -> Vec<u8> {
         let fc_model_str = self.fc_model.as_deref().unwrap_or("");
-        let mut buf = Vec::with_capacity(5 + self.serial_port.len() + 1 + fc_model_str.len() + 1 + 1);
+        let mut buf =
+            Vec::with_capacity(5 + self.serial_port.len() + 1 + fc_model_str.len() + 1 + 1);
         buf.push(MSG_TYPE_CONNECTION_STATUS);
         buf.push(self.connected as u8);
         buf.push(self.reconnecting as u8);
@@ -330,11 +331,19 @@ pub struct ConfigureBuild {
     pub esc_count: u8,
 }
 
-fn default_esc_count() -> u8 { 1 }
+fn default_esc_count() -> u8 {
+    1
+}
 
-fn default_battery_voltage() -> f64 { 14.8 }
-fn default_battery_capacity_mah() -> f64 { 1500.0 }
-fn default_battery_cell_count() -> u8 { 4 }
+fn default_battery_voltage() -> f64 {
+    14.8
+}
+fn default_battery_capacity_mah() -> f64 {
+    1500.0
+}
+fn default_battery_cell_count() -> u8 {
+    4
+}
 
 impl ConfigureBuild {
     pub fn from_bytes(data: &[u8]) -> Result<Self, ProtocolError> {
@@ -349,8 +358,8 @@ impl ConfigureBuild {
             return Err(ProtocolError::UnknownMessageType(data[0]));
         }
 
-        let json_str = std::str::from_utf8(&data[1..])
-            .map_err(|_| ProtocolError::InvalidPayload {
+        let json_str =
+            std::str::from_utf8(&data[1..]).map_err(|_| ProtocolError::InvalidPayload {
                 command_type: CommandType::Arm,
                 reason: "ConfigureBuild: invalid UTF-8".to_string(),
             })?;
@@ -793,7 +802,9 @@ impl IncomingMessage {
             MSG_TYPE_COMMAND => Ok(IncomingMessage::Command(Command::from_bytes(data)?)),
             MSG_TYPE_HANDSHAKE => Ok(IncomingMessage::Handshake),
             MSG_TYPE_NSH_COMMAND => Ok(IncomingMessage::NshCommand(NshCommand::from_bytes(data)?)),
-            MSG_TYPE_CONFIGURE_BUILD => Ok(IncomingMessage::ConfigureBuild(ConfigureBuild::from_bytes(data)?)),
+            MSG_TYPE_CONFIGURE_BUILD => Ok(IncomingMessage::ConfigureBuild(
+                ConfigureBuild::from_bytes(data)?,
+            )),
             MSG_TYPE_SHUTDOWN => Ok(IncomingMessage::Shutdown),
             other => Err(ProtocolError::UnknownMessageType(other)),
         }
@@ -889,7 +900,7 @@ mod tests {
         assert_eq!(bytes[1], 0); // not connected
         assert_eq!(bytes[2], 1); // reconnecting
         assert_eq!(bytes[3], 3); // retry_count
-        // Empty serial port: null terminator at index 4
+                                 // Empty serial port: null terminator at index 4
         assert_eq!(bytes[4], 0);
         // Empty fc_model: null terminator at index 5
         assert_eq!(bytes[5], 0);
@@ -910,7 +921,7 @@ mod tests {
         let bytes = status.to_bytes();
         assert_eq!(bytes[1], 0); // not connected
         assert_eq!(bytes[2], 1); // reconnecting
-        // bootloader_suspected byte is at index 6 (after two empty null-terminated strings)
+                                 // bootloader_suspected byte is at index 6 (after two empty null-terminated strings)
         assert_eq!(bytes[6], 1); // bootloader_suspected = true
     }
 
@@ -979,7 +990,10 @@ mod tests {
     fn test_invalid_message_type() {
         let bytes = [0xFF];
         let result = IncomingMessage::from_bytes(&bytes);
-        assert!(matches!(result, Err(ProtocolError::UnknownMessageType(0xFF))));
+        assert!(matches!(
+            result,
+            Err(ProtocolError::UnknownMessageType(0xFF))
+        ));
     }
 
     #[test]

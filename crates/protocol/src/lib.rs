@@ -177,7 +177,9 @@ impl ActuatorOutputs {
     }
 
     /// Create ActuatorOutputs from HIL_ACTUATOR_CONTROLS data
-    pub fn from_hil_actuator_controls(data: &HIL_ACTUATOR_CONTROLS_DATA) -> Result<Self, ProtocolError> {
+    pub fn from_hil_actuator_controls(
+        data: &HIL_ACTUATOR_CONTROLS_DATA,
+    ) -> Result<Self, ProtocolError> {
         let mut motors = [0.0f32; 4];
         let mut controls = [0.0f32; 16];
 
@@ -300,9 +302,15 @@ pub struct ConfigureBuild {
     pub frame_slug: Option<String>,
 }
 
-fn default_battery_voltage() -> f64 { 14.8 }
-fn default_battery_capacity_mah() -> f64 { 1500.0 }
-fn default_battery_cell_count() -> u8 { 4 }
+fn default_battery_voltage() -> f64 {
+    14.8
+}
+fn default_battery_capacity_mah() -> f64 {
+    1500.0
+}
+fn default_battery_cell_count() -> u8 {
+    4
+}
 
 /// Lifecycle stage of a `ConfigureBuild` request. Mirrors
 /// `websocket::protocol::ConfigState` — kept in sync because both crates
@@ -372,22 +380,25 @@ impl IncomingMessage {
         match msg_type {
             MSG_TYPE_HANDSHAKE => Ok(IncomingMessage::Handshake),
             MSG_TYPE_COMMAND => {
-                let json_str = std::str::from_utf8(&data[1..])
-                    .map_err(|_| WsProtocolError::InvalidPayload("Command: invalid UTF-8".into()))?;
+                let json_str = std::str::from_utf8(&data[1..]).map_err(|_| {
+                    WsProtocolError::InvalidPayload("Command: invalid UTF-8".into())
+                })?;
                 let cmd: Command = serde_json::from_str(json_str)
                     .map_err(|e| WsProtocolError::InvalidPayload(format!("Command: {e}")))?;
                 Ok(IncomingMessage::Command(cmd))
             }
             MSG_TYPE_NSH_COMMAND => {
-                let json_str = std::str::from_utf8(&data[1..])
-                    .map_err(|_| WsProtocolError::InvalidPayload("NshCommand: invalid UTF-8".into()))?;
+                let json_str = std::str::from_utf8(&data[1..]).map_err(|_| {
+                    WsProtocolError::InvalidPayload("NshCommand: invalid UTF-8".into())
+                })?;
                 let cmd: NshCommand = serde_json::from_str(json_str)
                     .map_err(|e| WsProtocolError::InvalidPayload(format!("NshCommand: {e}")))?;
                 Ok(IncomingMessage::NshCommand(cmd))
             }
             MSG_TYPE_CONFIGURE_BUILD => {
-                let json_str = std::str::from_utf8(&data[1..])
-                    .map_err(|_| WsProtocolError::InvalidPayload("ConfigureBuild: invalid UTF-8".into()))?;
+                let json_str = std::str::from_utf8(&data[1..]).map_err(|_| {
+                    WsProtocolError::InvalidPayload("ConfigureBuild: invalid UTF-8".into())
+                })?;
                 let build: ConfigureBuild = serde_json::from_str(json_str)
                     .map_err(|e| WsProtocolError::InvalidPayload(format!("ConfigureBuild: {e}")))?;
                 Ok(IncomingMessage::ConfigureBuild(build))
@@ -402,9 +413,14 @@ impl IncomingMessage {
 pub enum OutgoingMessage {
     StateUpdate(Vec<u8>),
     HandshakeAck,
-    CommandAck { success: bool, message: Option<String> },
+    CommandAck {
+        success: bool,
+        message: Option<String>,
+    },
     NshResponse(String),
-    ConnectionStatus { connected: bool },
+    ConnectionStatus {
+        connected: bool,
+    },
     VehicleMessage(String),
     ConfigResult(ConfigResult),
 }
@@ -424,7 +440,8 @@ impl OutgoingMessage {
                     "success": success,
                     "message": message
                 });
-                let json_bytes = serde_json::to_vec(&json).expect("CommandAck serialization cannot fail");
+                let json_bytes =
+                    serde_json::to_vec(&json).expect("CommandAck serialization cannot fail");
                 let mut buf = Vec::with_capacity(1 + json_bytes.len());
                 buf.push(MSG_TYPE_COMMAND_ACK);
                 buf.extend_from_slice(&json_bytes);
@@ -438,7 +455,8 @@ impl OutgoingMessage {
             }
             OutgoingMessage::ConnectionStatus { connected } => {
                 let json = serde_json::json!({ "connected": connected });
-                let json_bytes = serde_json::to_vec(&json).expect("ConnectionStatus serialization cannot fail");
+                let json_bytes =
+                    serde_json::to_vec(&json).expect("ConnectionStatus serialization cannot fail");
                 let mut buf = Vec::with_capacity(1 + json_bytes.len());
                 buf.push(MSG_TYPE_CONNECTION_STATUS);
                 buf.extend_from_slice(&json_bytes);
@@ -451,7 +469,8 @@ impl OutgoingMessage {
                 buf
             }
             OutgoingMessage::ConfigResult(result) => {
-                let json = serde_json::to_vec(result).expect("ConfigResult serialization cannot fail");
+                let json =
+                    serde_json::to_vec(result).expect("ConfigResult serialization cannot fail");
                 let mut buf = Vec::with_capacity(1 + json.len());
                 buf.push(MSG_TYPE_CONFIG_RESULT);
                 buf.extend_from_slice(&json);
@@ -478,10 +497,10 @@ mod tests {
     fn test_from_hil_actuator_controls() {
         let mut controls = [0.0f32; 16];
         // PX4 channels match sim motors 1-4 directly (Standard Quad X)
-        controls[0] = 0.1;  // ch0 = Motor 1 (FR, CCW)
-        controls[1] = 0.2;  // ch1 = Motor 2 (BL, CCW)
-        controls[2] = 0.3;  // ch2 = Motor 3 (FL, CW)
-        controls[3] = 0.4;  // ch3 = Motor 4 (BR, CW)
+        controls[0] = 0.1; // ch0 = Motor 1 (FR, CCW)
+        controls[1] = 0.2; // ch1 = Motor 2 (BL, CCW)
+        controls[2] = 0.3; // ch2 = Motor 3 (FL, CW)
+        controls[3] = 0.4; // ch3 = Motor 4 (BR, CW)
 
         let data = HIL_ACTUATOR_CONTROLS_DATA {
             time_usec: 1000000,
@@ -498,16 +517,22 @@ mod tests {
         assert!(outputs.is_hil_active());
 
         // Identity mapping: sim motors = px4 channels directly
-        assert!((outputs.motors[0] - 0.1).abs() < 0.01);  // Motor 1 (FR)
-        assert!((outputs.motors[1] - 0.2).abs() < 0.01);  // Motor 2 (BL)
-        assert!((outputs.motors[2] - 0.3).abs() < 0.01);  // Motor 3 (FL)
-        assert!((outputs.motors[3] - 0.4).abs() < 0.01);  // Motor 4 (BR)
+        assert!((outputs.motors[0] - 0.1).abs() < 0.01); // Motor 1 (FR)
+        assert!((outputs.motors[1] - 0.2).abs() < 0.01); // Motor 2 (BL)
+        assert!((outputs.motors[2] - 0.3).abs() < 0.01); // Motor 3 (FL)
+        assert!((outputs.motors[3] - 0.4).abs() < 0.01); // Motor 4 (BR)
     }
 
     #[test]
     fn test_decode_mode() {
-        assert_eq!(ActuatorOutputs::decode_mode(MavModeFlag::empty()), FlightMode::Disarmed);
-        assert_eq!(ActuatorOutputs::decode_mode(MavModeFlag::MAV_MODE_FLAG_SAFETY_ARMED), FlightMode::Armed);
+        assert_eq!(
+            ActuatorOutputs::decode_mode(MavModeFlag::empty()),
+            FlightMode::Disarmed
+        );
+        assert_eq!(
+            ActuatorOutputs::decode_mode(MavModeFlag::MAV_MODE_FLAG_SAFETY_ARMED),
+            FlightMode::Armed
+        );
         assert_eq!(
             ActuatorOutputs::decode_mode(
                 MavModeFlag::MAV_MODE_FLAG_SAFETY_ARMED | MavModeFlag::MAV_MODE_FLAG_HIL_ENABLED

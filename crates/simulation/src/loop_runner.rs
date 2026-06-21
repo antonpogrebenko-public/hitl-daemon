@@ -2,12 +2,12 @@
 
 use crate::state::{SimulationConfig, SimulationState};
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
-use hitl_physics::{rk4_step, throttle_to_omega_with_config, total_motor_current, BatteryConfig, PhysicsConfig};
-use mavlink::ardupilotmega::{
-    MavMessage, HIL_GPS_DATA, HIL_SENSOR_DATA, HilSensorUpdatedFlags,
+use hitl_physics::{
+    rk4_step, throttle_to_omega_with_config, total_motor_current, BatteryConfig, PhysicsConfig,
 };
-pub use protocol::SimulationStats;
+use mavlink::ardupilotmega::{HilSensorUpdatedFlags, MavMessage, HIL_GPS_DATA, HIL_SENSOR_DATA};
 use protocol::ActuatorOutputs;
+pub use protocol::SimulationStats;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tracing::{debug, error, info, trace, warn};
@@ -36,7 +36,6 @@ const STALE_WARN_INTERVAL: Duration = Duration::from_secs(5);
 /// to `error!` — the FC has likely disconnected without the serial layer
 /// detecting it yet.
 const DROP_ERROR_THRESHOLD: Duration = Duration::from_secs(2);
-
 
 /// Mag sensor update divider (400 Hz / 8 = 50 Hz)
 const MAG_UPDATE_DIVIDER: u64 = 8;
@@ -220,10 +219,8 @@ impl SimulationLoop {
             // Roll up window stats every STATS_WINDOW_INTERVAL.
             if window_start.elapsed() >= STATS_WINDOW_INTERVAL {
                 let window_secs = window_start.elapsed().as_secs_f64();
-                self.stats.tick_rate_hz =
-                    (window_ticks as f64 / window_secs) as f32;
-                self.stats.avg_latency_us =
-                    (window_latency_us as f64 / window_ticks as f64) as u32;
+                self.stats.tick_rate_hz = (window_ticks as f64 / window_secs) as f32;
+                self.stats.avg_latency_us = (window_latency_us as f64 / window_ticks as f64) as u32;
                 self.stats.max_latency_us = window_max_latency_us as u32;
 
                 // Keep the formatted log line as `debug!` for users who tail
@@ -314,13 +311,23 @@ impl SimulationLoop {
     fn step_physics(&mut self, dt: f64) {
         let mut state = self.state.write();
 
-        // NED: Z=0 is ground level; Z>0 is below ground (clamped).
-        // Single threshold shared with the ground-contact clamp below to
-        // avoid a dead zone where physics runs but ground forces do not.
-        const GROUND_CONTACT_Z: f64 = 0.0;
+        // NED: Z>ground_z means below ground (clamped).
+        // If terrain loaded, sample ground elevation; otherwise use flat ground at Z=0.
+        let ground_z = self
+            .config
+            .terrain
+            .as_ref()
+            .and_then(|t| {
+                t.sample_ground_ned(
+                    state.quadrotor.position[0], // north
+                    state.quadrotor.position[1], // east
+                )
+            })
+            .map(|z| z as f64)
+            .unwrap_or(0.0);
 
         // Skip physics only when disarmed on the ground (gyro calibration)
-        let on_ground = state.quadrotor.position[2] >= GROUND_CONTACT_Z;
+        let on_ground = state.quadrotor.position[2] >= ground_z;
         let motors_active = state.motor_commands.iter().any(|&c| c > 0.01);
 
         if motors_active || !on_ground {
@@ -339,10 +346,9 @@ impl SimulationLoop {
                 // the terminal voltage the ESCs actually see, not nominal.
                 // V_terminal = V_OCV(soc) - I·R_internal; ratio < 1 under load or at low SoC.
                 let v_nominal = self.config.physics.battery_voltage;
-                let v_terminal = state.battery.v_terminal(
-                    current,
-                    self.config.battery.internal_resistance_ohm,
-                );
+                let v_terminal = state
+                    .battery
+                    .v_terminal(current, self.config.battery.internal_resistance_ohm);
                 let voltage_ratio = if v_nominal > 0.0 {
                     (v_terminal / v_nominal).clamp(0.0, 1.0)
                 } else {
@@ -378,9 +384,9 @@ impl SimulationLoop {
             state.quadrotor.velocity[2],
         ];
 
-        let physics_on_ground = state.quadrotor.position[2] >= GROUND_CONTACT_Z;
+        let physics_on_ground = state.quadrotor.position[2] >= ground_z;
         if physics_on_ground {
-            state.quadrotor.position[2] = 0.0;
+            state.quadrotor.position[2] = ground_z;
 
             // Trigger impact deceleration if hitting ground with significant downward velocity.
             // Deceleration is spread over IMPACT_DURATION_TICKS to give the EKF
@@ -423,8 +429,7 @@ impl SimulationLoop {
             state.quadrotor.angular_velocity[2] *= 0.95;
 
             let (_, _, yaw) = state.quadrotor.quaternion.euler_angles();
-            state.quadrotor.quaternion =
-                nalgebra::UnitQuaternion::from_euler_angles(0.0, 0.0, yaw);
+            state.quadrotor.quaternion = nalgebra::UnitQuaternion::from_euler_angles(0.0, 0.0, yaw);
         }
 
         // Decrement impact counter (ticks down whether on ground or not)
@@ -437,7 +442,7 @@ impl SimulationLoop {
         // gets clean [0,0,-g] accel through the entire liftoff transition.
         if physics_on_ground {
             self.ground_contact_active = true;
-        } else if state.quadrotor.position[2] < -0.10 {
+        } else if state.quadrotor.position[2] < ground_z - 0.10 {
             self.ground_contact_active = false;
         }
 
@@ -480,7 +485,8 @@ impl SimulationLoop {
                 );
             } else if self.ground_contact_active {
                 let gravity = self.config.physics.gravity;
-                force_body = nalgebra::Vector3::new(0.0, 0.0, -self.config.physics.mass_kg * gravity);
+                force_body =
+                    nalgebra::Vector3::new(0.0, 0.0, -self.config.physics.mass_kg * gravity);
             }
 
             // Accelerometer reading = specific force = non-gravitational acceleration
@@ -490,7 +496,11 @@ impl SimulationLoop {
                 force_body[2] / self.config.physics.mass_kg,
             ];
 
-            let gyro_body = [q.angular_velocity[0], q.angular_velocity[1], q.angular_velocity[2]];
+            let gyro_body = [
+                q.angular_velocity[0],
+                q.angular_velocity[1],
+                q.angular_velocity[2],
+            ];
 
             // Altitude is negative of NED down position, plus reference altitude
             let altitude_m = self.config.reference_alt - q.position[2];
@@ -498,7 +508,14 @@ impl SimulationLoop {
             let position_ned = [q.position[0], q.position[1], q.position[2]];
             let velocity_ned = [q.velocity[0], q.velocity[1], q.velocity[2]];
 
-            (accel_body, gyro_body, altitude_m, position_ned, velocity_ned, attitude)
+            (
+                accel_body,
+                gyro_body,
+                altitude_m,
+                position_ned,
+                velocity_ned,
+                attitude,
+            )
         };
 
         // Compute which sensors to update this tick
@@ -519,14 +536,16 @@ impl SimulationLoop {
             let mag = if update_mag {
                 state.sensors.mag.sample(&attitude)
             } else {
-                self.last_mag.unwrap_or_else(|| state.sensors.mag.sample(&attitude))
+                self.last_mag
+                    .unwrap_or_else(|| state.sensors.mag.sample(&attitude))
             };
 
             // Baro: only sample on update ticks, otherwise use cached value
             let baro = if update_baro {
                 state.sensors.baro.sample(altitude_m)
             } else {
-                self.last_baro.unwrap_or_else(|| state.sensors.baro.sample(altitude_m))
+                self.last_baro
+                    .unwrap_or_else(|| state.sensors.baro.sample(altitude_m))
             };
 
             // GPS has internal rate limiting (returns None when not time to update)
@@ -575,7 +594,13 @@ impl SimulationLoop {
         }
 
         // Build and send HIL_SENSOR message
-        let hil_sensor = self.build_hil_sensor(&imu_reading, &baro_reading, &mag_reading, sim_time_us, fields_updated);
+        let hil_sensor = self.build_hil_sensor(
+            &imu_reading,
+            &baro_reading,
+            &mag_reading,
+            sim_time_us,
+            fields_updated,
+        );
         match self.mav_tx.try_send(MavMessage::HIL_SENSOR(hil_sensor)) {
             Ok(()) => {
                 self.stats.hil_sensor_count += 1;
@@ -620,7 +645,9 @@ impl SimulationLoop {
         if let Some(gps) = gps_reading {
             let hil_gps = self.build_hil_gps(&gps, sim_time_us);
             match self.mav_tx.try_send(MavMessage::HIL_GPS(hil_gps)) {
-                Ok(()) => { self.stats.hil_gps_count += 1; }
+                Ok(()) => {
+                    self.stats.hil_gps_count += 1;
+                }
                 Err(crossbeam_channel::TrySendError::Full(_)) => {
                     self.stats.sensor_drops += 1;
                     self.drop_count_since_last_warning += 1;
@@ -651,7 +678,7 @@ impl SimulationLoop {
             ymag: mag.field[1] as f32,
             zmag: mag.field[2] as f32,
             abs_pressure: baro.pressure_pa as f32 / 100.0, // Convert to hPa (mbar)
-            diff_pressure: 0.0, // No airspeed sensor
+            diff_pressure: 0.0,                            // No airspeed sensor
             pressure_alt: baro.altitude_m as f32,
             temperature: baro.temperature_c as f32,
             fields_updated,
@@ -679,15 +706,15 @@ impl SimulationLoop {
             time_usec: time_us,
             lat: (gps.lat * 1e7) as i32,
             lon: (gps.lon * 1e7) as i32,
-            alt: (alt_msl * 1000.0) as i32, // mm MSL
-            eph: (gps.hdop * 100.0) as u16,        // cm (using HDOP as horizontal accuracy proxy)
-            epv: 200,                               // cm (fixed vertical accuracy estimate)
-            vel: (ground_speed * 100.0) as u16,    // cm/s
-            vn: (gps.vel_n * 100.0) as i16,        // cm/s
-            ve: (gps.vel_e * 100.0) as i16,        // cm/s
-            vd: (gps.vel_d * 100.0) as i16,        // cm/s
-            cog: (cog_positive * 100.0) as u16,    // cdeg
-            fix_type: 3,                            // 3D fix
+            alt: (alt_msl * 1000.0) as i32,     // mm MSL
+            eph: (gps.hdop * 100.0) as u16,     // cm (using HDOP as horizontal accuracy proxy)
+            epv: 200,                           // cm (fixed vertical accuracy estimate)
+            vel: (ground_speed * 100.0) as u16, // cm/s
+            vn: (gps.vel_n * 100.0) as i16,     // cm/s
+            ve: (gps.vel_e * 100.0) as i16,     // cm/s
+            vd: (gps.vel_d * 100.0) as i16,     // cm/s
+            cog: (cog_positive * 100.0) as u16, // cdeg
+            fix_type: 3,                        // 3D fix
             satellites_visible: gps.satellites,
         }
     }
@@ -721,7 +748,11 @@ impl SimulationLoop {
         let max_omega = physics.max_motor_speed_from_voltage();
         let max_thrust_n = 4.0 * physics.kt * max_omega * max_omega;
         let weight_n = physics.mass_kg * physics.gravity;
-        let twr = if weight_n > 0.0 { (max_thrust_n / weight_n) as f32 } else { 0.0 };
+        let twr = if weight_n > 0.0 {
+            (max_thrust_n / weight_n) as f32
+        } else {
+            0.0
+        };
 
         // Roll/pitch/yaw of the sim quaternion in degrees. The TUI lights up
         // the attitude row red when |roll|+|pitch| is large while disarmed —

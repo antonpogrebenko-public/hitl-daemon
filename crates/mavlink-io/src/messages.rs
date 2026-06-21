@@ -89,7 +89,7 @@ pub fn make_hil_sensor(data: &HilSensorData) -> MavMessage {
         diff_pressure: data.diff_pressure,
         pressure_alt: data.pressure_alt,
         temperature: data.temperature,
-        fields_updated: HilSensorUpdatedFlags::all()
+        fields_updated: HilSensorUpdatedFlags::all(),
     })
 }
 
@@ -141,9 +141,9 @@ mod tests {
         let data = HilGpsData {
             time_usec: 1000000,
             fix_type: 3,
-            lat: 473977418,  // 47.3977418 degrees
-            lon: 85455963,   // 8.5455963 degrees
-            alt: 450000,     // 450m
+            lat: 473977418, // 47.3977418 degrees
+            lon: 85455963,  // 8.5455963 degrees
+            alt: 450000,    // 450m
             satellites_visible: 12,
             ..Default::default()
         };

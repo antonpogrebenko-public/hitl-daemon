@@ -1,16 +1,16 @@
-use crossbeam_channel::Sender;
-use hitl_physics::px4_pids::{compute_pids, fingerprint as pid_fingerprint, Px4Pids};
-use hitl_physics::{
-    estimate_flight_time_min, BaroChip, BatteryConfig, BuildSpec, FrameMaterial, ImuChip,
-    MagChip, PhysicsConfig,
-};
-use mavlink::ardupilotmega::{COMMAND_LONG_DATA, MavCmd, MavMessage, MavParamType, PARAM_SET_DATA};
-use std::sync::Mutex;
-use std::time::Duration;
 use crate::handler::ValidatedNshCommand;
 use crate::protocol::{
     AppliedConfig, ConfigResult, ConfigState, ConfigureBuild, OutgoingMessage, Px4PidsView,
 };
+use crossbeam_channel::Sender;
+use hitl_physics::px4_pids::{compute_pids, fingerprint as pid_fingerprint, Px4Pids};
+use hitl_physics::{
+    estimate_flight_time_min, BaroChip, BatteryConfig, BuildSpec, FrameMaterial, ImuChip, MagChip,
+    PhysicsConfig,
+};
+use mavlink::ardupilotmega::{MavCmd, MavMessage, MavParamType, COMMAND_LONG_DATA, PARAM_SET_DATA};
+use std::sync::Mutex;
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
@@ -81,8 +81,8 @@ impl BuildConfigHandler {
         mav_tx: Option<Sender<MavMessage>>,
         param_value_tx: Option<broadcast::Sender<(String, f32)>>,
     ) -> Self {
-        let api_url = std::env::var("RELEASE_API_URL")
-            .unwrap_or_else(|_| DEFAULT_API_URL.to_string());
+        let api_url =
+            std::env::var("RELEASE_API_URL").unwrap_or_else(|_| DEFAULT_API_URL.to_string());
 
         let (system_config_tx, _) = broadcast::channel(16);
 
@@ -156,25 +156,41 @@ impl BuildConfigHandler {
             .unwrap_or(30.0);
 
         // Fetch propeller specs if provided, otherwise use defaults
-        let (prop_diameter, prop_pitch, blade_count) = if let Some(ref prop_slug) = request.prop_slug {
+        let (prop_diameter, prop_pitch, blade_count) = if let Some(ref prop_slug) =
+            request.prop_slug
+        {
             match self.fetch_component_specs(prop_slug).await {
                 Ok(specs) => {
-                    let diameter = specs.get("diameterIn").and_then(|v| v.as_f64())
+                    let diameter = specs
+                        .get("diameterIn")
+                        .and_then(|v| v.as_f64())
                         .unwrap_or(request.prop_diameter_inches);
-                    let pitch = specs.get("pitchIn").and_then(|v| v.as_f64())
+                    let pitch = specs
+                        .get("pitchIn")
+                        .and_then(|v| v.as_f64())
                         .unwrap_or(diameter * 0.9);
-                    let blades = specs.get("bladeCount").and_then(|v| v.as_i64())
+                    let blades = specs
+                        .get("bladeCount")
+                        .and_then(|v| v.as_i64())
                         .unwrap_or(3) as i32;
                     info!(slug = %prop_slug, diameter, pitch, blades, "Loaded propeller specs");
                     (diameter, pitch, blades)
                 }
                 Err(e) => {
                     warn!(slug = %prop_slug, error = %e, "Failed to fetch propeller specs, using defaults");
-                    (request.prop_diameter_inches, request.prop_diameter_inches * 0.9, 3)
+                    (
+                        request.prop_diameter_inches,
+                        request.prop_diameter_inches * 0.9,
+                        3,
+                    )
                 }
             }
         } else {
-            (request.prop_diameter_inches, request.prop_diameter_inches * 0.9, 3)
+            (
+                request.prop_diameter_inches,
+                request.prop_diameter_inches * 0.9,
+                3,
+            )
         };
 
         // Build a typed BuildSpec from the request + fetched component specs.
@@ -192,7 +208,8 @@ impl BuildConfigHandler {
         // Estimate battery weight from capacity when no battery_slug will provide
         // an exact value. Regression across FPV packs: ~7g per cell per 100mAh
         // (4S 1500mAh ≈ 210g, 4S 4500mAh ≈ 630g, 6S 1100mAh ≈ 230g).
-        spec.battery.weight_g = request.battery_capacity_mah * request.battery_cell_count as f64 * 0.035;
+        spec.battery.weight_g =
+            request.battery_capacity_mah * request.battery_cell_count as f64 * 0.035;
 
         // Fetch frame specs if frame_slug provided — gets wheelbase/material
         // but frame_weight_g from the request always takes priority (user-tunable).
@@ -217,7 +234,9 @@ impl BuildConfigHandler {
         if let Some(ref esc_slug) = request.esc_slug {
             match self.fetch_component_specs(esc_slug).await {
                 Ok(specs) => {
-                    if let Some(continuous) = specs.get("continuousCurrentA").and_then(|v| v.as_f64()) {
+                    if let Some(continuous) =
+                        specs.get("continuousCurrentA").and_then(|v| v.as_f64())
+                    {
                         spec.escs.continuous_amps = continuous;
                     }
                     if let Some(burst) = specs.get("burstCurrentA").and_then(|v| v.as_f64()) {
@@ -282,15 +301,24 @@ impl BuildConfigHandler {
         if let Some(ref gps_slug) = request.gps_slug {
             match self.fetch_component_specs(gps_slug).await {
                 Ok(specs) => {
-                    let chipset = specs.get("chipset").and_then(|v| v.as_str())
+                    let chipset = specs
+                        .get("chipset")
+                        .and_then(|v| v.as_str())
                         .map(parse_gps_chipset)
                         .unwrap_or(hitl_physics::build::GpsChipset::Other);
-                    let update_rate_hz = specs.get("updateRateHz").and_then(|v| v.as_f64())
+                    let update_rate_hz = specs
+                        .get("updateRateHz")
+                        .and_then(|v| v.as_f64())
                         .unwrap_or(10.0)
                         .clamp(1.0, 100.0);
-                    let has_compass = specs.get("compass").or_else(|| specs.get("hasCompass"))
-                        .and_then(|v| v.as_bool()).unwrap_or(false);
-                    let weight_g = specs.get("weightG").and_then(|v| v.as_f64())
+                    let has_compass = specs
+                        .get("compass")
+                        .or_else(|| specs.get("hasCompass"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let weight_g = specs
+                        .get("weightG")
+                        .and_then(|v| v.as_f64())
                         .unwrap_or(12.0);
                     spec.gps = Some(hitl_physics::build::GpsSpec {
                         chipset,
@@ -418,17 +446,17 @@ impl BuildConfigHandler {
         // user can't accidentally fly with mismatched PIDs vs. physics.
         let (applied_pids, verified_params) =
             match self.push_pids_and_verify(&pids, hover_cmd, thr_min).await {
-            Ok(view) => view,
-            Err(e) => {
-                error!(error = %e, "PID verification failed — aborting reconfigure");
-                return ConfigResult {
-                    state: ConfigState::Error,
-                    success: false,
-                    error: Some(format!("PID verification failed: {e}")),
-                    config: None,
-                };
-            }
-        };
+                Ok(view) => view,
+                Err(e) => {
+                    error!(error = %e, "PID verification failed — aborting reconfigure");
+                    return ConfigResult {
+                        state: ConfigState::Error,
+                        success: false,
+                        error: Some(format!("PID verification failed: {e}")),
+                        config: None,
+                    };
+                }
+            };
 
         // Stage 3: hand new physics to the simulation loop. Only at this point
         // is the running drone state reconfigured. PX4 already has matching
@@ -500,7 +528,10 @@ impl BuildConfigHandler {
             ^ ((hover_cmd.to_bits() as u64) << 32)
             ^ ((thr_min.to_bits() as u64) << 16);
         {
-            let cache = self.last_pid_fingerprint.lock().expect("PID cache poisoned");
+            let cache = self
+                .last_pid_fingerprint
+                .lock()
+                .expect("PID cache poisoned");
             if *cache == Some(fp) {
                 debug!(
                     fingerprint = fp,
@@ -526,31 +557,31 @@ impl BuildConfigHandler {
         //   a ~0.8 Hz limit cycle. Scaled to 30% of hover (≥0.5 g descent
         //   authority), clamped to PX4's [0.05, 0.20] range.
         let params: [(&str, f32); 21] = [
-            ("MC_ROLLRATE_P",   pids.roll_p),
-            ("MC_ROLLRATE_I",   pids.roll_i),
-            ("MC_ROLLRATE_D",   pids.roll_d),
-            ("MC_ROLLRATE_FF",  pids.roll_ff),
-            ("MC_PITCHRATE_P",  pids.pitch_p),
-            ("MC_PITCHRATE_I",  pids.pitch_i),
-            ("MC_PITCHRATE_D",  pids.pitch_d),
+            ("MC_ROLLRATE_P", pids.roll_p),
+            ("MC_ROLLRATE_I", pids.roll_i),
+            ("MC_ROLLRATE_D", pids.roll_d),
+            ("MC_ROLLRATE_FF", pids.roll_ff),
+            ("MC_PITCHRATE_P", pids.pitch_p),
+            ("MC_PITCHRATE_I", pids.pitch_i),
+            ("MC_PITCHRATE_D", pids.pitch_d),
             ("MC_PITCHRATE_FF", pids.pitch_ff),
-            ("MC_YAWRATE_P",    pids.yaw_p),
-            ("MC_YAWRATE_I",    pids.yaw_i),
-            ("MC_YAWRATE_D",    pids.yaw_d),
-            ("MC_YAWRATE_FF",   pids.yaw_ff),
-            ("THR_MDL_FAC",     1.0),
-            ("MPC_THR_HOVER",   hover_cmd),
-            ("MPC_THR_MIN",     thr_min),
+            ("MC_YAWRATE_P", pids.yaw_p),
+            ("MC_YAWRATE_I", pids.yaw_i),
+            ("MC_YAWRATE_D", pids.yaw_d),
+            ("MC_YAWRATE_FF", pids.yaw_ff),
+            ("THR_MDL_FAC", 1.0),
+            ("MPC_THR_HOVER", hover_cmd),
+            ("MPC_THR_MIN", thr_min),
             // Zero accel/gyro calibration offsets: the simulated IMU has no
             // physical mounting bias. Real-hardware offsets create a persistent
             // lateral accel bias (~0.05 m/s²) that the EKF integrates into
             // position drift.
-            ("CAL_ACC0_XOFF",   0.0),
-            ("CAL_ACC0_YOFF",   0.0),
-            ("CAL_ACC0_ZOFF",   0.0),
-            ("CAL_GYRO0_XOFF",  0.0),
-            ("CAL_GYRO0_YOFF",  0.0),
-            ("CAL_GYRO0_ZOFF",  0.0),
+            ("CAL_ACC0_XOFF", 0.0),
+            ("CAL_ACC0_YOFF", 0.0),
+            ("CAL_ACC0_ZOFF", 0.0),
+            ("CAL_GYRO0_XOFF", 0.0),
+            ("CAL_GYRO0_YOFF", 0.0),
+            ("CAL_GYRO0_ZOFF", 0.0),
         ];
 
         let mut verified = 0u32;
@@ -570,21 +601,17 @@ impl BuildConfigHandler {
                     Err(crossbeam_channel::TrySendError::Full(_)) => {
                         warn!(
                             param = name,
-                            attempt,
-                            "MAVLink tx channel full — retrying PARAM_SET"
+                            attempt, "MAVLink tx channel full — retrying PARAM_SET"
                         );
                         tokio::time::sleep(Duration::from_millis(50)).await;
                         continue;
                     }
                     Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-                        return Err(format!(
-                            "MAVLink tx disconnected while sending {name}"
-                        ));
+                        return Err(format!("MAVLink tx disconnected while sending {name}"));
                     }
                 }
 
-                if let Some((got_name, got_value)) =
-                    wait_for_param_ack(&mut rx, name, value).await
+                if let Some((got_name, got_value)) = wait_for_param_ack(&mut rx, name, value).await
                 {
                     debug!(
                         param = %got_name,
@@ -612,16 +639,21 @@ impl BuildConfigHandler {
         }
 
         // Cache only after full verification — partial pushes must retry.
-        *self.last_pid_fingerprint.lock().expect("PID cache poisoned") = Some(fp);
+        *self
+            .last_pid_fingerprint
+            .lock()
+            .expect("PID cache poisoned") = Some(fp);
         // Persist the verified param snapshot so repush_if_configured can
         // re-push the same values after a FC power cycle without needing a
         // new ConfigureBuild from the browser.
-        *self.last_verified_params.lock().expect("PID params cache poisoned") =
-            Some(LastVerifiedParams {
-                pids: pids.clone(),
-                hover_cmd,
-                thr_min,
-            });
+        *self
+            .last_verified_params
+            .lock()
+            .expect("PID params cache poisoned") = Some(LastVerifiedParams {
+            pids: pids.clone(),
+            hover_cmd,
+            thr_min,
+        });
 
         // Persist to PX4 flash. PARAM_SET only writes RAM, so a Pixhawk
         // reboot resets our PIDs / thrust-curve params back to PX4 defaults
@@ -636,7 +668,11 @@ impl BuildConfigHandler {
             Err(e) => warn!(error = ?e, "Failed to send PARAM_SAVE — params live in RAM only"),
         }
 
-        info!(verified, fingerprint = fp, "All per-build PIDs verified on PX4");
+        info!(
+            verified,
+            fingerprint = fp,
+            "All per-build PIDs verified on PX4"
+        );
 
         Ok((
             Some(Px4PidsView {
@@ -765,36 +801,48 @@ impl BuildConfigHandler {
         );
 
         // Notify the frontend that re-configuration is in progress.
-        let _ = self.system_config_tx.send(OutgoingMessage::ConfigResult(ConfigResult {
-            state: ConfigState::Configuring,
-            success: true,
-            error: None,
-            config: None,
-        }));
+        let _ = self
+            .system_config_tx
+            .send(OutgoingMessage::ConfigResult(ConfigResult {
+                state: ConfigState::Configuring,
+                success: true,
+                error: None,
+                config: None,
+            }));
 
         // Clear the fingerprint cache so push_pids_and_verify doesn't skip
         // the push — PX4 just reset its RAM on power cycle.
-        *self.last_pid_fingerprint.lock().expect("PID cache poisoned") = None;
+        *self
+            .last_pid_fingerprint
+            .lock()
+            .expect("PID cache poisoned") = None;
 
-        match self.push_pids_and_verify(&p.pids, p.hover_cmd, p.thr_min).await {
+        match self
+            .push_pids_and_verify(&p.pids, p.hover_cmd, p.thr_min)
+            .await
+        {
             Ok(_) => {
                 info!("PIDs re-verified on reconnected FC");
-                let _ = self.system_config_tx.send(OutgoingMessage::ConfigResult(ConfigResult {
-                    state: ConfigState::Ready,
-                    success: true,
-                    error: None,
-                    config: None,
-                }));
+                let _ = self
+                    .system_config_tx
+                    .send(OutgoingMessage::ConfigResult(ConfigResult {
+                        state: ConfigState::Ready,
+                        success: true,
+                        error: None,
+                        config: None,
+                    }));
                 Ok(())
             }
             Err(e) => {
                 error!(error = %e, "PID re-push failed after FC reconnect");
-                let _ = self.system_config_tx.send(OutgoingMessage::ConfigResult(ConfigResult {
-                    state: ConfigState::Error,
-                    success: false,
-                    error: Some(format!("PID re-push after reconnect failed: {e}")),
-                    config: None,
-                }));
+                let _ = self
+                    .system_config_tx
+                    .send(OutgoingMessage::ConfigResult(ConfigResult {
+                        state: ConfigState::Error,
+                        success: false,
+                        error: Some(format!("PID re-push after reconnect failed: {e}")),
+                        config: None,
+                    }));
                 Err(e)
             }
         }
@@ -806,14 +854,20 @@ impl BuildConfigHandler {
 
     async fn fetch_component_specs(&self, slug: &str) -> Result<serde_json::Value, String> {
         let url = format!("{}/api/components/{}", self.api_url, slug);
-        let resp = self.http_client.get(&url).send().await
+        let resp = self
+            .http_client
+            .get(&url)
+            .send()
+            .await
             .map_err(|e| format!("HTTP request failed: {e}"))?;
 
         if !resp.status().is_success() {
             return Err(format!("API returned {}", resp.status()));
         }
 
-        let body: serde_json::Value = resp.json().await
+        let body: serde_json::Value = resp
+            .json()
+            .await
             .map_err(|e| format!("Failed to parse response: {e}"))?;
 
         body.get("specs")
@@ -993,14 +1047,14 @@ fn build_sensors_config(
     profiles: &hitl_physics::build::SensorProfiles,
     gps_profile: Option<&hitl_physics::build::GpsProfile>,
 ) -> hitl_sensors::SensorsConfig {
-    use hitl_sensors::{ImuConfig, GpsConfig, BaroConfig, MagConfig, SensorsConfig};
+    use hitl_sensors::{BaroConfig, GpsConfig, ImuConfig, MagConfig, SensorsConfig};
 
     let imu = ImuConfig {
         gyro_noise_density: profiles.imu.gyro_noise_density,
         accel_noise_density: profiles.imu.accel_noise_density,
-        gyro_bias_sigma: 0.0,   // CRITICAL: no drift in HITL
+        gyro_bias_sigma: 0.0, // CRITICAL: no drift in HITL
         gyro_bias_tau: 1000.0,
-        accel_bias_sigma: 0.0,  // CRITICAL: no drift in HITL
+        accel_bias_sigma: 0.0, // CRITICAL: no drift in HITL
         accel_bias_tau: 1000.0,
     };
 
@@ -1041,7 +1095,12 @@ fn build_sensors_config(
         MagConfig::default()
     };
 
-    SensorsConfig { imu, gps, baro, mag }
+    SensorsConfig {
+        imu,
+        gps,
+        baro,
+        mag,
+    }
 }
 
 #[cfg(test)]
@@ -1081,7 +1140,8 @@ mod tests {
         mav_tx: Option<Sender<MavMessage>>,
         param_value_tx: Option<broadcast::Sender<(String, f32)>>,
     ) -> BuildConfigHandler {
-        let (config_tx, _config_rx) = bounded::<(PhysicsConfig, BatteryConfig, hitl_sensors::SensorsConfig)>(4);
+        let (config_tx, _config_rx) =
+            bounded::<(PhysicsConfig, BatteryConfig, hitl_sensors::SensorsConfig)>(4);
         BuildConfigHandler::new(config_tx, None, mav_tx, param_value_tx)
     }
 
@@ -1107,7 +1167,10 @@ mod tests {
     fn spawn_fake_px4_with_capture(
         mav_rx: crossbeam_channel::Receiver<MavMessage>,
         param_value_tx: broadcast::Sender<(String, f32)>,
-    ) -> (tokio::task::JoinHandle<()>, std::sync::Arc<Mutex<Vec<CapturedMsg>>>) {
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        std::sync::Arc<Mutex<Vec<CapturedMsg>>>,
+    ) {
         let captured = std::sync::Arc::new(Mutex::new(Vec::<CapturedMsg>::new()));
         let captured_clone = captured.clone();
         let handle = tokio::task::spawn_blocking(move || {
@@ -1266,10 +1329,13 @@ mod tests {
             .iter()
             .filter(|m| matches!(m, CapturedMsg::ParamSet(_, _)))
             .count();
-        let saw_storage_write = snapshot.iter().any(|m| {
-            matches!(m, CapturedMsg::CommandLong(c) if *c == MAV_CMD_PREFLIGHT_STORAGE)
-        });
-        assert_eq!(param_sets, 21, "expected 21 PARAM_SETs (15 PID/thrust + 6 cal offsets)");
+        let saw_storage_write = snapshot
+            .iter()
+            .any(|m| matches!(m, CapturedMsg::CommandLong(c) if *c == MAV_CMD_PREFLIGHT_STORAGE));
+        assert_eq!(
+            param_sets, 21,
+            "expected 21 PARAM_SETs (15 PID/thrust + 6 cal offsets)"
+        );
         assert!(
             saw_storage_write,
             "expected MAV_CMD_PREFLIGHT_STORAGE (245) after the PARAM_SETs — \

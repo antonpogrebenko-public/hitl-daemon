@@ -1,6 +1,8 @@
 //! MAVLink encode/decode with sequence tracking
 
-use mavlink::{ardupilotmega::MavMessage, peek_reader::PeekReader, MavFrame, MavHeader, MAV_STX_V2};
+use mavlink::{
+    ardupilotmega::MavMessage, peek_reader::PeekReader, MavFrame, MavHeader, MAV_STX_V2,
+};
 use std::io::{Read, Write};
 use thiserror::Error;
 use tracing::{debug, trace};

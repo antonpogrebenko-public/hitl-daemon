@@ -5,13 +5,13 @@
 
 use clap::Parser;
 use crossbeam_channel::{bounded, Receiver, Sender};
-use mavlink::ardupilotmega::MavMessage;
-use mavlink_io::async_io::{MavlinkIo, NshRequest, reconnect_delay};
-use mavlink_io::serial::find_pixhawk_ports;
-use protocol::{ActuatorOutputs, DaemonState, DaemonStatus};
 use hitl_physics::{throttle_to_omega_with_config, PhysicsConfig};
 use hitl_sensors::{ImuConfig, SensorsConfig};
-use simulation::{SimulationConfig, SimulationLoop, SimulationState};
+use mavlink::ardupilotmega::MavMessage;
+use mavlink_io::async_io::{reconnect_delay, MavlinkIo, NshRequest};
+use mavlink_io::serial::find_pixhawk_ports;
+use protocol::{ActuatorOutputs, DaemonState, DaemonStatus};
+use simulation::{SimulationConfig, SimulationLoop, SimulationState, TerrainCache};
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -21,7 +21,10 @@ use tokio::sync::watch;
 use tracing::{debug, error, info, trace, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use websocket::{CommandType, ConnectionStatus, StateUpdate, ValidatedNshCommand, VehicleMessage, WebSocketServer, WebSocketServerConfig};
+use websocket::{
+    CommandType, ConnectionStatus, StateUpdate, ValidatedNshCommand, VehicleMessage,
+    WebSocketServer, WebSocketServerConfig,
+};
 
 mod tui;
 
@@ -72,13 +75,19 @@ struct Args {
     #[arg(long)]
     log_file: Option<String>,
 
+    /// Terrain tiles URL for ground collision (e.g. https://th3seus-terrain.s3.amazonaws.com/tiles)
+    #[arg(long)]
+    terrain_url: Option<String>,
+
     /// UDP port for QGroundControl bridge (0 to disable)
     #[arg(long, default_value = "14550")]
     qgc_udp: u16,
 }
 
 enum TracingMode {
-    Tui { log_rx: std::sync::mpsc::Receiver<String> },
+    Tui {
+        log_rx: std::sync::mpsc::Receiver<String>,
+    },
     Plain,
 }
 
@@ -173,7 +182,11 @@ fn spawn_simulation_thread(
     actuator_rx: Receiver<ActuatorOutputs>,
     mav_tx: Sender<MavMessage>,
     _shutdown: Arc<AtomicBool>,
-    config_rx: Receiver<(PhysicsConfig, hitl_physics::BatteryConfig, hitl_sensors::SensorsConfig)>,
+    config_rx: Receiver<(
+        PhysicsConfig,
+        hitl_physics::BatteryConfig,
+        hitl_sensors::SensorsConfig,
+    )>,
     sim_stats_tx: tokio::sync::watch::Sender<protocol::SimulationStats>,
 ) -> (thread::JoinHandle<()>, SimulationState) {
     let mut sim_loop = SimulationLoop::new(config, actuator_rx, config_rx, mav_tx)
@@ -220,7 +233,9 @@ fn spawn_sim_only_actuator_thread(
 
                     // Auto-recharge after AUTO_RECHARGE_TICKS ticks (~3 s)
                     if tick - depleted_tick >= AUTO_RECHARGE_TICKS {
-                        info!("sim-only: battery depleted — auto-recharging for continued simulation");
+                        info!(
+                            "sim-only: battery depleted — auto-recharging for continued simulation"
+                        );
                         sim_state.recharge_battery();
                         depleted_since = None;
                     }
@@ -268,8 +283,16 @@ fn create_state_update(sim_state: &SimulationState, packets_per_sec: u16) -> Sta
 
     StateUpdate {
         timestamp_us: state.sim_time_us,
-        position_ned: [q.position[0] as f32, q.position[1] as f32, q.position[2] as f32],
-        velocity_ned: [q.velocity[0] as f32, q.velocity[1] as f32, q.velocity[2] as f32],
+        position_ned: [
+            q.position[0] as f32,
+            q.position[1] as f32,
+            q.position[2] as f32,
+        ],
+        velocity_ned: [
+            q.velocity[0] as f32,
+            q.velocity[1] as f32,
+            q.velocity[2] as f32,
+        ],
         quaternion_wxyz: [
             q.quaternion.w as f32,
             q.quaternion.i as f32,
@@ -327,24 +350,41 @@ async fn main() {
     // Use realistic noise levels but disable bias DRIFT (which causes "High Gyro Bias")
     let clean_sensors = SensorsConfig {
         imu: ImuConfig {
-            gyro_noise_density: 0.0008,   // Default: realistic noise level
-            accel_noise_density: 0.006,   // Default: realistic noise level
-            gyro_bias_sigma: 0.0,         // CRITICAL: No bias drift in HITL
-            gyro_bias_tau: 1000.0,        // Long time constant (unused since sigma=0)
-            accel_bias_sigma: 0.0,        // No accel bias drift for HITL — gives EKF clean data
-            accel_bias_tau: 1000.0,       // Long time constant, effectively disabled
+            gyro_noise_density: 0.0008, // Default: realistic noise level
+            accel_noise_density: 0.006, // Default: realistic noise level
+            gyro_bias_sigma: 0.0,       // CRITICAL: No bias drift in HITL
+            gyro_bias_tau: 1000.0,      // Long time constant (unused since sigma=0)
+            accel_bias_sigma: 0.0,      // No accel bias drift for HITL — gives EKF clean data
+            accel_bias_tau: 1000.0,     // Long time constant, effectively disabled
         },
         baro: hitl_sensors::BaroConfig::default(),
         gps: hitl_sensors::GpsConfig {
-            position_drift_tau: 1000.0,      // Very slow drift
-            position_drift_sigma: 0.0,       // No position drift for HITL
-            horizontal_noise_sigma: 0.1,     // 10cm noise - tight for HITL
-            altitude_noise_sigma: 0.3,       // 30cm altitude noise
-            velocity_noise_sigma: 0.05,      // 5cm/s velocity noise
-            delay_ms: 80.0,                  // Moderate delay
-            update_rate_hz: 10.0,            // 10 Hz GPS
+            position_drift_tau: 1000.0,  // Very slow drift
+            position_drift_sigma: 0.0,   // No position drift for HITL
+            horizontal_noise_sigma: 0.1, // 10cm noise - tight for HITL
+            altitude_noise_sigma: 0.3,   // 30cm altitude noise
+            velocity_noise_sigma: 0.05,  // 5cm/s velocity noise
+            delay_ms: 80.0,              // Moderate delay
+            update_rate_hz: 10.0,        // 10 Hz GPS
         },
         mag: hitl_sensors::MagConfig::default(),
+    };
+
+    // Load terrain tiles if URL provided (blocking - must complete before sim starts)
+    let terrain_cache = if let Some(ref url) = args.terrain_url {
+        let cache = Arc::new(TerrainCache::new());
+        let lat = args.reference_lat;
+        let lon = args.reference_lon;
+        let alt = args.reference_alt;
+        if cache.load(url, lat, lon, alt).await {
+            info!("Terrain loaded for ground collision detection");
+            Some(cache)
+        } else {
+            warn!("Failed to load terrain - using flat ground at Z=0");
+            None
+        }
+    } else {
+        None
     };
 
     let sim_config = SimulationConfig {
@@ -354,6 +394,7 @@ async fn main() {
         tick_rate_hz: args.tick_rate,
         gps_rate_hz: args.gps_rate,
         sensors: clean_sensors,
+        terrain: terrain_cache,
         ..Default::default()
     };
 
@@ -376,7 +417,11 @@ async fn main() {
     // build_config_tx/rx: WebSocket -> Simulation (PhysicsConfig + BatteryConfig + SensorsConfig)
     let (actuator_tx, actuator_rx) = bounded::<ActuatorOutputs>(16);
     let (sim_mav_tx, sim_mav_rx) = bounded::<MavMessage>(512);
-    let (build_config_tx, build_config_rx) = bounded::<(PhysicsConfig, hitl_physics::BatteryConfig, hitl_sensors::SensorsConfig)>(1);
+    let (build_config_tx, build_config_rx) = bounded::<(
+        PhysicsConfig,
+        hitl_physics::BatteryConfig,
+        hitl_sensors::SensorsConfig,
+    )>(1);
 
     // Shutdown signal
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -396,8 +441,7 @@ async fn main() {
     // a live snapshot of tick rate, position, motor RPMs, battery, etc.
     // Moves the per-window `info!` log out of the scrolling log area and
     // into the TUI header so the log stream stays readable.
-    let (sim_stats_tx, sim_stats_rx) =
-        watch::channel(protocol::SimulationStats::default());
+    let (sim_stats_tx, sim_stats_rx) = watch::channel(protocol::SimulationStats::default());
 
     // Spawn TUI thread if in TUI mode
     let tui_handle = match tracing_mode {
@@ -418,7 +462,11 @@ async fn main() {
     // Clone the MAVLink output for the WebSocket build-config handler so it
     // can push Phase 6 per-build PIDs via PARAM_SET. In --sim-only mode there
     // is no PX4 attached, so the param push is pointless and we pass None.
-    let build_config_mav_tx = if sim_only_mode { None } else { Some(sim_mav_tx.clone()) };
+    let build_config_mav_tx = if sim_only_mode {
+        None
+    } else {
+        Some(sim_mav_tx.clone())
+    };
 
     // Capture reference_alt before moving sim_config
     let terrain_reference_alt = sim_config.reference_alt as f32;
@@ -445,7 +493,10 @@ async fn main() {
         match UdpSocket::bind(format!("0.0.0.0:{}", qgc_local_port)) {
             Ok(socket) => {
                 socket.set_nonblocking(true).ok();
-                info!("QGC UDP bridge: local port {} ↔ QGC port {}", qgc_local_port, args.qgc_udp);
+                info!(
+                    "QGC UDP bridge: local port {} ↔ QGC port {}",
+                    qgc_local_port, args.qgc_udp
+                );
                 Some(Arc::new(socket))
             }
             Err(e) => {
@@ -461,12 +512,17 @@ async fn main() {
     let (nsh_cmd_tx, mut nsh_cmd_rx) = tokio::sync::mpsc::channel::<ValidatedNshCommand>(4);
 
     // Shared MAVLink I/O - can be updated by connection manager
-    let mav_io: Arc<tokio::sync::RwLock<Option<Arc<MavlinkIo>>>> = Arc::new(tokio::sync::RwLock::new(None));
+    let mav_io: Arc<tokio::sync::RwLock<Option<Arc<MavlinkIo>>>> =
+        Arc::new(tokio::sync::RwLock::new(None));
 
     // In sim-only mode, always generate fake actuator commands
     // In normal mode, fake actuators run until FC connects
     if sim_only_mode {
-        let handle = spawn_sim_only_actuator_thread(actuator_tx.clone(), shutdown.clone(), sim_state.clone());
+        let handle = spawn_sim_only_actuator_thread(
+            actuator_tx.clone(),
+            shutdown.clone(),
+            sim_state.clone(),
+        );
         thread_handles.push(handle);
     }
 
@@ -487,8 +543,7 @@ async fn main() {
     // was actually applied before signalling the simulation "ready" stage.
     // Capacity is generous because PX4 may emit unrelated PARAM_VALUE traffic
     // during the wait window (e.g. QGC parameter pull).
-    let (param_value_tx, _) =
-        tokio::sync::broadcast::channel::<(String, f32)>(256);
+    let (param_value_tx, _) = tokio::sync::broadcast::channel::<(String, f32)>(256);
 
     // Create WebSocket server
     let ws_config = WebSocketServerConfig {
@@ -502,8 +557,16 @@ async fn main() {
 
     // Set up build config handler to send PhysicsConfig updates to simulation
     // Pass NSH sender so it can restart EKF2 after config changes (clone before moving to ws_server)
-    let nsh_tx_for_config = if sim_only_mode { None } else { Some(nsh_cmd_tx.clone()) };
-    let build_config_param_value_tx = if sim_only_mode { None } else { Some(param_value_tx.clone()) };
+    let nsh_tx_for_config = if sim_only_mode {
+        None
+    } else {
+        Some(nsh_cmd_tx.clone())
+    };
+    let build_config_param_value_tx = if sim_only_mode {
+        None
+    } else {
+        Some(param_value_tx.clone())
+    };
     let build_config_handler = std::sync::Arc::new(websocket::BuildConfigHandler::new(
         build_config_tx,
         nsh_tx_for_config,
@@ -535,7 +598,9 @@ async fn main() {
     let ws_shutdown = ws_server.shutdown_signal();
 
     // Spawn WebSocket server task
-    let serial_port_label = initial_port.clone().unwrap_or_else(|| "scanning".to_string());
+    let serial_port_label = initial_port
+        .clone()
+        .unwrap_or_else(|| "scanning".to_string());
     let ws_handle = tokio::spawn(async move {
         let version_parts: Vec<u8> = VERSION
             .split('.')
@@ -546,7 +611,15 @@ async fn main() {
         let version_minor = version_parts.get(1).copied().unwrap_or(1);
         let version_patch = version_parts.get(2).copied().unwrap_or(0);
 
-        if let Err(e) = ws_server.run(version_major, version_minor, version_patch, serial_port_label).await {
+        if let Err(e) = ws_server
+            .run(
+                version_major,
+                version_minor,
+                version_patch,
+                serial_port_label,
+            )
+            .await
+        {
             error!("WebSocket server error: {}", e);
         }
     });
@@ -565,7 +638,8 @@ async fn main() {
     });
 
     // Shared FC model (set once when HEARTBEAT identifies the FC)
-    let fc_model: Arc<tokio::sync::RwLock<Option<String>>> = Arc::new(tokio::sync::RwLock::new(None));
+    let fc_model: Arc<tokio::sync::RwLock<Option<String>>> =
+        Arc::new(tokio::sync::RwLock::new(None));
 
     // Shared packets_per_sec (updated every second by status task)
     let packets_per_sec_shared = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -647,7 +721,11 @@ async fn main() {
 
             // Drain connection status updates
             while let Ok(cs) = conn_status_rx.try_recv() {
-                current_serial_port = if cs.serial_port.is_empty() { None } else { Some(cs.serial_port) };
+                current_serial_port = if cs.serial_port.is_empty() {
+                    None
+                } else {
+                    Some(cs.serial_port)
+                };
                 is_reconnecting = cs.reconnecting;
             }
 
@@ -670,7 +748,10 @@ async fn main() {
                     if total > 0 {
                         let quality = (successes * 100) / total;
                         if quality < 95 {
-                            warn!(quality_pct = quality, failures, "Serial link quality degraded — check USB cable");
+                            warn!(
+                                quality_pct = quality,
+                                failures, "Serial link quality degraded — check USB cable"
+                            );
                         }
                     }
                 }
@@ -730,7 +811,11 @@ async fn main() {
                 // Refresh cached mav_io reference
                 {
                     let guard = mav_io_nsh.read().await;
-                    if cached_mav_io.as_ref().map(|m| m.is_disconnected()).unwrap_or(true) {
+                    if cached_mav_io
+                        .as_ref()
+                        .map(|m| m.is_disconnected())
+                        .unwrap_or(true)
+                    {
                         cached_mav_io = guard.clone();
                     }
                 }
@@ -908,7 +993,10 @@ async fn main() {
                 }
 
                 // Check if we have an active connection
-                let is_connected = current_mav_io.as_ref().map(|m| !m.is_disconnected()).unwrap_or(false);
+                let is_connected = current_mav_io
+                    .as_ref()
+                    .map(|m| !m.is_disconnected())
+                    .unwrap_or(false);
 
                 if is_connected {
                     // Connection is alive, just check periodically
@@ -933,7 +1021,9 @@ async fn main() {
                         let _ = tokio::time::timeout(Duration::from_secs(1), h).await;
                     }
 
-                    if retry_count < 255 { retry_count += 1; }
+                    if retry_count < 255 {
+                        retry_count += 1;
+                    }
 
                     let is_bootloader = bootloader_suspected.load(Ordering::SeqCst);
                     let _ = conn_status_tx_reconnect.send(ConnectionStatus {
@@ -973,7 +1063,11 @@ async fn main() {
                 let Some(port_path) = port_path else {
                     // No FC found, wait and retry
                     let delay = reconnect_delay(retry_count);
-                    debug!(retry_count, delay_ms = delay.as_millis(), "No FC found, waiting...");
+                    debug!(
+                        retry_count,
+                        delay_ms = delay.as_millis(),
+                        "No FC found, waiting..."
+                    );
 
                     let _ = conn_status_tx_reconnect.send(ConnectionStatus {
                         connected: false,
@@ -985,16 +1079,29 @@ async fn main() {
                     });
 
                     tokio::time::sleep(delay).await;
-                    if retry_count < 255 { retry_count += 1; }
+                    if retry_count < 255 {
+                        retry_count += 1;
+                    }
                     continue;
                 };
 
                 info!(port = %port_path, "Found FC, connecting...");
 
                 // Create MAVLink I/O
-                let (mut new_mav_io, tx_to_app, rx_from_app, nsh_resp_tx, nsh_req_rx) = MavlinkIo::new();
+                let (mut new_mav_io, tx_to_app, rx_from_app, nsh_resp_tx, nsh_req_rx) =
+                    MavlinkIo::new();
 
-                match new_mav_io.spawn(&port_path, baud, tx_to_app, rx_from_app, nsh_resp_tx.clone(), nsh_req_rx).await {
+                match new_mav_io
+                    .spawn(
+                        &port_path,
+                        baud,
+                        tx_to_app,
+                        rx_from_app,
+                        nsh_resp_tx.clone(),
+                        nsh_req_rx,
+                    )
+                    .await
+                {
                     Ok(()) => {
                         info!(port = %port_path, "Connected to FC!");
                         let was_reconnect = retry_count > 0;
@@ -1053,7 +1160,9 @@ async fn main() {
                             let mut last_origin_lat: f64 = 0.0;
                             let mut last_origin_lon: f64 = 0.0;
                             loop {
-                                if shutdown_recv.load(Ordering::Relaxed) || mav_io_recv.is_disconnected() {
+                                if shutdown_recv.load(Ordering::Relaxed)
+                                    || mav_io_recv.is_disconnected()
+                                {
                                     break;
                                 }
 
@@ -1101,7 +1210,8 @@ async fn main() {
                                             .trim_end_matches('\0')
                                             .to_string();
                                         if !name.is_empty() {
-                                            let _ = param_value_tx_recv.send((name, pv.param_value));
+                                            let _ =
+                                                param_value_tx_recv.send((name, pv.param_value));
                                         }
                                     }
 
@@ -1113,7 +1223,8 @@ async fn main() {
                                             .to_string();
                                         if !text.is_empty() {
                                             let severity = status.severity as u8;
-                                            let timestamp_ms = start_time.elapsed().as_millis() as u32;
+                                            let timestamp_ms =
+                                                start_time.elapsed().as_millis() as u32;
                                             debug!(severity = severity, text = %text, "STATUSTEXT received");
                                             let _ = vehicle_msg_tx_recv.send(VehicleMessage {
                                                 severity,
@@ -1137,26 +1248,42 @@ async fn main() {
                                         if model.is_none() {
                                             if hb.autopilot != MavAutopilot::MAV_AUTOPILOT_INVALID {
                                                 let name = match hb.autopilot {
-                                                    MavAutopilot::MAV_AUTOPILOT_PX4 => match hb.mavtype {
-                                                        MavType::MAV_TYPE_QUADROTOR => "PX4 Quadrotor",
-                                                        MavType::MAV_TYPE_HEXAROTOR => "PX4 Hexarotor",
-                                                        MavType::MAV_TYPE_OCTOROTOR => "PX4 Octorotor",
-                                                        MavType::MAV_TYPE_FIXED_WING => "PX4 Fixed Wing",
-                                                        _ => "PX4 Vehicle",
-                                                    },
-                                                    MavAutopilot::MAV_AUTOPILOT_ARDUPILOTMEGA => "ArduPilot",
+                                                    MavAutopilot::MAV_AUTOPILOT_PX4 => {
+                                                        match hb.mavtype {
+                                                            MavType::MAV_TYPE_QUADROTOR => {
+                                                                "PX4 Quadrotor"
+                                                            }
+                                                            MavType::MAV_TYPE_HEXAROTOR => {
+                                                                "PX4 Hexarotor"
+                                                            }
+                                                            MavType::MAV_TYPE_OCTOROTOR => {
+                                                                "PX4 Octorotor"
+                                                            }
+                                                            MavType::MAV_TYPE_FIXED_WING => {
+                                                                "PX4 Fixed Wing"
+                                                            }
+                                                            _ => "PX4 Vehicle",
+                                                        }
+                                                    }
+                                                    MavAutopilot::MAV_AUTOPILOT_ARDUPILOTMEGA => {
+                                                        "ArduPilot"
+                                                    }
                                                     _ => "Unknown FC",
                                                 };
-                                                info!(fc_model = name, "Flight controller identified");
+                                                info!(
+                                                    fc_model = name,
+                                                    "Flight controller identified"
+                                                );
                                                 *model = Some(name.to_string());
-                                                let _ = conn_status_tx_recv.send(ConnectionStatus {
-                                                    connected: true,
-                                                    reconnecting: false,
-                                                    retry_count: 0,
-                                                    serial_port: port_path_recv.clone(),
-                                                    fc_model: Some(name.to_string()),
-                                                    bootloader_suspected: false,
-                                                });
+                                                let _ =
+                                                    conn_status_tx_recv.send(ConnectionStatus {
+                                                        connected: true,
+                                                        reconnecting: false,
+                                                        retry_count: 0,
+                                                        serial_port: port_path_recv.clone(),
+                                                        fc_model: Some(name.to_string()),
+                                                        bootloader_suspected: false,
+                                                    });
                                             }
                                         }
                                     }
@@ -1164,33 +1291,34 @@ async fn main() {
                                     // Extract terrain origin from GPS messages.
                                     // Priority: GpsGlobalOrigin > HomePosition > GlobalPositionInt.
                                     // Only upgrade source or re-emit if position moved >1m.
-                                    let candidate: Option<(f64, f64, f32, protocol::OriginSource)> = match &msg {
-                                        MavMessage::GPS_GLOBAL_ORIGIN(d) => Some((
-                                            d.latitude as f64 / 1e7,
-                                            d.longitude as f64 / 1e7,
-                                            d.altitude as f32 / 1000.0,
-                                            protocol::OriginSource::GpsGlobalOrigin,
-                                        )),
-                                        MavMessage::HOME_POSITION(d) => Some((
-                                            d.latitude as f64 / 1e7,
-                                            d.longitude as f64 / 1e7,
-                                            d.altitude as f32 / 1000.0,
-                                            protocol::OriginSource::HomePosition,
-                                        )),
-                                        MavMessage::GLOBAL_POSITION_INT(d) => {
-                                            if best_origin_source.is_none() {
-                                                Some((
-                                                    d.lat as f64 / 1e7,
-                                                    d.lon as f64 / 1e7,
-                                                    d.alt as f32 / 1000.0,
-                                                    protocol::OriginSource::GlobalPositionInt,
-                                                ))
-                                            } else {
-                                                None
+                                    let candidate: Option<(f64, f64, f32, protocol::OriginSource)> =
+                                        match &msg {
+                                            MavMessage::GPS_GLOBAL_ORIGIN(d) => Some((
+                                                d.latitude as f64 / 1e7,
+                                                d.longitude as f64 / 1e7,
+                                                d.altitude as f32 / 1000.0,
+                                                protocol::OriginSource::GpsGlobalOrigin,
+                                            )),
+                                            MavMessage::HOME_POSITION(d) => Some((
+                                                d.latitude as f64 / 1e7,
+                                                d.longitude as f64 / 1e7,
+                                                d.altitude as f32 / 1000.0,
+                                                protocol::OriginSource::HomePosition,
+                                            )),
+                                            MavMessage::GLOBAL_POSITION_INT(d) => {
+                                                if best_origin_source.is_none() {
+                                                    Some((
+                                                        d.lat as f64 / 1e7,
+                                                        d.lon as f64 / 1e7,
+                                                        d.alt as f32 / 1000.0,
+                                                        protocol::OriginSource::GlobalPositionInt,
+                                                    ))
+                                                } else {
+                                                    None
+                                                }
                                             }
-                                        }
-                                        _ => None,
-                                    };
+                                            _ => None,
+                                        };
 
                                     if let Some((lat, lon, alt, source)) = candidate {
                                         let dominated = best_origin_source
@@ -1198,7 +1326,8 @@ async fn main() {
                                             .unwrap_or(false);
                                         if !dominated {
                                             let dlat = (lat - last_origin_lat) * 111_320.0;
-                                            let dlon = (lon - last_origin_lon) * 111_320.0
+                                            let dlon = (lon - last_origin_lon)
+                                                * 111_320.0
                                                 * (lat.to_radians().cos());
                                             let moved = (dlat * dlat + dlon * dlon).sqrt() > 1.0;
                                             let upgraded = best_origin_source
@@ -1242,7 +1371,8 @@ async fn main() {
                             info!("MAVLink sender task started");
 
                             // Bridge crossbeam → tokio mpsc so we can use select!
-                            let (sim_tx, mut sim_rx) = tokio::sync::mpsc::channel::<MavMessage>(128);
+                            let (sim_tx, mut sim_rx) =
+                                tokio::sync::mpsc::channel::<MavMessage>(128);
                             let bridge_shutdown = shutdown_send.clone();
                             let bridge_rx = sim_mav_rx_send.clone();
                             let bridge_handle = tokio::task::spawn_blocking(move || {
@@ -1253,8 +1383,12 @@ async fn main() {
                                                 break;
                                             }
                                         }
-                                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                                            continue
+                                        }
+                                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                                            break
+                                        }
                                     }
                                 }
                             });
@@ -1269,7 +1403,9 @@ async fn main() {
                             let mut qgc_recv_buf = [0u8; 280];
 
                             loop {
-                                if shutdown_send.load(Ordering::Relaxed) || mav_io_send.is_disconnected() {
+                                if shutdown_send.load(Ordering::Relaxed)
+                                    || mav_io_send.is_disconnected()
+                                {
                                     break;
                                 }
 
@@ -1326,7 +1462,9 @@ async fn main() {
 
                         let delay = reconnect_delay(retry_count);
                         tokio::time::sleep(delay).await;
-                        if retry_count < 255 { retry_count += 1; }
+                        if retry_count < 255 {
+                            retry_count += 1;
+                        }
                     }
                 }
             }

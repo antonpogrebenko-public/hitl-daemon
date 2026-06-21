@@ -8,3 +8,4 @@ pub mod state;
 
 pub use loop_runner::{SimulationLoop, SimulationStats};
 pub use state::{SimulationConfig, SimulationState};
+pub use terrain::TerrainCache;

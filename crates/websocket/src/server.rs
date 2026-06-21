@@ -127,22 +127,34 @@ impl WebSocketServer {
     }
 
     /// Set the NSH response receiver (for broadcasting responses to clients)
-    pub fn set_nsh_response_receiver(&mut self, nsh_resp_rx: broadcast::Receiver<crate::protocol::NshResponse>) {
+    pub fn set_nsh_response_receiver(
+        &mut self,
+        nsh_resp_rx: broadcast::Receiver<crate::protocol::NshResponse>,
+    ) {
         self.nsh_resp_rx = Some(nsh_resp_rx);
     }
 
     /// Set the connection status receiver (for broadcasting status to clients)
-    pub fn set_connection_status_receiver(&mut self, conn_status_rx: broadcast::Receiver<ConnectionStatus>) {
+    pub fn set_connection_status_receiver(
+        &mut self,
+        conn_status_rx: broadcast::Receiver<ConnectionStatus>,
+    ) {
         self.conn_status_rx = Some(conn_status_rx);
     }
 
     /// Set the vehicle message receiver (for broadcasting STATUSTEXT messages to clients)
-    pub fn set_vehicle_message_receiver(&mut self, vehicle_msg_rx: broadcast::Receiver<VehicleMessage>) {
+    pub fn set_vehicle_message_receiver(
+        &mut self,
+        vehicle_msg_rx: broadcast::Receiver<VehicleMessage>,
+    ) {
         self.vehicle_msg_rx = Some(vehicle_msg_rx);
     }
 
     /// Set the terrain origin receiver (for broadcasting to clients)
-    pub fn set_terrain_origin_receiver(&mut self, terrain_origin_rx: broadcast::Receiver<crate::protocol::TerrainOrigin>) {
+    pub fn set_terrain_origin_receiver(
+        &mut self,
+        terrain_origin_rx: broadcast::Receiver<crate::protocol::TerrainOrigin>,
+    ) {
         self.terrain_origin_rx = Some(terrain_origin_rx);
     }
 
@@ -205,7 +217,9 @@ impl WebSocketServer {
                     let mut rx = rx;
                     loop {
                         match rx.recv().await {
-                            Ok(msg) => { let _ = tx_clone.send(msg); }
+                            Ok(msg) => {
+                                let _ = tx_clone.send(msg);
+                            }
                             Err(broadcast::error::RecvError::Closed) => break,
                             Err(broadcast::error::RecvError::Lagged(_)) => continue,
                         }
@@ -303,8 +317,9 @@ impl WebSocketServer {
 
         // Create terrain origin broadcast sender if we have a receiver.
         // Also cache the latest value so late-joining clients receive it.
-        let terrain_origin_latest: Arc<tokio::sync::RwLock<Option<crate::protocol::TerrainOrigin>>> =
-            Arc::new(tokio::sync::RwLock::new(None));
+        let terrain_origin_latest: Arc<
+            tokio::sync::RwLock<Option<crate::protocol::TerrainOrigin>>,
+        > = Arc::new(tokio::sync::RwLock::new(None));
         let terrain_origin_tx = self.terrain_origin_rx.map(|rx| {
             let (tx, _) = broadcast::channel(4);
             let tx_clone = tx.clone();
@@ -348,7 +363,10 @@ impl WebSocketServer {
                 .allow_methods(Any)
                 .allow_headers(Any)
         } else {
-            let origins: Vec<_> = self.config.allowed_origins.iter()
+            let origins: Vec<_> = self
+                .config
+                .allowed_origins
+                .iter()
                 .filter_map(|o| o.parse().ok())
                 .collect();
             CorsLayer::new()
@@ -389,10 +407,7 @@ const PING_INTERVAL: Duration = Duration::from_secs(5);
 const PONG_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// WebSocket upgrade handler
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
     ws.max_message_size(MAX_INCOMING_MESSAGE_SIZE)
         .on_upgrade(|socket| handle_socket(socket, state))
 }

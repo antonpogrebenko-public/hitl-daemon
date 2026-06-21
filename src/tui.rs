@@ -148,7 +148,9 @@ fn run_tui_inner(
             let state_text_len = state_text.chars().count();
             let state_span = Span::styled(
                 state_text,
-                Style::default().fg(state_color).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(state_color)
+                    .add_modifier(Modifier::BOLD),
             );
             let line_state = row_styled(
                 "State",
@@ -161,7 +163,10 @@ fn run_tui_inner(
                 cell("Port", status.serial_port.as_deref().unwrap_or("none")),
                 cell(
                     "Clients",
-                    format!("{}  pkts {}/s", status.connected_clients, status.packets_per_sec),
+                    format!(
+                        "{}  pkts {}/s",
+                        status.connected_clients, status.packets_per_sec
+                    ),
                 ),
             );
 
@@ -184,7 +189,10 @@ fn run_tui_inner(
                 tick_text_len,
                 cell(
                     "Latency",
-                    format!("avg {} µs / max {} µs", sim.avg_latency_us, sim.max_latency_us),
+                    format!(
+                        "avg {} µs / max {} µs",
+                        sim.avg_latency_us, sim.max_latency_us
+                    ),
                 ),
             );
 
@@ -208,7 +216,10 @@ fn run_tui_inner(
                 "Armed",
                 arm_span,
                 arm_text_len,
-                cell("Mode", format!("{}    sim t  {:.1} s", sim.flight_mode, sim.sim_time_s)),
+                cell(
+                    "Mode",
+                    format!("{}    sim t  {:.1} s", sim.flight_mode, sim.sim_time_s),
+                ),
             );
 
             let line_pos = row(
@@ -254,12 +265,19 @@ fn run_tui_inner(
                 roll,
                 pitch,
                 yaw,
-                if phantom_tilt { "   ⚠ inverted on ground — reconfigure" } else { "" }
+                if phantom_tilt {
+                    "   ⚠ inverted on ground — reconfigure"
+                } else {
+                    ""
+                }
             );
-            let att_color = if phantom_tilt { Color::Red } else { Color::DarkGray };
+            let att_color = if phantom_tilt {
+                Color::Red
+            } else {
+                Color::DarkGray
+            };
             let att_text_len = att_text.chars().count();
-            let att_span =
-                Span::styled(att_text, Style::default().fg(att_color));
+            let att_span = Span::styled(att_text, Style::default().fg(att_color));
             let line_att = row_styled("Att", att_span, att_text_len, cell("", ""));
 
             // ── Battery + Build ───────────────────────────────────────
@@ -270,11 +288,18 @@ fn run_tui_inner(
             } else {
                 Color::Red
             };
-            let batt_text = format!("{:>5.2} V  {:>3.0}%", sim.battery_voltage, sim.battery_percent);
+            let batt_text = format!(
+                "{:>5.2} V  {:>3.0}%",
+                sim.battery_voltage, sim.battery_percent
+            );
             let batt_text_len = batt_text.chars().count();
             let batt_span = Span::styled(batt_text, Style::default().fg(batt_color));
             let build_value = if sim.build_configured {
-                format!("{:>5.0} g    TWR {:>4.2}", sim.mass_kg * 1000.0, sim.thrust_to_weight)
+                format!(
+                    "{:>5.0} g    TWR {:>4.2}",
+                    sim.mass_kg * 1000.0,
+                    sim.thrust_to_weight
+                )
             } else {
                 "not configured".to_string()
             };
@@ -343,9 +368,7 @@ fn run_tui_inner(
         // Poll for keyboard events (non-blocking with timeout)
         if event::poll(Duration::from_millis(TUI_REFRESH_MS))? {
             if let Event::Key(key) = event::read()? {
-                if key.code == KeyCode::Char('c')
-                    && key.modifiers.contains(KeyModifiers::CONTROL)
-                {
+                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                     shutdown.store(true, Ordering::SeqCst);
                     break;
                 }

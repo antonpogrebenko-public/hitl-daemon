@@ -8,6 +8,7 @@ description = "HITL simulation loop integrating physics and sensors"
 hitl-physics = { path = "../../../hitl-physics" }
 hitl-sensors = { path = "../../../hitl-sensors" }
 protocol = { path = "../protocol" }
+terrain = { path = "../terrain" }
 mavlink = { workspace = true }
 nalgebra = { workspace = true }
 crossbeam-channel = { workspace = true }

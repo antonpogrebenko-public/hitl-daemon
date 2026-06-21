@@ -24,13 +24,8 @@ const MAX_COMMANDS_PER_WINDOW: usize = 10;
 
 /// NSH commands that are blocked by default for safety.
 /// These can cause data loss or make the FC unresponsive.
-const BLOCKED_NSH_COMMANDS: &[&str] = &[
-    "shutdown",
-    "erase",
-    "format",
-    "hardfault_log",
-    "bl_update",
-];
+const BLOCKED_NSH_COMMANDS: &[&str] =
+    &["shutdown", "erase", "format", "hardfault_log", "bl_update"];
 
 /// Takeoff altitude bounds (meters)
 const MIN_TAKEOFF_ALTITUDE: f32 = 1.0;
@@ -224,7 +219,12 @@ impl ConnectionHandler {
 
         // Rate limiting check
         if let Err(e) = self.check_rate_limit(client_id).await {
-            warn!(client_id, request_id = nsh.request_id, "Rate limited: {}", e);
+            warn!(
+                client_id,
+                request_id = nsh.request_id,
+                "Rate limited: {}",
+                e
+            );
             return OutgoingMessage::NshResponse(NshResponse {
                 request_id: nsh.request_id,
                 success: false,
@@ -270,7 +270,11 @@ impl ConnectionHandler {
         let validated = ValidatedNshCommand {
             request_id: nsh.request_id,
             command: nsh.command.clone(),
-            timeout_ms: if nsh.timeout_ms == 0 { 2000 } else { nsh.timeout_ms },
+            timeout_ms: if nsh.timeout_ms == 0 {
+                2000
+            } else {
+                nsh.timeout_ms
+            },
             client_id,
         };
 
@@ -314,7 +318,12 @@ impl ConnectionHandler {
     async fn handle_command(&self, client_id: u64, cmd: Command) -> OutgoingMessage {
         // Rate limiting check
         if let Err(e) = self.check_rate_limit(client_id).await {
-            warn!(client_id, command_id = cmd.command_id, "Rate limited: {}", e);
+            warn!(
+                client_id,
+                command_id = cmd.command_id,
+                "Rate limited: {}",
+                e
+            );
             return OutgoingMessage::CommandAck(CommandAck {
                 command_id: cmd.command_id,
                 success: false,
@@ -345,7 +354,8 @@ impl ConnectionHandler {
             warn!(
                 client_id,
                 command_id = cmd.command_id,
-                "Invalid command: {}", e
+                "Invalid command: {}",
+                e
             );
             return OutgoingMessage::CommandAck(CommandAck {
                 command_id: cmd.command_id,
@@ -378,7 +388,8 @@ impl ConnectionHandler {
                 warn!(
                     client_id,
                     command_id = cmd.command_id,
-                    "Failed to forward command: {}", e
+                    "Failed to forward command: {}",
+                    e
                 );
                 OutgoingMessage::CommandAck(CommandAck {
                     command_id: cmd.command_id,
@@ -475,7 +486,8 @@ mod tests {
         drop(state_tx); // We don't need to send states in these tests
         let shutdown = Arc::new(AtomicBool::new(false));
 
-        let handler = ConnectionHandler::new(1, 0, 0, "/dev/test".to_string(), cmd_tx, state_rx, shutdown);
+        let handler =
+            ConnectionHandler::new(1, 0, 0, "/dev/test".to_string(), cmd_tx, state_rx, shutdown);
 
         (handler, cmd_rx)
     }

@@ -4,9 +4,10 @@ use hitl_physics::{BatteryConfig, BatteryState, PhysicsConfig, QuadrotorState};
 use hitl_sensors::{Sensors, SensorsConfig};
 use parking_lot::RwLock;
 use std::sync::Arc;
+use terrain::TerrainCache;
 
 /// Configuration for the simulation
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SimulationConfig {
     /// Physics configuration
     pub physics: PhysicsConfig,
@@ -24,6 +25,8 @@ pub struct SimulationConfig {
     pub tick_rate_hz: u32,
     /// GPS update rate (Hz)
     pub gps_rate_hz: u32,
+    /// Terrain cache for ground collision (optional)
+    pub terrain: Option<Arc<TerrainCache>>,
 }
 
 impl Default for SimulationConfig {
@@ -38,7 +41,24 @@ impl Default for SimulationConfig {
             reference_alt: 1655.0,
             tick_rate_hz: 400,
             gps_rate_hz: 5,
+            terrain: None,
         }
+    }
+}
+
+impl std::fmt::Debug for SimulationConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SimulationConfig")
+            .field("physics", &self.physics)
+            .field("battery", &self.battery)
+            .field("sensors", &self.sensors)
+            .field("reference_lat", &self.reference_lat)
+            .field("reference_lon", &self.reference_lon)
+            .field("reference_alt", &self.reference_alt)
+            .field("tick_rate_hz", &self.tick_rate_hz)
+            .field("gps_rate_hz", &self.gps_rate_hz)
+            .field("terrain", &self.terrain.as_ref().map(|t| t.is_loaded()))
+            .finish()
     }
 }
 

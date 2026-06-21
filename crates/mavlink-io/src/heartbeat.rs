@@ -6,7 +6,6 @@ use mavlink::ardupilotmega::{
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-
 /// Heartbeat timeout duration (5 seconds)
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -74,7 +73,10 @@ impl HeartbeatManager {
 
     /// Check if we're connected (received a recent heartbeat)
     pub fn is_connected(&self) -> bool {
-        matches!(self.state, ConnectionState::Connected | ConnectionState::Armed)
+        matches!(
+            self.state,
+            ConnectionState::Connected | ConnectionState::Armed
+        )
     }
 
     /// Check if the vehicle is armed
@@ -83,7 +85,12 @@ impl HeartbeatManager {
     }
 
     /// Process a received heartbeat message
-    pub fn on_heartbeat_received(&mut self, system_id: u8, component_id: u8, heartbeat: &HEARTBEAT_DATA) {
+    pub fn on_heartbeat_received(
+        &mut self,
+        system_id: u8,
+        component_id: u8,
+        heartbeat: &HEARTBEAT_DATA,
+    ) {
         let now = Instant::now();
         let was_disconnected = self.state == ConnectionState::Disconnected;
 
@@ -93,7 +100,9 @@ impl HeartbeatManager {
         self.last_base_mode = Some(heartbeat.base_mode);
 
         // Determine new state based on armed flag
-        let is_armed = heartbeat.base_mode.contains(MavModeFlag::MAV_MODE_FLAG_SAFETY_ARMED);
+        let is_armed = heartbeat
+            .base_mode
+            .contains(MavModeFlag::MAV_MODE_FLAG_SAFETY_ARMED);
         let new_state = if is_armed {
             ConnectionState::Armed
         } else {
