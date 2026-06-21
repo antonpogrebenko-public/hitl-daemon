@@ -420,6 +420,9 @@ async fn main() {
     // is no PX4 attached, so the param push is pointless and we pass None.
     let build_config_mav_tx = if sim_only_mode { None } else { Some(sim_mav_tx.clone()) };
 
+    // Capture reference_alt before moving sim_config
+    let terrain_reference_alt = sim_config.reference_alt as f32;
+
     // Spawn simulation thread
     let (sim_handle, sim_state) = spawn_simulation_thread(
         sim_config,
@@ -1034,6 +1037,7 @@ async fn main() {
                         let qgc_socket_recv = qgc_socket_reconnect.clone();
                         let vehicle_msg_tx_recv = vehicle_msg_tx.clone();
                         let terrain_origin_tx_recv = terrain_origin_tx.clone();
+                        let reference_alt_recv = terrain_reference_alt;
                         let fc_model_recv = fc_model_reconnect.clone();
                         let conn_status_tx_recv = conn_status_tx_reconnect.clone();
                         let param_value_tx_recv = param_value_tx_reconnect.clone();
@@ -1209,12 +1213,13 @@ async fn main() {
                                                     websocket::TerrainOrigin {
                                                         ref_lat: lat,
                                                         ref_lon: lon,
-                                                        ref_alt: alt,
+                                                        ref_alt: reference_alt_recv,
                                                         source: source as u8,
                                                     },
                                                 );
                                                 info!(
-                                                    lat, lon, alt,
+                                                    lat, lon,
+                                                    alt = reference_alt_recv,
                                                     source = ?source,
                                                     "Terrain origin updated"
                                                 );

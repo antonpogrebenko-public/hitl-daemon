@@ -5,6 +5,11 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.3] - 2026-06-21
+
+### Fixed
+- **TERRAIN_ORIGIN altitude now uses simulation reference_alt** — the alt field in TERRAIN_ORIGIN message now contains the simulation's MSL ground level (1655m for Boulder CO) instead of the GPS_GLOBAL_ORIGIN altitude (often 0 due to ellipsoid datum). Terrain in the 3D viewer now renders at the correct height relative to the drone.
+
 ## [0.9.2] - 2026-06-21
 
 ### Added
