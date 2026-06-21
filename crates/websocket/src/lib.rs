@@ -10,5 +10,5 @@ pub mod server;
 
 pub use build_config::BuildConfigHandler;
 pub use handler::{ConnectionHandler, ValidatedCommand, ValidatedNshCommand};
-pub use protocol::{Command, CommandType, ConnectionStatus, HandshakeAck, IncomingMessage, NshCommand, NshResponse, OutgoingMessage, StateUpdate, VehicleMessage};
+pub use protocol::{Command, CommandType, ConnectionStatus, HandshakeAck, IncomingMessage, NshCommand, NshResponse, OutgoingMessage, StateUpdate, TerrainOrigin, VehicleMessage};
 pub use server::{WebSocketServer, WebSocketServerConfig};

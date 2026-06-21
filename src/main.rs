@@ -476,6 +476,9 @@ async fn main() {
     // Broadcast channel for vehicle messages (STATUSTEXT from PX4)
     let (vehicle_msg_tx, _) = tokio::sync::broadcast::channel::<VehicleMessage>(64);
 
+    // Broadcast channel for terrain origin (GPS_GLOBAL_ORIGIN / HOME_POSITION / GLOBAL_POSITION_INT)
+    let (terrain_origin_tx, _) = tokio::sync::broadcast::channel::<websocket::TerrainOrigin>(4);
+
     // Broadcast channel for PARAM_VALUE acks from PX4. BuildConfigHandler
     // subscribes after pushing PARAM_SETs so it can verify each parameter
     // was actually applied before signalling the simulation "ready" stage.
@@ -521,6 +524,9 @@ async fn main() {
 
     // Always enable vehicle message broadcasting
     ws_server.set_vehicle_message_receiver(vehicle_msg_tx.subscribe());
+
+    // Enable terrain origin broadcasting
+    ws_server.set_terrain_origin_receiver(terrain_origin_tx.subscribe());
 
     // Get browser shutdown signal before ws_server is moved
     let ws_shutdown = ws_server.shutdown_signal();
@@ -1027,6 +1033,7 @@ async fn main() {
                         let actuator_tx_recv = actuator_tx_reconnect.clone();
                         let qgc_socket_recv = qgc_socket_reconnect.clone();
                         let vehicle_msg_tx_recv = vehicle_msg_tx.clone();
+                        let terrain_origin_tx_recv = terrain_origin_tx.clone();
                         let fc_model_recv = fc_model_reconnect.clone();
                         let conn_status_tx_recv = conn_status_tx_reconnect.clone();
                         let param_value_tx_recv = param_value_tx_reconnect.clone();
@@ -1038,6 +1045,9 @@ async fn main() {
                             info!("MAVLink receiver task started");
                             let heartbeat_timeout = Duration::from_secs(5);
                             let mut heartbeat_received = false;
+                            let mut best_origin_source: Option<protocol::OriginSource> = None;
+                            let mut last_origin_lat: f64 = 0.0;
+                            let mut last_origin_lon: f64 = 0.0;
                             loop {
                                 if shutdown_recv.load(Ordering::Relaxed) || mav_io_recv.is_disconnected() {
                                     break;
@@ -1143,6 +1153,71 @@ async fn main() {
                                                     fc_model: Some(name.to_string()),
                                                     bootloader_suspected: false,
                                                 });
+                                            }
+                                        }
+                                    }
+
+                                    // Extract terrain origin from GPS messages.
+                                    // Priority: GpsGlobalOrigin > HomePosition > GlobalPositionInt.
+                                    // Only upgrade source or re-emit if position moved >1m.
+                                    let candidate: Option<(f64, f64, f32, protocol::OriginSource)> = match &msg {
+                                        MavMessage::GPS_GLOBAL_ORIGIN(d) => Some((
+                                            d.latitude as f64 / 1e7,
+                                            d.longitude as f64 / 1e7,
+                                            d.altitude as f32 / 1000.0,
+                                            protocol::OriginSource::GpsGlobalOrigin,
+                                        )),
+                                        MavMessage::HOME_POSITION(d) => Some((
+                                            d.latitude as f64 / 1e7,
+                                            d.longitude as f64 / 1e7,
+                                            d.altitude as f32 / 1000.0,
+                                            protocol::OriginSource::HomePosition,
+                                        )),
+                                        MavMessage::GLOBAL_POSITION_INT(d) => {
+                                            if best_origin_source.is_none() {
+                                                Some((
+                                                    d.lat as f64 / 1e7,
+                                                    d.lon as f64 / 1e7,
+                                                    d.alt as f32 / 1000.0,
+                                                    protocol::OriginSource::GlobalPositionInt,
+                                                ))
+                                            } else {
+                                                None
+                                            }
+                                        }
+                                        _ => None,
+                                    };
+
+                                    if let Some((lat, lon, alt, source)) = candidate {
+                                        let dominated = best_origin_source
+                                            .map(|best| source < best)
+                                            .unwrap_or(false);
+                                        if !dominated {
+                                            let dlat = (lat - last_origin_lat) * 111_320.0;
+                                            let dlon = (lon - last_origin_lon) * 111_320.0
+                                                * (lat.to_radians().cos());
+                                            let moved = (dlat * dlat + dlon * dlon).sqrt() > 1.0;
+                                            let upgraded = best_origin_source
+                                                .map(|best| source > best)
+                                                .unwrap_or(true);
+
+                                            if upgraded || moved {
+                                                best_origin_source = Some(source);
+                                                last_origin_lat = lat;
+                                                last_origin_lon = lon;
+                                                let _ = terrain_origin_tx_recv.send(
+                                                    websocket::TerrainOrigin {
+                                                        ref_lat: lat,
+                                                        ref_lon: lon,
+                                                        ref_alt: alt,
+                                                        source: source as u8,
+                                                    },
+                                                );
+                                                info!(
+                                                    lat, lon, alt,
+                                                    source = ?source,
+                                                    "Terrain origin updated"
+                                                );
                                             }
                                         }
                                     }

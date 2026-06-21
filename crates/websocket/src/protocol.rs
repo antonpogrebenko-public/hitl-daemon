@@ -53,6 +53,7 @@ pub const MSG_TYPE_CONNECTION_STATUS: u8 = 0x05;
 pub const MSG_TYPE_VEHICLE_MESSAGE: u8 = 0x06;
 pub const MSG_TYPE_SHUTDOWN: u8 = 0x07;
 pub const MSG_TYPE_CONFIG_RESULT: u8 = 0x08;
+pub const MSG_TYPE_TERRAIN_ORIGIN: u8 = 0x09;
 pub const MSG_TYPE_COMMAND: u8 = 0x10;
 pub const MSG_TYPE_HANDSHAKE: u8 = 0x11;
 pub const MSG_TYPE_NSH_COMMAND: u8 = 0x12;
@@ -709,6 +710,37 @@ impl Command {
     }
 }
 
+/// Terrain origin sent to browser (event-driven, not periodic).
+///
+/// ## Binary format (0x09)
+/// - `[0]`: 0x09 message type
+/// - `[1-8]`: ref_lat (f64 LE, degrees WGS84)
+/// - `[9-16]`: ref_lon (f64 LE, degrees WGS84)
+/// - `[17-20]`: ref_alt (f32 LE, metres AMSL)
+/// - `[21]`: source (u8: 0=GlobalPositionInt, 1=HomePosition, 2=GpsGlobalOrigin)
+/// - Total: 22 bytes
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TerrainOrigin {
+    pub ref_lat: f64,
+    pub ref_lon: f64,
+    pub ref_alt: f32,
+    pub source: u8,
+}
+
+impl TerrainOrigin {
+    pub const SIZE: usize = 22;
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(Self::SIZE);
+        buf.push(MSG_TYPE_TERRAIN_ORIGIN);
+        buf.extend_from_slice(&self.ref_lat.to_le_bytes());
+        buf.extend_from_slice(&self.ref_lon.to_le_bytes());
+        buf.extend_from_slice(&self.ref_alt.to_le_bytes());
+        buf.push(self.source);
+        buf
+    }
+}
+
 /// All possible outgoing messages
 #[derive(Debug, Clone)]
 pub enum OutgoingMessage {
@@ -719,6 +751,7 @@ pub enum OutgoingMessage {
     ConnectionStatus(ConnectionStatus),
     VehicleMessage(VehicleMessage),
     ConfigResult(ConfigResult),
+    TerrainOrigin(TerrainOrigin),
 }
 
 impl OutgoingMessage {
@@ -731,6 +764,7 @@ impl OutgoingMessage {
             OutgoingMessage::ConnectionStatus(c) => c.to_bytes(),
             OutgoingMessage::VehicleMessage(v) => v.to_bytes(),
             OutgoingMessage::ConfigResult(r) => r.to_bytes(),
+            OutgoingMessage::TerrainOrigin(t) => t.to_bytes(),
         }
     }
 }

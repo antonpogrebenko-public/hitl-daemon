@@ -57,6 +57,10 @@ struct AppState {
     conn_status_tx: Option<broadcast::Sender<ConnectionStatus>>,
     /// Vehicle message sender for broadcasting to clients
     vehicle_msg_tx: Option<broadcast::Sender<VehicleMessage>>,
+    /// Terrain origin sender for broadcasting to clients
+    terrain_origin_tx: Option<broadcast::Sender<crate::protocol::TerrainOrigin>>,
+    /// Cached latest terrain origin (sent to late-joining clients)
+    terrain_origin_latest: Arc<tokio::sync::RwLock<Option<crate::protocol::TerrainOrigin>>>,
     /// System-initiated `ConfigResult` messages (e.g. from `repush_if_configured`
     /// on FC reconnect). Forwarded to all connected clients so the browser can
     /// display the spinner / ready state without requiring a manual re-configure.
@@ -80,6 +84,8 @@ pub struct WebSocketServer {
     conn_status_rx: Option<broadcast::Receiver<ConnectionStatus>>,
     /// Channel to receive vehicle messages (STATUSTEXT) for broadcasting to clients
     vehicle_msg_rx: Option<broadcast::Receiver<VehicleMessage>>,
+    /// Channel to receive terrain origin for broadcasting to clients
+    terrain_origin_rx: Option<broadcast::Receiver<crate::protocol::TerrainOrigin>>,
     /// Shutdown signal that browser can trigger
     shutdown_signal: Arc<AtomicBool>,
     /// Build configuration handler
@@ -103,6 +109,7 @@ impl WebSocketServer {
             nsh_resp_rx: None,
             conn_status_rx: None,
             vehicle_msg_rx: None,
+            terrain_origin_rx: None,
             shutdown_signal: Arc::new(AtomicBool::new(false)),
             build_config_handler: None,
             recharge_fn: None,
@@ -132,6 +139,11 @@ impl WebSocketServer {
     /// Set the vehicle message receiver (for broadcasting STATUSTEXT messages to clients)
     pub fn set_vehicle_message_receiver(&mut self, vehicle_msg_rx: broadcast::Receiver<VehicleMessage>) {
         self.vehicle_msg_rx = Some(vehicle_msg_rx);
+    }
+
+    /// Set the terrain origin receiver (for broadcasting to clients)
+    pub fn set_terrain_origin_receiver(&mut self, terrain_origin_rx: broadcast::Receiver<crate::protocol::TerrainOrigin>) {
+        self.terrain_origin_rx = Some(terrain_origin_rx);
     }
 
     /// Set the build configuration handler
@@ -289,12 +301,38 @@ impl WebSocketServer {
             tx
         });
 
+        // Create terrain origin broadcast sender if we have a receiver.
+        // Also cache the latest value so late-joining clients receive it.
+        let terrain_origin_latest: Arc<tokio::sync::RwLock<Option<crate::protocol::TerrainOrigin>>> =
+            Arc::new(tokio::sync::RwLock::new(None));
+        let terrain_origin_tx = self.terrain_origin_rx.map(|rx| {
+            let (tx, _) = broadcast::channel(4);
+            let tx_clone = tx.clone();
+            let cache = terrain_origin_latest.clone();
+            tokio::spawn(async move {
+                let mut rx = rx;
+                loop {
+                    match rx.recv().await {
+                        Ok(origin) => {
+                            *cache.write().await = Some(origin);
+                            let _ = tx_clone.send(origin);
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    }
+                }
+            });
+            tx
+        });
+
         let app_state = Arc::new(AppState {
             handler,
             update_interval,
             nsh_resp_tx,
             conn_status_tx,
             vehicle_msg_tx,
+            terrain_origin_tx,
+            terrain_origin_latest,
             system_config_tx,
         });
 
@@ -376,6 +414,15 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
     // Subscribe to vehicle messages if available
     let mut vehicle_msg_rx = state.vehicle_msg_tx.as_ref().map(|tx| tx.subscribe());
+
+    // Subscribe to terrain origin if available
+    let mut terrain_origin_rx = state.terrain_origin_tx.as_ref().map(|tx| tx.subscribe());
+
+    // Send cached terrain origin to late-joining client
+    if let Some(origin) = *state.terrain_origin_latest.read().await {
+        let msg = OutgoingMessage::TerrainOrigin(origin);
+        let _ = ws_sender.send(Message::Binary(msg.to_bytes().into())).await;
+    }
 
     // Subscribe to system-initiated config results (reconnect re-push) if available
     let mut system_config_rx = state.system_config_tx.as_ref().map(|tx| tx.subscribe());
@@ -501,6 +548,27 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         }
                         Err(broadcast::error::RecvError::Closed) => {
                             vehicle_msg_rx = None;
+                        }
+                    }
+                }
+                // Handle terrain origin updates (event-driven, rare)
+                result = async {
+                    match terrain_origin_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match result {
+                        Ok(origin) => {
+                            let msg = OutgoingMessage::TerrainOrigin(origin);
+                            let bytes = msg.to_bytes();
+                            if ws_sender.send(Message::Binary(bytes.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(broadcast::error::RecvError::Closed) => {
+                            terrain_origin_rx = None;
                         }
                     }
                 }

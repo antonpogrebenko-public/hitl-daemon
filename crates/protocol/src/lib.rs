@@ -231,6 +231,25 @@ impl ActuatorOutputs {
     }
 }
 
+/// Source of the terrain origin (EKF local-frame reference point).
+/// Higher variants are preferred over lower ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum OriginSource {
+    GlobalPositionInt = 0,
+    HomePosition = 1,
+    GpsGlobalOrigin = 2,
+}
+
+/// Real-world EKF local-frame origin forwarded from PX4.
+/// The viewer uses this to anchor terrain at the correct GPS location.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TerrainOrigin {
+    pub ref_lat: f64,
+    pub ref_lon: f64,
+    pub ref_alt: f32,
+    pub source: OriginSource,
+}
+
 // WebSocket message type constants — Outgoing
 pub const MSG_TYPE_STATE_UPDATE: u8 = 0x01;
 pub const MSG_TYPE_HANDSHAKE_ACK: u8 = 0x02;
@@ -239,6 +258,7 @@ pub const MSG_TYPE_NSH_RESPONSE: u8 = 0x04;
 pub const MSG_TYPE_CONNECTION_STATUS: u8 = 0x05;
 pub const MSG_TYPE_VEHICLE_MESSAGE: u8 = 0x06;
 pub const MSG_TYPE_CONFIG_RESULT: u8 = 0x08;
+pub const MSG_TYPE_TERRAIN_ORIGIN: u8 = 0x09;
 
 // WebSocket message type constants — Incoming
 pub const MSG_TYPE_HANDSHAKE: u8 = 0x10;
