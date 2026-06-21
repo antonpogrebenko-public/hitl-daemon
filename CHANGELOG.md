@@ -5,6 +5,11 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.2] - 2026-06-21
+
+### Added
+- **TERRAIN_ORIGIN WebSocket message (0x09)** — broadcasts GPS origin to connected clients for terrain rendering. Extracts from MAVLink GPS_GLOBAL_ORIGIN > HOME_POSITION > GLOBAL_POSITION_INT with priority gating. 22-byte binary: tag + f64 lat + f64 lon + f32 alt + u8 source. Late-joining clients receive cached origin immediately.
+
 ## [0.9.1] - 2026-06-21
 
 ### Fixed
