@@ -63,6 +63,12 @@ pub struct BuildConfigHandler {
     /// those emitted by `repush_if_configured` on FC reconnect). The
     /// WebSocket server subscribes and forwards to all connected clients.
     system_config_tx: broadcast::Sender<OutgoingMessage>,
+    /// Shared terrain cache. When ConfigureBuild includes a terrain_url,
+    /// we validate and load tiles into this cache. The simulation loop
+    /// already holds the same Arc and will pick up the new data.
+    terrain_cache: Option<std::sync::Arc<terrain::TerrainCache>>,
+    /// Reference position for terrain loading (lat, lon, alt)
+    terrain_ref: Mutex<(f64, f64, f64)>,
 }
 
 /// Snapshot of the parameters that were last successfully verified on PX4.
@@ -80,6 +86,8 @@ impl BuildConfigHandler {
         nsh_tx: Option<mpsc::Sender<ValidatedNshCommand>>,
         mav_tx: Option<Sender<MavMessage>>,
         param_value_tx: Option<broadcast::Sender<(String, f32)>>,
+        terrain_cache: Option<std::sync::Arc<terrain::TerrainCache>>,
+        terrain_ref: (f64, f64, f64),
     ) -> Self {
         let api_url =
             std::env::var("RELEASE_API_URL").unwrap_or_else(|_| DEFAULT_API_URL.to_string());
@@ -99,6 +107,30 @@ impl BuildConfigHandler {
             last_pid_fingerprint: Mutex::new(None),
             last_verified_params: Mutex::new(None),
             system_config_tx,
+            terrain_cache,
+            terrain_ref: Mutex::new(terrain_ref),
+        }
+    }
+
+    /// Load terrain from URL if provided and valid
+    pub async fn load_terrain_if_provided(&self, config: &crate::protocol::ConfigureBuild) -> Result<bool, String> {
+        let url = match config.validate_terrain_url()? {
+            Some(u) => u,
+            None => return Ok(false),
+        };
+
+        let cache = match &self.terrain_cache {
+            Some(c) => c,
+            None => return Err("Terrain cache not initialized".to_string()),
+        };
+
+        let (lat, lon, alt) = *self.terrain_ref.lock().unwrap();
+
+        if cache.load(&url, lat, lon, alt).await {
+            info!("Terrain loaded from {}", url);
+            Ok(true)
+        } else {
+            Err(format!("Failed to load terrain from {}", url))
         }
     }
 
@@ -125,6 +157,11 @@ impl BuildConfigHandler {
         request: ConfigureBuild,
         progress_tx: mpsc::Sender<OutgoingMessage>,
     ) -> ConfigResult {
+        // Load terrain if URL provided (non-blocking for config flow)
+        if let Err(e) = self.load_terrain_if_provided(&request).await {
+            warn!("Terrain load failed: {}", e);
+        }
+
         let motor_specs = match self.fetch_motor_specs(&request.motor_slug).await {
             Ok(specs) => specs,
             Err(e) => {
@@ -1142,7 +1179,7 @@ mod tests {
     ) -> BuildConfigHandler {
         let (config_tx, _config_rx) =
             bounded::<(PhysicsConfig, BatteryConfig, hitl_sensors::SensorsConfig)>(4);
-        BuildConfigHandler::new(config_tx, None, mav_tx, param_value_tx)
+        BuildConfigHandler::new(config_tx, None, mav_tx, param_value_tx, None, (40.0, -105.0, 1655.0))
     }
 
     /// Hover throttle representative of a TWR≈2 build (1/2). Used by tests to

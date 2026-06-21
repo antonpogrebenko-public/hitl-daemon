@@ -7,6 +7,7 @@ license = "MIT"
 
 [dependencies]
 protocol = { path = "../protocol" }
+terrain = { path = "../terrain" }
 hitl-physics = { path = "../../../hitl-physics" }
 hitl-sensors = { path = "../../../hitl-sensors" }
 axum = { version = "0.7", features = ["ws"] }
@@ -19,5 +20,6 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = "1.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+url = "2.5"
 crossbeam-channel = { workspace = true }
 mavlink = { workspace = true }

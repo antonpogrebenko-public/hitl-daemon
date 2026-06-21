@@ -329,6 +329,53 @@ pub struct ConfigureBuild {
     /// 1 = 4-in-1 ESC (weighs once), 4 = individual ESCs (weight × 4).
     #[serde(default = "default_esc_count")]
     pub esc_count: u8,
+    /// Terrain tiles URL (S3 bucket). Must be from whitelisted buckets.
+    #[serde(default)]
+    pub terrain_url: Option<String>,
+}
+
+/// Allowed S3 bucket hostnames for terrain tiles
+const ALLOWED_TERRAIN_HOSTS: &[&str] = &[
+    "th3seus-terrain-playground.s3.amazonaws.com",
+    "th3seus-terrain.s3.amazonaws.com",
+];
+
+impl ConfigureBuild {
+    /// Validate terrain_url is from an allowed S3 bucket.
+    /// Strict validation: must be https, exact host match, no userinfo.
+    pub fn validate_terrain_url(&self) -> Result<Option<String>, String> {
+        let url_str = match &self.terrain_url {
+            Some(u) if !u.is_empty() => u,
+            _ => return Ok(None),
+        };
+
+        let parsed = url::Url::parse(url_str)
+            .map_err(|e| format!("Invalid terrain URL: {}", e))?;
+
+        if parsed.scheme() != "https" {
+            return Err("Terrain URL must use https".to_string());
+        }
+
+        if parsed.username() != "" || parsed.password().is_some() {
+            return Err("Terrain URL must not contain credentials".to_string());
+        }
+
+        let host = parsed.host_str()
+            .ok_or("Terrain URL missing host")?
+            .to_ascii_lowercase();
+        let host_normalized = host.trim_end_matches('.');
+
+        for allowed in ALLOWED_TERRAIN_HOSTS {
+            if host_normalized == *allowed {
+                return Ok(Some(url_str.clone()));
+            }
+        }
+
+        Err(format!(
+            "Terrain URL host '{}' not in allowlist. Allowed: {:?}",
+            host_normalized, ALLOWED_TERRAIN_HOSTS
+        ))
+    }
 }
 
 fn default_esc_count() -> u8 {

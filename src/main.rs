@@ -370,22 +370,18 @@ async fn main() {
         mag: hitl_sensors::MagConfig::default(),
     };
 
-    // Load terrain tiles if URL provided (blocking - must complete before sim starts)
-    let terrain_cache = if let Some(ref url) = args.terrain_url {
-        let cache = Arc::new(TerrainCache::new());
-        let lat = args.reference_lat;
-        let lon = args.reference_lon;
-        let alt = args.reference_alt;
-        if cache.load(url, lat, lon, alt).await {
+    // Create shared terrain cache (can be populated via CLI flag or WebSocket)
+    let terrain_cache = Arc::new(TerrainCache::new());
+    let terrain_ref = (args.reference_lat, args.reference_lon, args.reference_alt);
+
+    // Load terrain tiles if URL provided via CLI (blocking - must complete before sim starts)
+    if let Some(ref url) = args.terrain_url {
+        if terrain_cache.load(url, terrain_ref.0, terrain_ref.1, terrain_ref.2).await {
             info!("Terrain loaded for ground collision detection");
-            Some(cache)
         } else {
-            warn!("Failed to load terrain - using flat ground at Z=0");
-            None
+            warn!("Failed to load terrain from CLI URL - using flat ground at Z=0");
         }
-    } else {
-        None
-    };
+    }
 
     let sim_config = SimulationConfig {
         reference_lat: args.reference_lat,
@@ -394,7 +390,7 @@ async fn main() {
         tick_rate_hz: args.tick_rate,
         gps_rate_hz: args.gps_rate,
         sensors: clean_sensors,
-        terrain: terrain_cache,
+        terrain: Some(terrain_cache.clone()),
         ..Default::default()
     };
 
@@ -572,6 +568,8 @@ async fn main() {
         nsh_tx_for_config,
         build_config_mav_tx,
         build_config_param_value_tx,
+        Some(terrain_cache),
+        terrain_ref,
     ));
     // Keep a clone for the reconnect task so it can re-push PIDs after FC power cycles.
     let build_config_handler_for_reconnect = build_config_handler.clone();

@@ -5,6 +5,14 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.5] - 2026-06-21
+
+### Added
+- **WebSocket terrain URL** — frontend can now pass `terrain_url` in `ConfigureBuild` message. Daemon validates URL is from whitelisted S3 buckets (`th3seus-terrain`, `th3seus-terrain-playground`) and loads tiles dynamically. No CLI flag needed when using web UI.
+
+### Changed
+- **Shared terrain cache** — `TerrainCache` now shared between simulation and `BuildConfigHandler`. Terrain loaded via WebSocket updates the same cache used by physics loop.
+
 ## [0.9.4] - 2026-06-21
 
 ### Added
