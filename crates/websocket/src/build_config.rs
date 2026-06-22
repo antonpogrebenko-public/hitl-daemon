@@ -392,6 +392,22 @@ impl BuildConfigHandler {
         });
         let sensors_config = build_sensors_config(&sensor_profiles, gps_profile.as_ref(), &request);
 
+        // Log the resolved sensor noise and how the profile was matched
+        // (exact / mcu_family / average, or "default" when no profile was sent).
+        info!(
+            "Sensor noise [{}]: gyro_nd={:.6} accel_nd={:.5} | baro={:.4}m mag={:.5}G | gps h={:.3}m alt={:.3}m vel={:.3}m/s rate={}Hz delay={}ms",
+            request.sensor_match_type.as_deref().unwrap_or("default"),
+            sensors_config.imu.gyro_noise_density,
+            sensors_config.imu.accel_noise_density,
+            sensors_config.baro.noise_sigma,
+            sensors_config.mag.noise_sigma_gauss,
+            sensors_config.gps.horizontal_noise_sigma,
+            sensors_config.gps.altitude_noise_sigma,
+            sensors_config.gps.velocity_noise_sigma,
+            sensors_config.gps.update_rate_hz,
+            sensors_config.gps.delay_ms,
+        );
+
         let mut physics = spec.to_physics_config();
         // The request may carry a non-nominal voltage (e.g. fully-charged 16.8 V on
         // a 4S pack). Preserve that — `to_physics_config()` derives nominal from

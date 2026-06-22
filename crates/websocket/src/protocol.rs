@@ -355,6 +355,11 @@ pub struct ConfigureBuild {
     /// GPS velocity noise sigma in m/s
     #[serde(default)]
     pub gps_velocity_noise: Option<f64>,
+    /// How the sensor profile was matched: "exact", "mcu_family", "average",
+    /// or absent when no profile was found (built-in defaults are used).
+    /// Informational only — surfaced in the daemon log.
+    #[serde(default)]
+    pub sensor_match_type: Option<String>,
 }
 
 /// Allowed S3 bucket hostnames for terrain tiles
