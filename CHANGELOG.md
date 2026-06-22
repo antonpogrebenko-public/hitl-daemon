@@ -5,6 +5,12 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.9] - 2026-06-22
+
+### Added
+- **Sensor profile logging** — `ConfigureBuild` now logs resolved sensor noise values and match type (exact/mcu_family/average/default) for diagnostics.
+- **Sensor match type passthrough** — accepts optional `sensor_match_type` field in WebSocket config to track how the profile was resolved.
+
 ## [0.9.6] - 2026-06-21
 
 ### Changed
