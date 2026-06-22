@@ -332,6 +332,29 @@ pub struct ConfigureBuild {
     /// Terrain tiles URL (S3 bucket). Must be from whitelisted buckets.
     #[serde(default)]
     pub terrain_url: Option<String>,
+
+    // Sensor noise parameters (from API sensor profiles, optional with defaults)
+    /// Gyro noise density in rad/s/sqrt(Hz)
+    #[serde(default)]
+    pub gyro_noise_density: Option<f64>,
+    /// Accel noise density in m/s^2/sqrt(Hz)
+    #[serde(default)]
+    pub accel_noise_density: Option<f64>,
+    /// Baro noise sigma in meters
+    #[serde(default)]
+    pub baro_noise_sigma: Option<f64>,
+    /// Mag noise sigma in gauss
+    #[serde(default)]
+    pub mag_noise_sigma: Option<f64>,
+    /// GPS horizontal noise sigma in meters
+    #[serde(default)]
+    pub gps_horizontal_noise: Option<f64>,
+    /// GPS altitude noise sigma in meters
+    #[serde(default)]
+    pub gps_altitude_noise: Option<f64>,
+    /// GPS velocity noise sigma in m/s
+    #[serde(default)]
+    pub gps_velocity_noise: Option<f64>,
 }
 
 /// Allowed S3 bucket hostnames for terrain tiles

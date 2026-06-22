@@ -390,7 +390,7 @@ impl BuildConfigHandler {
             }
             p
         });
-        let sensors_config = build_sensors_config(&sensor_profiles, gps_profile.as_ref());
+        let sensors_config = build_sensors_config(&sensor_profiles, gps_profile.as_ref(), &request);
 
         let mut physics = spec.to_physics_config();
         // The request may carry a non-nominal voltage (e.g. fully-charged 16.8 V on
@@ -1080,15 +1080,24 @@ fn parse_gps_chipset(s: &str) -> hitl_physics::build::GpsChipset {
 ///
 /// For HITL: bias drift is always disabled (causes EKF divergence in sim) but
 /// chip-specific noise densities are preserved for realistic sensor behavior.
+///
+/// API sensor profiles (from ConfigureBuild) override component-derived values
+/// when present, allowing hardware-specific tuning based on real flight log data.
 fn build_sensors_config(
     profiles: &hitl_physics::build::SensorProfiles,
     gps_profile: Option<&hitl_physics::build::GpsProfile>,
+    request: &crate::protocol::ConfigureBuild,
 ) -> hitl_sensors::SensorsConfig {
     use hitl_sensors::{BaroConfig, GpsConfig, ImuConfig, MagConfig, SensorsConfig};
 
+    // API sensor profile values override component-derived defaults
     let imu = ImuConfig {
-        gyro_noise_density: profiles.imu.gyro_noise_density,
-        accel_noise_density: profiles.imu.accel_noise_density,
+        gyro_noise_density: request
+            .gyro_noise_density
+            .unwrap_or(profiles.imu.gyro_noise_density),
+        accel_noise_density: request
+            .accel_noise_density
+            .unwrap_or(profiles.imu.accel_noise_density),
         gyro_bias_sigma: 0.0, // CRITICAL: no drift in HITL
         gyro_bias_tau: 1000.0,
         accel_bias_sigma: 0.0, // CRITICAL: no drift in HITL
@@ -1097,20 +1106,26 @@ fn build_sensors_config(
 
     let gps = if let Some(gp) = gps_profile {
         GpsConfig {
-            horizontal_noise_sigma: gp.horizontal_noise_sigma_m,
-            altitude_noise_sigma: gp.altitude_noise_sigma_m,
-            velocity_noise_sigma: gp.velocity_noise_sigma_mps,
+            horizontal_noise_sigma: request
+                .gps_horizontal_noise
+                .unwrap_or(gp.horizontal_noise_sigma_m),
+            altitude_noise_sigma: request
+                .gps_altitude_noise
+                .unwrap_or(gp.altitude_noise_sigma_m),
+            velocity_noise_sigma: request
+                .gps_velocity_noise
+                .unwrap_or(gp.velocity_noise_sigma_mps),
             position_drift_sigma: 0.0, // No drift in HITL
             position_drift_tau: 1000.0,
             update_rate_hz: gp.update_rate_hz,
             delay_ms: gp.delay_ms,
         }
     } else {
-        // No GPS module selected — use tight defaults for HITL
+        // No GPS module selected — use API values or tight defaults for HITL
         GpsConfig {
-            horizontal_noise_sigma: 0.1,
-            altitude_noise_sigma: 0.3,
-            velocity_noise_sigma: 0.05,
+            horizontal_noise_sigma: request.gps_horizontal_noise.unwrap_or(0.1),
+            altitude_noise_sigma: request.gps_altitude_noise.unwrap_or(0.3),
+            velocity_noise_sigma: request.gps_velocity_noise.unwrap_or(0.05),
             position_drift_sigma: 0.0,
             position_drift_tau: 1000.0,
             update_rate_hz: 10.0,
@@ -1119,17 +1134,22 @@ fn build_sensors_config(
     };
 
     let baro = BaroConfig {
-        noise_sigma: profiles.baro.noise_sigma_m,
+        noise_sigma: request
+            .baro_noise_sigma
+            .unwrap_or(profiles.baro.noise_sigma_m),
         ..BaroConfig::default()
     };
 
     let mag = if let Some(mp) = profiles.mag {
         MagConfig {
-            noise_sigma_gauss: mp.noise_sigma_gauss,
+            noise_sigma_gauss: request.mag_noise_sigma.unwrap_or(mp.noise_sigma_gauss),
             ..MagConfig::default()
         }
     } else {
-        MagConfig::default()
+        MagConfig {
+            noise_sigma_gauss: request.mag_noise_sigma.unwrap_or(0.005),
+            ..MagConfig::default()
+        }
     };
 
     SensorsConfig {
