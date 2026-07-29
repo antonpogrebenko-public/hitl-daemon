@@ -929,7 +929,7 @@ mod tests {
         };
 
         let cache = TerrainCache::new();
-        assert!(cache.load_from_tiles(meta, tiles, TEST_LAT, TEST_LON, 0.0));
+        assert!(cache.load_from_tiles(meta, tiles, TEST_LAT, TEST_LON));
         Arc::new(cache)
     }
 

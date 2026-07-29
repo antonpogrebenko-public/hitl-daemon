@@ -391,7 +391,7 @@ async fn main() {
     // real terrain in QGC. Adopt the sampled elevation instead.
     let mut reference_alt = args.reference_alt;
     if let Some(ref url) = args.terrain_url {
-        if terrain_cache.load(url, terrain_ref.0, terrain_ref.1, terrain_ref.2).await {
+        if terrain_cache.load(url, terrain_ref.0, terrain_ref.1).await {
             match terrain_cache.origin_elevation_msl() {
                 Some(dem_alt) => {
                     if (dem_alt - args.reference_alt).abs() > 1.0 {
@@ -1360,7 +1360,13 @@ async fn main() {
                                             _ => None,
                                         };
 
-                                    if let Some((lat, lon, alt, source)) = candidate {
+                                    // The message's own altitude is deliberately
+                                    // discarded: the viewer needs the same
+                                    // vertical datum the physics uses, which is
+                                    // the DEM elevation at the origin (adopted
+                                    // into reference_alt at terrain load), not
+                                    // whatever MSL the FC happens to report.
+                                    if let Some((lat, lon, _alt, source)) = candidate {
                                         let dominated = best_origin_source
                                             .map(|best| source < best)
                                             .unwrap_or(false);

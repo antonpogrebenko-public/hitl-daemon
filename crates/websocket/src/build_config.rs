@@ -124,9 +124,9 @@ impl BuildConfigHandler {
             None => return Err("Terrain cache not initialized".to_string()),
         };
 
-        let (lat, lon, alt) = *self.terrain_ref.lock().unwrap();
+        let (lat, lon, _alt) = *self.terrain_ref.lock().unwrap();
 
-        if cache.load(&url, lat, lon, alt).await {
+        if cache.load(&url, lat, lon).await {
             info!("Terrain loaded from {}", url);
             Ok(true)
         } else {

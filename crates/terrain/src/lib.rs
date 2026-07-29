@@ -1,8 +1,6 @@
 use parking_lot::RwLock as SyncRwLock;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 /// Samples per tile edge. Part of the public tile contract: callers of
@@ -55,198 +53,6 @@ impl TileCoord {
     }
 }
 
-struct LoadedTile {
-    heights: Vec<f32>,
-}
-
-pub struct TerrainProvider {
-    base_url: String,
-    meta: RwLock<Option<TileMeta>>,
-    cache: RwLock<HashMap<TileCoord, Arc<LoadedTile>>>,
-    client: reqwest::Client,
-    max_cache_size: usize,
-}
-
-impl TerrainProvider {
-    pub fn new(base_url: String) -> Self {
-        Self {
-            base_url: base_url.trim_end_matches('/').to_string(),
-            meta: RwLock::new(None),
-            cache: RwLock::new(HashMap::new()),
-            client: reqwest::Client::new(),
-            max_cache_size: 16,
-        }
-    }
-
-    pub async fn ensure_meta(&self) -> Option<TileMeta> {
-        {
-            let meta = self.meta.read().await;
-            if meta.is_some() {
-                return meta.clone();
-            }
-        }
-
-        let url = format!("{}/meta.json", self.base_url);
-        match self.client.get(&url).send().await {
-            Ok(resp) if resp.status().is_success() => match resp.json::<TileMeta>().await {
-                Ok(m) => {
-                    debug!("Loaded terrain meta: zoom={}, bbox={:?}", m.zoom, m.bbox);
-                    let mut meta = self.meta.write().await;
-                    *meta = Some(m.clone());
-                    Some(m)
-                }
-                Err(e) => {
-                    warn!("Failed to parse terrain meta: {}", e);
-                    None
-                }
-            },
-            Ok(resp) => {
-                warn!("Failed to fetch terrain meta: HTTP {}", resp.status());
-                None
-            }
-            Err(e) => {
-                warn!("Failed to fetch terrain meta: {}", e);
-                None
-            }
-        }
-    }
-
-    pub async fn ensure_tiles_loaded(&self, lat: f64, lon: f64) {
-        let meta = match self.ensure_meta().await {
-            Some(m) => m,
-            None => return,
-        };
-
-        let center = TileCoord::from_lon_lat(lon, lat, meta.zoom);
-
-        for dy in -1i32..=1 {
-            for dx in -1i32..=1 {
-                let coord = TileCoord {
-                    x: (center.x as i32 + dx) as u32,
-                    y: (center.y as i32 + dy) as u32,
-                    z: meta.zoom,
-                };
-                self.load_tile(coord).await;
-            }
-        }
-    }
-
-    async fn load_tile(&self, coord: TileCoord) -> Option<Arc<LoadedTile>> {
-        {
-            let cache = self.cache.read().await;
-            if let Some(tile) = cache.get(&coord) {
-                return Some(Arc::clone(tile));
-            }
-        }
-
-        let url = format!("{}/{}/{}/{}.bin", self.base_url, coord.z, coord.x, coord.y);
-        let resp = match self.client.get(&url).send().await {
-            Ok(r) if r.status().is_success() => r,
-            Ok(r) => {
-                debug!("Tile not found: {} (HTTP {})", url, r.status());
-                return None;
-            }
-            Err(e) => {
-                warn!("Failed to fetch tile {}: {}", url, e);
-                return None;
-            }
-        };
-
-        let bytes = match resp.bytes().await {
-            Ok(b) => b,
-            Err(e) => {
-                warn!("Failed to read tile bytes: {}", e);
-                return None;
-            }
-        };
-
-        if bytes.len() != TILE_SIZE * TILE_SIZE * 4 {
-            warn!(
-                "Invalid tile size: expected {}, got {}",
-                TILE_SIZE * TILE_SIZE * 4,
-                bytes.len()
-            );
-            return None;
-        }
-
-        let heights: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect();
-
-        let tile = Arc::new(LoadedTile { heights });
-
-        {
-            let mut cache = self.cache.write().await;
-            cache.insert(coord, Arc::clone(&tile));
-            self.evict_old_tiles(&mut cache);
-        }
-
-        debug!("Loaded terrain tile {}/{}/{}", coord.z, coord.x, coord.y);
-        Some(tile)
-    }
-
-    fn evict_old_tiles(&self, cache: &mut HashMap<TileCoord, Arc<LoadedTile>>) {
-        while cache.len() > self.max_cache_size {
-            if let Some(key) = cache.keys().next().cloned() {
-                cache.remove(&key);
-            }
-        }
-    }
-
-    pub async fn sample_elevation(&self, lat: f64, lon: f64) -> Option<f32> {
-        let meta = {
-            let m = self.meta.read().await;
-            m.clone()?
-        };
-
-        let coord = TileCoord::from_lon_lat(lon, lat, meta.zoom);
-
-        let tile = {
-            let cache = self.cache.read().await;
-            cache.get(&coord).cloned()
-        }?;
-
-        let (nw_lon, nw_lat) = tile_to_lon_lat(coord.x, coord.y, coord.z);
-        let (se_lon, se_lat) = tile_to_lon_lat(coord.x + 1, coord.y + 1, coord.z);
-
-        let fx = ((lon - nw_lon) / (se_lon - nw_lon) * (TILE_SIZE - 1) as f64)
-            .clamp(0.0, (TILE_SIZE - 1) as f64);
-        let fy = ((nw_lat - lat) / (nw_lat - se_lat) * (TILE_SIZE - 1) as f64)
-            .clamp(0.0, (TILE_SIZE - 1) as f64);
-
-        let x0 = fx.floor() as usize;
-        let y0 = fy.floor() as usize;
-        let x1 = (x0 + 1).min(TILE_SIZE - 1);
-        let y1 = (y0 + 1).min(TILE_SIZE - 1);
-        let dx = fx - x0 as f64;
-        let dy = fy - y0 as f64;
-
-        let h00 = tile.heights[y0 * TILE_SIZE + x0] as f64;
-        let h10 = tile.heights[y0 * TILE_SIZE + x1] as f64;
-        let h01 = tile.heights[y1 * TILE_SIZE + x0] as f64;
-        let h11 = tile.heights[y1 * TILE_SIZE + x1] as f64;
-
-        let elevation = h00 * (1.0 - dx) * (1.0 - dy)
-            + h10 * dx * (1.0 - dy)
-            + h01 * (1.0 - dx) * dy
-            + h11 * dx * dy;
-
-        Some(elevation as f32)
-    }
-
-    pub async fn sample_elevation_ned(
-        &self,
-        lat: f64,
-        lon: f64,
-        reference_alt: f64,
-    ) -> Option<f32> {
-        let msl_elevation = self.sample_elevation(lat, lon).await?;
-        let ned_down = reference_alt - msl_elevation as f64;
-        Some(ned_down as f32)
-    }
-}
-
 fn tile_to_lon_lat(x: u32, y: u32, z: u32) -> (f64, f64) {
     let n = 2_u32.pow(z) as f64;
     let lon = x as f64 / n * 360.0 - 180.0;
@@ -268,7 +74,6 @@ struct TerrainCacheInner {
     tiles: HashMap<TileCoord, Vec<f32>>,
     origin_lat: f64,
     origin_lon: f64,
-    reference_alt: f64,
     origin_elevation: Option<f64>,
 }
 
@@ -280,14 +85,13 @@ impl TerrainCache {
                 tiles: HashMap::new(),
                 origin_lat: 0.0,
                 origin_lon: 0.0,
-                reference_alt: 0.0,
                 origin_elevation: None,
             }),
         }
     }
 
     /// Load terrain tiles around origin. Call from async context at startup.
-    pub async fn load(&self, base_url: &str, lat: f64, lon: f64, reference_alt: f64) -> bool {
+    pub async fn load(&self, base_url: &str, lat: f64, lon: f64) -> bool {
         let client = reqwest::Client::new();
         let base_url = base_url.trim_end_matches('/');
 
@@ -342,7 +146,7 @@ impl TerrainCache {
             }
         }
 
-        self.load_from_tiles(meta, tiles, lat, lon, reference_alt)
+        self.load_from_tiles(meta, tiles, lat, lon)
     }
 
     /// Populate the cache from already-decoded height tiles, bypassing HTTP.
@@ -357,7 +161,6 @@ impl TerrainCache {
         tiles: HashMap<TileCoord, Vec<f32>>,
         lat: f64,
         lon: f64,
-        reference_alt: f64,
     ) -> bool {
         let tile_count = tiles.len();
 
@@ -369,7 +172,6 @@ impl TerrainCache {
             inner.tiles = tiles;
             inner.origin_lat = lat;
             inner.origin_lon = lon;
-            inner.reference_alt = reference_alt;
             inner.origin_elevation = origin_elevation;
         }
 
@@ -583,7 +385,7 @@ mod tests {
         }
 
         let cache = TerrainCache::new();
-        assert!(cache.load_from_tiles(test_meta(), tiles, TEST_LAT, TEST_LON, 0.0));
+        assert!(cache.load_from_tiles(test_meta(), tiles, TEST_LAT, TEST_LON));
         cache
     }
 
