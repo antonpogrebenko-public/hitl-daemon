@@ -295,13 +295,25 @@ impl TerrainCache {
         // Height above the datum is the negation of the NED down coordinate.
         let h = |n: f64, e: f64| self.sample_ground_ned(n, e).map(|z| -(z as f64));
 
-        let hn_pos = h(north + PROBE_M, east)?;
-        let hn_neg = h(north - PROBE_M, east)?;
-        let he_pos = h(north, east + PROBE_M)?;
-        let he_neg = h(north, east - PROBE_M)?;
+        // The centre must be known — that is the same condition under which the
+        // *height* is known, which keeps this function's coverage identical to
+        // `sample_ground_ned`'s. Anything narrower would leave a shell along the
+        // tile-block edge where the ground has a height but no normal, and a
+        // caller defaulting that to "level" would flatten genuinely sloped
+        // terrain — the same unknown-vs-flat conflation the height path avoids.
+        let h_centre = h(north, east)?;
 
-        let dh_dn = (hn_pos - hn_neg) / (2.0 * PROBE_M);
-        let dh_de = (he_pos - he_neg) / (2.0 * PROBE_M);
+        // Central differences where both probes land inside coverage, one-sided
+        // against the centre where only one does.
+        let slope = |pos: Option<f64>, neg: Option<f64>| match (pos, neg) {
+            (Some(a), Some(b)) => Some((a - b) / (2.0 * PROBE_M)),
+            (Some(a), None) => Some((a - h_centre) / PROBE_M),
+            (None, Some(b)) => Some((h_centre - b) / PROBE_M),
+            (None, None) => None,
+        };
+
+        let dh_dn = slope(h(north + PROBE_M, east), h(north - PROBE_M, east))?;
+        let dh_de = slope(h(north, east + PROBE_M), h(north, east - PROBE_M))?;
 
         // Surface height h(n, e) has upward normal (-dh/dn, -dh/de, 1) in
         // (north, east, up). Flipping the third axis into NED down gives -1.
@@ -492,9 +504,19 @@ mod tests {
     #[test]
     fn ground_normal_is_straight_up_on_level_terrain() {
         let cache = cache_with_tiles(|_, _| 1655.0);
-        let n = cache.sample_ground_normal_ned(0.0, 0.0).expect("inside tiles");
-        assert!(n[0].abs() < 1e-4, "north component should vanish, got {}", n[0]);
-        assert!(n[1].abs() < 1e-4, "east component should vanish, got {}", n[1]);
+        let n = cache
+            .sample_ground_normal_ned(0.0, 0.0)
+            .expect("inside tiles");
+        assert!(
+            n[0].abs() < 1e-4,
+            "north component should vanish, got {}",
+            n[0]
+        );
+        assert!(
+            n[1].abs() < 1e-4,
+            "east component should vanish, got {}",
+            n[1]
+        );
         assert!(
             (n[2] + 1.0).abs() < 1e-4,
             "down component should be -1 (pointing up), got {}",
@@ -509,7 +531,9 @@ mod tests {
     fn ground_normal_tilts_away_from_rising_terrain() {
         // 1 m of rise per 1 m north: a 45-degree slope.
         let cache = cache_with_tiles(|lat, _| (1655.0 + (lat - TEST_LAT) * 111_320.0) as f32);
-        let n = cache.sample_ground_normal_ned(0.0, 0.0).expect("inside tiles");
+        let n = cache
+            .sample_ground_normal_ned(0.0, 0.0)
+            .expect("inside tiles");
 
         assert!(
             n[0] < 0.0,
@@ -529,9 +553,14 @@ mod tests {
         let cache = cache_with_tiles(|lat, lon| {
             (1655.0 + (lat - TEST_LAT) * 40_000.0 + (lon - TEST_LON) * 25_000.0) as f32
         });
-        let n = cache.sample_ground_normal_ned(0.0, 0.0).expect("inside tiles");
+        let n = cache
+            .sample_ground_normal_ned(0.0, 0.0)
+            .expect("inside tiles");
         let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
-        assert!((len - 1.0).abs() < 1e-5, "expected unit normal, got length {len}");
+        assert!(
+            (len - 1.0).abs() < 1e-5,
+            "expected unit normal, got length {len}"
+        );
     }
 
     /// A normal built from a partly-missing neighbourhood would be wrong in an
@@ -540,7 +569,75 @@ mod tests {
     fn ground_normal_returns_none_outside_coverage() {
         let cache = cache_with_tiles(|_, _| 1655.0);
         assert!(cache.sample_ground_normal_ned(50_000.0, 0.0).is_none());
-        assert!(TerrainCache::new().sample_ground_normal_ned(0.0, 0.0).is_none());
+        assert!(TerrainCache::new()
+            .sample_ground_normal_ned(0.0, 0.0)
+            .is_none());
+    }
+
+    /// The normal must be available at exactly the same points the height is.
+    /// Central differences alone leave a probe-width shell along the tile-block
+    /// edge where the height resolves but the normal does not — and a caller
+    /// defaulting that to "level" would flatten genuinely sloped ground, the
+    /// same unknown-vs-flat conflation the height path exists to avoid. One-
+    /// sided differences at the boundary close the shell.
+    #[test]
+    fn ground_normal_coverage_matches_ground_height_coverage() {
+        // Sloped, so a boundary sample that silently fell back to level would
+        // show up as a suspiciously vertical normal.
+        let cache = cache_with_tiles(|lat, _| (1655.0 + (lat - TEST_LAT) * 20_000.0) as f32);
+
+        let mut inside = 0;
+        let mut outside = 0;
+        for i in 0..600 {
+            let north = i as f64 * 10.0;
+            if cache.sample_ground_ned(north, 0.0).is_some() {
+                assert!(
+                    cache.sample_ground_normal_ned(north, 0.0).is_some(),
+                    "height resolved but normal did not at {north} m north"
+                );
+                inside += 1;
+            } else {
+                assert!(
+                    cache.sample_ground_normal_ned(north, 0.0).is_none(),
+                    "normal resolved but height did not at {north} m north"
+                );
+                outside += 1;
+            }
+        }
+        assert!(
+            inside > 0 && outside > 0,
+            "test must span the coverage edge"
+        );
+    }
+
+    /// At the very edge the one-sided difference must still see the slope
+    /// rather than degrading to level ground.
+    #[test]
+    fn ground_normal_at_the_coverage_edge_still_reports_slope() {
+        let cache = cache_with_tiles(|lat, _| (1655.0 + (lat - TEST_LAT) * 20_000.0) as f32);
+
+        let mut last_inside = 0.0;
+        for i in 0..600 {
+            let north = i as f64 * 10.0;
+            if cache.sample_ground_ned(north, 0.0).is_some() {
+                last_inside = north;
+            }
+        }
+
+        let edge = cache
+            .sample_ground_normal_ned(last_inside, 0.0)
+            .expect("edge point has a height, so it must have a normal");
+        let interior = cache.sample_ground_normal_ned(0.0, 0.0).expect("interior");
+
+        assert!(
+            edge[0] < 0.0,
+            "edge normal should still lean off the rising slope, got {}",
+            edge[0]
+        );
+        assert!(
+            (edge[0] - interior[0]).abs() < 0.05,
+            "edge normal {edge:?} should closely match interior {interior:?}"
+        );
     }
 
     /// `origin_elevation_msl` is the bridge between the terrain datum and the

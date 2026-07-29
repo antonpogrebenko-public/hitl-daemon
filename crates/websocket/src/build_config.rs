@@ -113,7 +113,10 @@ impl BuildConfigHandler {
     }
 
     /// Load terrain from URL if provided and valid
-    pub async fn load_terrain_if_provided(&self, config: &crate::protocol::ConfigureBuild) -> Result<bool, String> {
+    pub async fn load_terrain_if_provided(
+        &self,
+        config: &crate::protocol::ConfigureBuild,
+    ) -> Result<bool, String> {
         let url = match config.validate_terrain_url()? {
             Some(u) => u,
             None => return Ok(false),
@@ -1215,7 +1218,14 @@ mod tests {
     ) -> BuildConfigHandler {
         let (config_tx, _config_rx) =
             bounded::<(PhysicsConfig, BatteryConfig, hitl_sensors::SensorsConfig)>(4);
-        BuildConfigHandler::new(config_tx, None, mav_tx, param_value_tx, None, (40.0, -105.0, 1655.0))
+        BuildConfigHandler::new(
+            config_tx,
+            None,
+            mav_tx,
+            param_value_tx,
+            None,
+            (40.0, -105.0, 1655.0),
+        )
     }
 
     /// Hover throttle representative of a TWR≈2 build (1/2). Used by tests to

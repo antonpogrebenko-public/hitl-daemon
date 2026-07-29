@@ -395,8 +395,7 @@ impl ConfigureBuild {
             _ => return Ok(None),
         };
 
-        let parsed = url::Url::parse(url_str)
-            .map_err(|e| format!("Invalid terrain URL: {}", e))?;
+        let parsed = url::Url::parse(url_str).map_err(|e| format!("Invalid terrain URL: {}", e))?;
 
         if parsed.scheme() != "https" {
             return Err("Terrain URL must use https".to_string());
@@ -406,7 +405,8 @@ impl ConfigureBuild {
             return Err("Terrain URL must not contain credentials".to_string());
         }
 
-        let host = parsed.host_str()
+        let host = parsed
+            .host_str()
             .ok_or("Terrain URL missing host")?
             .to_ascii_lowercase();
         let host_normalized = host.trim_end_matches('.');

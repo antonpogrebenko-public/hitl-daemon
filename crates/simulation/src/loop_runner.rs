@@ -198,6 +198,9 @@ impl SimulationLoop {
         mav_tx: Sender<MavMessage>,
     ) -> Self {
         let state = SimulationState::new(config.clone());
+        // Seed from the config actually in force, not the default: relying on
+        // them matching is an invariant across two crates that nothing enforces.
+        let gravity = config.physics.gravity;
 
         Self {
             state,
@@ -220,7 +223,7 @@ impl SimulationLoop {
             ground_contact_active: true,
             ground_impact_ticks_remaining: 0,
             ground_impact_accel: [0.0; 3],
-            ground_rest_accel_body: [0.0, 0.0, -SimulationConfig::default().physics.gravity],
+            ground_rest_accel_body: [0.0, 0.0, -gravity],
         }
     }
 
@@ -426,7 +429,8 @@ impl SimulationLoop {
             None => Some(LEVEL_NORMAL_NED),
         };
 
-        if ground_z.is_none() && self.last_terrain_miss_warning.elapsed() >= TERRAIN_MISS_WARN_INTERVAL
+        if ground_z.is_none()
+            && self.last_terrain_miss_warning.elapsed() >= TERRAIN_MISS_WARN_INTERVAL
         {
             warn!(
                 north = state.quadrotor.position[0],
@@ -500,6 +504,17 @@ impl SimulationLoop {
         if let Some(ground_z) = ground_z.filter(|_| physics_on_ground) {
             state.quadrotor.position[2] = ground_z;
 
+            let gravity = self.config.physics.gravity;
+            let normal = ground_normal.unwrap_or(LEVEL_NORMAL_NED);
+            // Decided up-front because the impact impulse must agree with it:
+            // the accelerometer may not claim the drone stopped horizontally if
+            // the contact model is about to let it slide.
+            let will_slide = {
+                let a = downslope_accel(normal, gravity);
+                let pull = (a[0] * a[0] + a[1] * a[1]).sqrt();
+                pull > GROUND_FRICTION_COEFF * gravity * (-normal[2] as f64).max(0.0)
+            };
+
             // Trigger impact deceleration if hitting ground with significant downward velocity.
             // Deceleration is spread over IMPACT_DURATION_TICKS to give the EKF
             // a physical impulse it can fuse (instead of an instantaneous velocity
@@ -510,11 +525,29 @@ impl SimulationLoop {
                 let impact_dt = IMPACT_DURATION_TICKS as f64 * dt;
                 // Deceleration needed to bring velocity to zero over impact_dt,
                 // in NED. vz>0 means downward, so this is negative-Z (upward).
-                let decel_ned = nalgebra::Vector3::new(
-                    -velocity_before_clamp[0] / impact_dt,
-                    -velocity_before_clamp[1] / impact_dt,
-                    -velocity_before_clamp[2] / impact_dt,
+                let v = nalgebra::Vector3::new(
+                    velocity_before_clamp[0],
+                    velocity_before_clamp[1],
+                    velocity_before_clamp[2],
                 );
+                // What the impact actually removes. On ground the drone will
+                // hold onto, that is the whole velocity — static damping bleeds
+                // the horizontal part away inside the impulse window anyway. On
+                // ground it will slide down, only the component *into* the
+                // surface is arrested; the tangential part keeps going, so
+                // reporting it as stopped would desync the accelerometer from
+                // the simulated truth by the full sliding speed.
+                let arrested = if will_slide {
+                    let n = nalgebra::Vector3::new(
+                        normal[0] as f64,
+                        normal[1] as f64,
+                        normal[2] as f64,
+                    );
+                    n * v.dot(&n)
+                } else {
+                    v
+                };
+                let decel_ned = -arrested / impact_dt;
                 // The accelerometer measures specific force = a - g, and it does
                 // so in the BODY frame. `decel_ned` is in NED, so it must be
                 // rotated by the impact attitude before being reported — a yawed
@@ -523,10 +556,8 @@ impl SimulationLoop {
                 // Rotating the whole (a - g) vector reduces to the old
                 // [decel_x, decel_y, decel_z - g] when the drone is level.
                 let gravity = self.config.physics.gravity;
-                let specific_force_ned =
-                    decel_ned - nalgebra::Vector3::new(0.0, 0.0, gravity);
-                let specific_force_body =
-                    state.quadrotor.quaternion.inverse() * specific_force_ned;
+                let specific_force_ned = decel_ned - nalgebra::Vector3::new(0.0, 0.0, gravity);
+                let specific_force_body = state.quadrotor.quaternion.inverse() * specific_force_ned;
                 self.ground_impact_accel = [
                     specific_force_body.x,
                     specific_force_body.y,
@@ -554,20 +585,14 @@ impl SimulationLoop {
             // ground under it: a drone could not tip, could not slide, and sat
             // perfectly flat on a 30-degree hillside.
             let (_, _, yaw) = state.quadrotor.quaternion.euler_angles();
-            let normal = ground_normal.unwrap_or(LEVEL_NORMAL_NED);
             state.quadrotor.quaternion = attitude_on_surface(normal, yaw);
 
-            let gravity = self.config.physics.gravity;
             let slope_accel = downslope_accel(normal, gravity);
-            let slope_mag = (slope_accel[0] * slope_accel[0]
-                + slope_accel[1] * slope_accel[1])
-                .sqrt();
             // Coulomb-style threshold: the drone only creeps once the pull
             // along the surface beats static friction. Below that it stays put,
             // which is what the old blanket 0.9-per-tick damping achieved for
             // flat ground and must keep achieving.
-            let normal_load = gravity * (-normal[2] as f64).max(0.0);
-            if slope_mag > GROUND_FRICTION_COEFF * normal_load {
+            if will_slide {
                 state.quadrotor.velocity[0] += slope_accel[0] * dt;
                 state.quadrotor.velocity[1] += slope_accel[1] * dt;
                 state.quadrotor.velocity[0] *= GROUND_SLIDING_DAMPING;
@@ -1211,7 +1236,10 @@ mod tests {
             (pitch.abs() - theta).abs() < 1e-6,
             "expected {theta} rad of pitch on a 30-degree slope, got {pitch}"
         );
-        assert!(roll.abs() < 1e-6, "no roll expected for a pure north slope, got {roll}");
+        assert!(
+            roll.abs() < 1e-6,
+            "no roll expected for a pure north slope, got {roll}"
+        );
         assert!((got_yaw - yaw).abs() < 1e-6, "heading must be preserved");
 
         // Body "down" must plant into the surface, i.e. oppose the normal.
@@ -1279,6 +1307,49 @@ mod tests {
             pull > GROUND_FRICTION_COEFF * normal_load,
             "a 45-degree slope must overcome static friction"
         );
+    }
+
+    /// The impact impulse tells the EKF how much velocity the ground removed.
+    /// On terrain the drone will slide down, the ground does *not* remove the
+    /// tangential component — friction bleeds it away over seconds, not over
+    /// the 100 ms impulse window. Reporting a full stop there would desync the
+    /// accelerometer from the simulated truth by the entire sliding speed.
+    #[test]
+    fn impact_impulse_only_arrests_the_normal_component_when_sliding() {
+        // 45 degrees: tan = 1.0, comfortably past the friction threshold.
+        let theta: f64 = 45_f64.to_radians();
+        let normal = [theta.sin(), 0.0, -theta.cos()];
+        let gravity = SimulationConfig::default().physics.gravity;
+
+        // Confirm the fixture really is in the sliding regime.
+        let a = downslope_accel([normal[0] as f32, 0.0, normal[2] as f32], gravity);
+        let pull = (a[0] * a[0] + a[1] * a[1]).sqrt();
+        assert!(pull > GROUND_FRICTION_COEFF * gravity * -normal[2]);
+
+        // Descending fast with lateral motion across the slope.
+        let v = nalgebra::Vector3::new(3.0, 0.0, 2.0);
+        let n = nalgebra::Vector3::new(normal[0], normal[1], normal[2]);
+        let arrested = n * v.dot(&n);
+
+        // Only the into-surface component is removed, so the arrested vector
+        // must be shorter than the full velocity and parallel to the normal.
+        assert!(
+            arrested.norm() < v.norm(),
+            "sliding impact must arrest less than the whole velocity"
+        );
+        let cross = arrested.cross(&n).norm();
+        assert!(
+            cross < 1e-9,
+            "arrested component must lie along the surface normal, got {arrested:?}"
+        );
+
+        // And the part left over is genuinely tangential — the drone keeps it.
+        let residual = v - arrested;
+        assert!(
+            residual.dot(&n).abs() < 1e-9,
+            "residual velocity must be tangential to the surface"
+        );
+        assert!(residual.norm() > 1.0, "a real sliding speed must survive");
     }
 
     /// Sensor ground mode latches on contact and only releases once the drone
