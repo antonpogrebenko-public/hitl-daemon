@@ -277,6 +277,42 @@ impl TerrainCache {
         Some(ned_ground as f32)
     }
 
+    /// Unit surface normal at (north, east), in NED.
+    ///
+    /// NED is down-positive, so a level surface returns `[0, 0, -1]` — the
+    /// normal points *up*, against the down axis. Returns `None` whenever any
+    /// of the four probe points falls outside cached coverage, so callers get
+    /// the same "unknown" signal as [`TerrainCache::sample_ground_ned`] rather
+    /// than a normal derived from a partially-missing neighbourhood.
+    ///
+    /// The probe spacing is deliberately close to the DEM's own sample
+    /// spacing (~7 m at zoom 14): sampling much tighter only re-reads the
+    /// bilinear patch between the same two posts and reports its slope, not
+    /// the terrain's.
+    pub fn sample_ground_normal_ned(&self, north: f64, east: f64) -> Option<[f32; 3]> {
+        const PROBE_M: f64 = 5.0;
+
+        // Height above the datum is the negation of the NED down coordinate.
+        let h = |n: f64, e: f64| self.sample_ground_ned(n, e).map(|z| -(z as f64));
+
+        let hn_pos = h(north + PROBE_M, east)?;
+        let hn_neg = h(north - PROBE_M, east)?;
+        let he_pos = h(north, east + PROBE_M)?;
+        let he_neg = h(north, east - PROBE_M)?;
+
+        let dh_dn = (hn_pos - hn_neg) / (2.0 * PROBE_M);
+        let dh_de = (he_pos - he_neg) / (2.0 * PROBE_M);
+
+        // Surface height h(n, e) has upward normal (-dh/dn, -dh/de, 1) in
+        // (north, east, up). Flipping the third axis into NED down gives -1.
+        let len = (dh_dn * dh_dn + dh_de * dh_de + 1.0).sqrt();
+        Some([
+            (-dh_dn / len) as f32,
+            (-dh_de / len) as f32,
+            (-1.0 / len) as f32,
+        ])
+    }
+
     /// Check if terrain is loaded
     pub fn is_loaded(&self) -> bool {
         let inner = self.inner.read();
@@ -448,6 +484,63 @@ mod tests {
         let cache = TerrainCache::new();
         assert!(!cache.is_loaded());
         assert!(cache.sample_ground_ned(0.0, 0.0).is_none());
+    }
+
+    /// Level ground must produce a normal that points straight up in NED
+    /// (down-negative), so the ground contact model can recognise flat terrain
+    /// and keep the exact flat-ground accelerometer path.
+    #[test]
+    fn ground_normal_is_straight_up_on_level_terrain() {
+        let cache = cache_with_tiles(|_, _| 1655.0);
+        let n = cache.sample_ground_normal_ned(0.0, 0.0).expect("inside tiles");
+        assert!(n[0].abs() < 1e-4, "north component should vanish, got {}", n[0]);
+        assert!(n[1].abs() < 1e-4, "east component should vanish, got {}", n[1]);
+        assert!(
+            (n[2] + 1.0).abs() < 1e-4,
+            "down component should be -1 (pointing up), got {}",
+            n[2]
+        );
+    }
+
+    /// On a slope rising to the north, the normal must tilt *away* from the
+    /// uphill direction — i.e. lean south — which is what makes a drone
+    /// resting on it pitch back and slide downhill.
+    #[test]
+    fn ground_normal_tilts_away_from_rising_terrain() {
+        // 1 m of rise per 1 m north: a 45-degree slope.
+        let cache = cache_with_tiles(|lat, _| (1655.0 + (lat - TEST_LAT) * 111_320.0) as f32);
+        let n = cache.sample_ground_normal_ned(0.0, 0.0).expect("inside tiles");
+
+        assert!(
+            n[0] < 0.0,
+            "normal should lean south (negative north) on north-rising ground, got {}",
+            n[0]
+        );
+        assert!(n[1].abs() < 1e-3, "no east tilt expected, got {}", n[1]);
+        // 45 degrees: north and down components have equal magnitude.
+        assert!(
+            (n[0].abs() - n[2].abs()).abs() < 1e-2,
+            "45-degree slope should split the normal evenly, got {n:?}"
+        );
+    }
+
+    #[test]
+    fn ground_normal_is_unit_length() {
+        let cache = cache_with_tiles(|lat, lon| {
+            (1655.0 + (lat - TEST_LAT) * 40_000.0 + (lon - TEST_LON) * 25_000.0) as f32
+        });
+        let n = cache.sample_ground_normal_ned(0.0, 0.0).expect("inside tiles");
+        let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        assert!((len - 1.0).abs() < 1e-5, "expected unit normal, got length {len}");
+    }
+
+    /// A normal built from a partly-missing neighbourhood would be wrong in an
+    /// unbounded way, so coverage gaps must propagate as None.
+    #[test]
+    fn ground_normal_returns_none_outside_coverage() {
+        let cache = cache_with_tiles(|_, _| 1655.0);
+        assert!(cache.sample_ground_normal_ned(50_000.0, 0.0).is_none());
+        assert!(TerrainCache::new().sample_ground_normal_ned(0.0, 0.0).is_none());
     }
 
     /// `origin_elevation_msl` is the bridge between the terrain datum and the

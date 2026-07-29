@@ -47,6 +47,70 @@ const IMPACT_DURATION_TICKS: u32 = 40;
 /// landing is gentle enough that the clamp alone does not confuse the EKF.
 const IMPACT_VEL_THRESHOLD: f64 = 0.5;
 
+/// Surface normal of level ground in NED. Down is positive, so "up" is -1.
+const LEVEL_NORMAL_NED: [f32; 3] = [0.0, 0.0, -1.0];
+
+/// How far the surface normal may tilt from vertical while still counting as
+/// level. Below this the flat-ground accelerometer path is used verbatim: an
+/// exact `[0, 0, -g]`, never a rotation of the NED gravity vector. That exact
+/// path exists because even a fraction of a degree of spurious tilt integrates
+/// into tens of metres of EKF position drift over a flight.
+const LEVEL_NORMAL_EPS: f64 = 1e-4;
+
+/// Static friction coefficient between the airframe and the ground. tan(theta)
+/// above this and a parked drone starts to slide, i.e. slopes steeper than
+/// about 31 degrees.
+const GROUND_FRICTION_COEFF: f64 = 0.6;
+
+/// Per-tick lateral damping while the drone is stuck to the ground. At 400 Hz
+/// this bleeds off horizontal speed almost immediately, which is what keeps a
+/// landed drone from wandering.
+const GROUND_STATIC_DAMPING: f64 = 0.9;
+
+/// Per-tick lateral damping while sliding downhill. Light enough that gravity
+/// along the surface wins, so a drone on a steep slope actually slides.
+const GROUND_SLIDING_DAMPING: f64 = 0.999;
+
+/// True when the surface is level to within `LEVEL_NORMAL_EPS`.
+fn is_level(normal: [f32; 3]) -> bool {
+    (normal[0] as f64).abs() < LEVEL_NORMAL_EPS && (normal[1] as f64).abs() < LEVEL_NORMAL_EPS
+}
+
+/// Attitude of a body resting on a surface with the given NED normal, keeping
+/// its current heading. Body Z (down in FRD) is planted into the surface and
+/// the nose is the current yaw projected onto the surface plane.
+fn attitude_on_surface(normal: [f32; 3], yaw: f64) -> nalgebra::UnitQuaternion<f64> {
+    if is_level(normal) {
+        // Exact level attitude — no matrix round-trip, so no residual tilt.
+        return nalgebra::UnitQuaternion::from_euler_angles(0.0, 0.0, yaw);
+    }
+
+    let up = nalgebra::Vector3::new(normal[0] as f64, normal[1] as f64, normal[2] as f64);
+    let z_body = -up; // FRD: body Z points down, into the surface.
+    let heading = nalgebra::Vector3::new(yaw.cos(), yaw.sin(), 0.0);
+
+    // Project the heading onto the surface plane. Degenerate only if the
+    // surface is vertical and faces along the heading, which real terrain
+    // sampled from a heightfield cannot produce.
+    let x_body = heading - z_body * heading.dot(&z_body);
+    let Some(x_body) = x_body.try_normalize(1e-9) else {
+        return nalgebra::UnitQuaternion::from_euler_angles(0.0, 0.0, yaw);
+    };
+    let y_body = z_body.cross(&x_body);
+
+    nalgebra::UnitQuaternion::from_rotation_matrix(&nalgebra::Rotation3::from_matrix_unchecked(
+        nalgebra::Matrix3::from_columns(&[x_body, y_body, z_body]),
+    ))
+}
+
+/// Component of gravity along the surface, in NED. Zero on level ground.
+fn downslope_accel(normal: [f32; 3], gravity: f64) -> [f64; 3] {
+    let n = nalgebra::Vector3::new(normal[0] as f64, normal[1] as f64, normal[2] as f64);
+    let g = nalgebra::Vector3::new(0.0, 0.0, gravity);
+    let tangential = g - n * g.dot(&n);
+    [tangential.x, tangential.y, tangential.z]
+}
+
 /// Mag sensor update divider (400 Hz / 8 = 50 Hz)
 const MAG_UPDATE_DIVIDER: u64 = 8;
 /// Baro sensor update divider (400 Hz / 8 = 50 Hz)
@@ -118,6 +182,11 @@ pub struct SimulationLoop {
     ground_impact_ticks_remaining: u32,
     /// Body-frame deceleration acceleration to report during ground impact (m/s²).
     ground_impact_accel: [f64; 3],
+    /// Body-frame specific force to report while resting on the ground (m/s²).
+    /// Exactly `[0, 0, -g]` on level ground; on a slope it is the gravity
+    /// reaction rotated into the drone's resting attitude, which is what a real
+    /// accelerometer on a tilted airframe reads.
+    ground_rest_accel_body: [f64; 3],
 }
 
 impl SimulationLoop {
@@ -151,6 +220,7 @@ impl SimulationLoop {
             ground_contact_active: true,
             ground_impact_ticks_remaining: 0,
             ground_impact_accel: [0.0; 3],
+            ground_rest_accel_body: [0.0, 0.0, -SimulationConfig::default().physics.gravity],
         }
     }
 
@@ -347,6 +417,15 @@ impl SimulationLoop {
             None => Some(0.0),
         };
 
+        // Surface orientation under the drone. `None` (no terrain configured,
+        // or outside coverage) means level ground, matching `ground_z`.
+        let ground_normal: Option<[f32; 3]> = match self.config.terrain.as_ref() {
+            Some(terrain) => terrain
+                .sample_ground_normal_ned(state.quadrotor.position[0], state.quadrotor.position[1])
+                .or(Some(LEVEL_NORMAL_NED)),
+            None => Some(LEVEL_NORMAL_NED),
+        };
+
         if ground_z.is_none() && self.last_terrain_miss_warning.elapsed() >= TERRAIN_MISS_WARN_INTERVAL
         {
             warn!(
@@ -466,15 +545,50 @@ impl SimulationLoop {
                 state.quadrotor.velocity[2] = 0.0;
             }
 
-            state.quadrotor.velocity[0] *= 0.9;
-            state.quadrotor.velocity[1] *= 0.9;
-
             state.quadrotor.angular_velocity[0] = 0.0;
             state.quadrotor.angular_velocity[1] = 0.0;
             state.quadrotor.angular_velocity[2] *= 0.95;
 
+            // Rest on the surface, not on an imaginary level plane. Forcing
+            // (0, 0, yaw) made every landing look identical regardless of the
+            // ground under it: a drone could not tip, could not slide, and sat
+            // perfectly flat on a 30-degree hillside.
             let (_, _, yaw) = state.quadrotor.quaternion.euler_angles();
-            state.quadrotor.quaternion = nalgebra::UnitQuaternion::from_euler_angles(0.0, 0.0, yaw);
+            let normal = ground_normal.unwrap_or(LEVEL_NORMAL_NED);
+            state.quadrotor.quaternion = attitude_on_surface(normal, yaw);
+
+            let gravity = self.config.physics.gravity;
+            let slope_accel = downslope_accel(normal, gravity);
+            let slope_mag = (slope_accel[0] * slope_accel[0]
+                + slope_accel[1] * slope_accel[1])
+                .sqrt();
+            // Coulomb-style threshold: the drone only creeps once the pull
+            // along the surface beats static friction. Below that it stays put,
+            // which is what the old blanket 0.9-per-tick damping achieved for
+            // flat ground and must keep achieving.
+            let normal_load = gravity * (-normal[2] as f64).max(0.0);
+            if slope_mag > GROUND_FRICTION_COEFF * normal_load {
+                state.quadrotor.velocity[0] += slope_accel[0] * dt;
+                state.quadrotor.velocity[1] += slope_accel[1] * dt;
+                state.quadrotor.velocity[0] *= GROUND_SLIDING_DAMPING;
+                state.quadrotor.velocity[1] *= GROUND_SLIDING_DAMPING;
+            } else {
+                state.quadrotor.velocity[0] *= GROUND_STATIC_DAMPING;
+                state.quadrotor.velocity[1] *= GROUND_STATIC_DAMPING;
+            }
+
+            // Specific force a resting accelerometer reads. On level ground
+            // this is the exact [0, 0, -g] the EKF depends on; on a slope it is
+            // that vector in the tilted airframe's own frame, which is a real
+            // physical reading rather than the integration artifact the
+            // flat-ground path exists to suppress.
+            self.ground_rest_accel_body = if is_level(normal) {
+                [0.0, 0.0, -gravity]
+            } else {
+                let g_ned = nalgebra::Vector3::new(0.0, 0.0, gravity);
+                let sf = state.quadrotor.quaternion.inverse() * (-g_ned);
+                [sf.x, sf.y, sf.z]
+            };
         }
 
         // Decrement impact counter (ticks down whether on ground or not)
@@ -538,8 +652,16 @@ impl SimulationLoop {
                 );
             } else if self.ground_contact_active {
                 let gravity = self.config.physics.gravity;
-                force_body =
-                    nalgebra::Vector3::new(0.0, 0.0, -self.config.physics.mass_kg * gravity);
+                let mass = self.config.physics.mass_kg;
+                force_body = nalgebra::Vector3::new(
+                    self.ground_rest_accel_body[0] * mass,
+                    self.ground_rest_accel_body[1] * mass,
+                    self.ground_rest_accel_body[2] * mass,
+                );
+                debug_assert!(
+                    force_body.norm() > 0.0 || gravity == 0.0,
+                    "resting accel must be initialised before ground contact"
+                );
             }
 
             // Accelerometer reading = specific force = non-gravitational acceleration
@@ -1056,6 +1178,106 @@ mod tests {
             (down - ground_z).abs() < 1e-6,
             "inside coverage the drone must be clamped to the sampled ground \
              height {ground_z}, got {down}"
+        );
+    }
+
+    /// Level ground must keep producing an exactly level attitude. Any residual
+    /// tilt here becomes a lateral accelerometer bias that the EKF integrates
+    /// into tens of metres of position drift.
+    #[test]
+    fn level_ground_produces_an_exactly_level_attitude() {
+        for yaw in [0.0, 0.7, -2.1, std::f64::consts::PI] {
+            let q = attitude_on_surface(LEVEL_NORMAL_NED, yaw);
+            let (roll, pitch, got_yaw) = q.euler_angles();
+            assert_eq!(roll, 0.0, "roll must be exactly zero on level ground");
+            assert_eq!(pitch, 0.0, "pitch must be exactly zero on level ground");
+            assert!((got_yaw - yaw).abs() < 1e-12, "yaw must be preserved");
+        }
+    }
+
+    /// Resting on a slope must tilt the airframe with the surface rather than
+    /// leaving it flat, and must preserve heading.
+    #[test]
+    fn resting_attitude_follows_the_surface_and_keeps_heading() {
+        // 30-degree slope falling to the north: normal leans north.
+        let theta: f64 = 30_f64.to_radians();
+        let normal = [theta.sin() as f32, 0.0, -theta.cos() as f32];
+        let yaw = 0.0;
+
+        let q = attitude_on_surface(normal, yaw);
+        let (roll, pitch, got_yaw) = q.euler_angles();
+
+        assert!(
+            (pitch.abs() - theta).abs() < 1e-6,
+            "expected {theta} rad of pitch on a 30-degree slope, got {pitch}"
+        );
+        assert!(roll.abs() < 1e-6, "no roll expected for a pure north slope, got {roll}");
+        assert!((got_yaw - yaw).abs() < 1e-6, "heading must be preserved");
+
+        // Body "down" must plant into the surface, i.e. oppose the normal.
+        let z_body_ned = q * nalgebra::Vector3::new(0.0, 0.0, 1.0);
+        let up = nalgebra::Vector3::new(normal[0] as f64, normal[1] as f64, normal[2] as f64);
+        assert!(
+            (z_body_ned.dot(&up) + 1.0).abs() < 1e-6,
+            "body down should be antiparallel to the surface normal"
+        );
+    }
+
+    #[test]
+    fn downslope_accel_is_zero_on_level_ground_and_points_downhill_otherwise() {
+        let g = 9.81;
+        let flat = downslope_accel(LEVEL_NORMAL_NED, g);
+        assert!(flat[0].abs() < 1e-12 && flat[1].abs() < 1e-12);
+
+        // Ground falling towards the north: normal tilts north, so the pull
+        // along the surface must also be northward.
+        let theta: f64 = 30_f64.to_radians();
+        let normal = [theta.sin() as f32, 0.0, -theta.cos() as f32];
+        let a = downslope_accel(normal, g);
+        assert!(a[0] > 0.0, "expected northward downhill pull, got {}", a[0]);
+        // |a_tangential| = g sin(theta) cos(theta)... check the magnitude of
+        // the full 3-vector instead: g*sin(theta).
+        let mag = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
+        assert!(
+            (mag - g * theta.sin()).abs() < 1e-6,
+            "expected g*sin(theta) = {}, got {mag}",
+            g * theta.sin()
+        );
+    }
+
+    /// A drone parked on gentle ground must stay parked: static friction has to
+    /// beat the downhill pull, or landed vehicles creep forever.
+    #[test]
+    fn gentle_slopes_do_not_make_a_parked_drone_creep() {
+        let g = 9.81;
+        // 10 degrees: tan(10 deg) = 0.18, well under the 0.6 friction floor.
+        let theta: f64 = 10_f64.to_radians();
+        let normal = [theta.sin() as f32, 0.0, -theta.cos() as f32];
+
+        let a = downslope_accel(normal, g);
+        let pull = (a[0] * a[0] + a[1] * a[1]).sqrt();
+        let normal_load = g * (-normal[2] as f64);
+        assert!(
+            pull < GROUND_FRICTION_COEFF * normal_load,
+            "a 10-degree slope must not overcome static friction"
+        );
+    }
+
+    /// Steep ground must overcome friction, otherwise the sim can never show a
+    /// drone sliding off a hillside.
+    #[test]
+    fn steep_slopes_overcome_static_friction() {
+        let g = 9.81;
+        // 45 degrees: tan = 1.0, above the 0.6 friction floor.
+        let theta: f64 = 45_f64.to_radians();
+        let normal = [theta.sin() as f32, 0.0, -theta.cos() as f32];
+
+        let a = downslope_accel(normal, g);
+        let pull = (a[0] * a[0] + a[1] * a[1]).sqrt();
+        let normal_load = g * (-normal[2] as f64);
+        assert!(
+            pull > GROUND_FRICTION_COEFF * normal_load,
+            "a 45-degree slope must overcome static friction"
         );
     }
 
