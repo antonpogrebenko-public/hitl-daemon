@@ -181,12 +181,10 @@ impl ActuatorOutputs {
         data: &HIL_ACTUATOR_CONTROLS_DATA,
     ) -> Result<Self, ProtocolError> {
         let mut motors = [0.0f32; 4];
-        let mut controls = [0.0f32; 16];
 
-        // Copy all 16 control channels
-        for (i, &control) in data.controls.iter().enumerate() {
-            controls[i] = control;
-        }
+        // `[f32; 16]` is `Copy` — direct assignment is equivalent to the
+        // element-wise loop but avoids the manual indexing.
+        let controls = data.controls;
 
         // Extract motor outputs with PX4 → Simulation remapping
         // PX4 sends motor values in [0, 1] range (0 = off, 1 = full throttle)
