@@ -151,7 +151,7 @@ The 400 Hz loop in `loop_runner.rs`:
 6. Discharge battery based on total motor current (`total_motor_current`)
 7. If battery depleted → zero motor commands (drone falls); **sim-only**: auto-recharge after 3s
 8. RK4 integration step
-9. **Ground contact**: unified threshold (no dead zone), thrust-proportional friction (no sticky ground)
+9. **Ground contact**: unified threshold (no dead zone); attitude follows the sampled surface normal; Coulomb friction threshold decides park vs slide
 10. Sample sensors (IMU@400Hz, mag/baro@50Hz, GPS@10Hz)
 11. Send HIL_SENSOR and HIL_GPS to PX4
 
@@ -206,14 +206,30 @@ If no HEARTBEAT is received within 5s of connecting, the daemon suspects the FC 
 ### Sensor channel backpressure
 If a sensor channel is full (producer outpacing consumer), the daemon emits a rate-limited warn at 5s and escalates to error at 2s continuous. Indicates the simulation loop is overloaded or a consumer task has stalled.
 
-### Ground accelerometer must NOT use quaternion rotation
-In `loop_runner.rs`, the on-ground accelerometer override must produce `[0, 0, -mg]` directly in body frame. Do NOT rotate the NED gravity vector by the quaternion — any residual quaternion tilt (even 0.25°) creates a persistent accel lateral bias that the EKF integrates into massive position drift (76m in 77s observed). This also prevents landing detection because the EKF altitude estimate diverges.
+### Ground accelerometer: level ground must NOT use quaternion rotation
+On **level** ground the on-ground accelerometer override must produce `[0, 0, -mg]` directly in body frame. Do NOT rotate the NED gravity vector by the simulated quaternion — any residual tilt (even 0.25°) creates a persistent lateral accel bias that the EKF integrates into massive position drift (76m in 77s observed), and it also prevents landing detection because the altitude estimate diverges.
+
+Since slope support this is a *conditional*, not a blanket rule. `is_level()` gates it on the sampled surface normal. Level ground takes the exact `[0, 0, -g]` path, and `attitude_on_surface()` builds an exact euler attitude with no matrix round-trip, so there is no residual to integrate. On genuinely sloped ground the drone really is tilted and the reading is the gravity reaction rotated into the resting attitude — a physical measurement, not the artifact the flat-ground path guards against. Do not collapse the two branches back into one.
+
+### Ground friction is a Coulomb threshold, not blanket damping
+`GROUND_FRICTION_COEFF = 0.6` (about 31°). Below it a parked drone keeps `GROUND_STATIC_DAMPING` (0.9/tick) and stays put; above it, gravity along the surface wins and it slides with only `GROUND_SLIDING_DAMPING` (0.999/tick). A flat 0.9 everywhere is 1e-19 per second at 400 Hz — infinitely sticky ground that makes every slope behave like a level plane.
+
+### Terrain coverage gaps mean "unknown", never "flat"
+`ground_z` is `Option<f64>`. `None` means terrain is configured but the drone left the cached 3x3 tile block. Collapsing it to 0.0 clamps a drone flying below the origin datum straight up to it, velocity zeroed and attitude levelled — a discontinuity the EKF cannot reconcile. Unknown ground disables the clamp and logs a rate-limited warning. Flat Z=0 applies only when no terrain is configured at all.
+
+### Landed state comes from PX4, never from the simulation
+The daemon consumes `EXTENDED_SYS_STATE` and forwards `MAV_LANDED_STATE` in the state frame at byte `[86]`. The simulation deliberately does not infer it: the value is PX4's own land-detector verdict, so a disagreement with the simulated ground contact is the signal that synthesized sensors have misled the EKF. Computing it locally would destroy the only cross-check.
+
+### Altitude datum comes from the DEM, not --alt
+When terrain loads, `reference_alt` is replaced by `TerrainCache::origin_elevation_msl()`. Ground collision, the barometer, and HIL_GPS MSL then share one datum. Keeping the CLI `--alt` leaves baro and GPS self-consistent but both offset from true MSL (~1640 m with the default Boulder reference), so the vehicle plots below real terrain in QGC.
 
 ### ConfigureBuild zeroes accel/gyro calibration offsets
 `push_pids_and_verify()` sends `CAL_ACC0_XOFF/YOFF/ZOFF=0` and `CAL_GYRO0_XOFF/YOFF/ZOFF=0` alongside PIDs. The real FC has calibration offsets from hardware mounting (e.g., +0.05 m/s² X-axis). PX4 subtracts these from raw readings. Since the simulated IMU has no physical bias, these offsets create a persistent ~0.05 m/s² lateral acceleration that the EKF integrates into 1.6m/8s of drift. Zeroing them eliminates the bias.
 
 ### Ground impact deceleration prevents EKF underground divergence
 When the drone hits the ground at speed (>0.5 m/s), the simulation generates a 100ms deceleration impulse on the accelerometer (`ground_impact_accel`). Without this, the ground clamp instantly zeros velocity but reports only gravity — the EKF sees no force to explain the velocity change, rejects GPS, and dead-reckons underground (37m observed in a 6.4 m/s impact). The impulse gives the EKF a physical event it can reconcile with the sudden velocity change.
+
+The impulse is derived from **NED** velocity and the accelerometer reads in the **body** frame, so the full `(a - g)` vector is rotated by the impact attitude before it is reported. Skipping that rotation puts the lateral component on the wrong body axis for any non-zero yaw — a 90° yaw sends a northward impact onto body Y — and the EKF integrates a phantom sideways acceleration.
 
 ## WebSocket Protocol
 
