@@ -15,7 +15,13 @@
 //! - `[82]`: armed (u8 bool)
 //! - `[83]`: flight_mode (u8)
 //! - `[84-85]`: packets_per_sec (u16 LE)
-//! - Total: 86 bytes
+//! - `[86]`: landed_state (u8, MAV_LANDED_STATE: 0=undefined, 1=on ground,
+//!   2=in air, 3=takeoff, 4=landing)
+//! - Total: 87 bytes
+//!
+//! Readers must accept frames of at least `STATE_UPDATE_MIN_SIZE` (86) bytes so
+//! a browser talking to an older daemon still parses; the missing trailing byte
+//! decodes as landed_state = 0 (undefined).
 //!
 //! ## 0x02: Handshake ACK
 //! - `[0]`: 0x02 message type
@@ -59,8 +65,13 @@ pub const MSG_TYPE_HANDSHAKE: u8 = 0x11;
 pub const MSG_TYPE_NSH_COMMAND: u8 = 0x12;
 pub const MSG_TYPE_CONFIGURE_BUILD: u8 = 0x13;
 
-// State update size
-pub const STATE_UPDATE_SIZE: usize = 86;
+// State update size (current wire format)
+pub const STATE_UPDATE_SIZE: usize = 87;
+
+/// Smallest state frame a reader must still accept. Frames from daemons older
+/// than the landed_state field are 86 bytes; the absent byte decodes as 0
+/// (MAV_LANDED_STATE_UNDEFINED).
+pub const STATE_UPDATE_MIN_SIZE: usize = 86;
 
 #[derive(Debug, Error)]
 pub enum ProtocolError {
@@ -94,10 +105,12 @@ pub struct StateUpdate {
     pub armed: bool,
     pub flight_mode: u8,
     pub packets_per_sec: u16,
+    /// Flight controller's land detector verdict (MAV_LANDED_STATE).
+    pub landed_state: u8,
 }
 
 impl StateUpdate {
-    /// Serialize to binary format (86 bytes)
+    /// Serialize to binary format (87 bytes)
     pub fn to_bytes(&self) -> [u8; STATE_UPDATE_SIZE] {
         let mut buf = [0u8; STATE_UPDATE_SIZE];
 
@@ -140,15 +153,16 @@ impl StateUpdate {
         buf[82] = self.armed as u8;
         buf[83] = self.flight_mode;
         buf[84..86].copy_from_slice(&self.packets_per_sec.to_le_bytes());
+        buf[86] = self.landed_state;
 
         buf
     }
 
     /// Deserialize from binary format
     pub fn from_bytes(data: &[u8]) -> Result<Self, ProtocolError> {
-        if data.len() < STATE_UPDATE_SIZE {
+        if data.len() < STATE_UPDATE_MIN_SIZE {
             return Err(ProtocolError::MessageTooShort {
-                expected: STATE_UPDATE_SIZE,
+                expected: STATE_UPDATE_MIN_SIZE,
                 actual: data.len(),
             });
         }
@@ -194,6 +208,9 @@ impl StateUpdate {
         let armed = data[82] != 0;
         let flight_mode = data[83];
         let packets_per_sec = u16::from_le_bytes(data[84..86].try_into().unwrap());
+        // Absent on pre-landed_state daemons; 0 is MAV_LANDED_STATE_UNDEFINED,
+        // which is exactly the right meaning for "this daemon cannot tell us".
+        let landed_state = data.get(86).copied().unwrap_or(0);
 
         Ok(Self {
             timestamp_us,
@@ -207,6 +224,7 @@ impl StateUpdate {
             armed,
             flight_mode,
             packets_per_sec,
+            landed_state,
         })
     }
 }
@@ -890,6 +908,39 @@ impl IncomingMessage {
 mod tests {
     use super::*;
 
+    /// A browser on the current protocol must still parse frames from a daemon
+    /// that predates the landed_state byte, reporting UNDEFINED rather than
+    /// rejecting the frame and blanking the whole telemetry view.
+    #[test]
+    fn state_update_accepts_legacy_86_byte_frame() {
+        let state = StateUpdate {
+            timestamp_us: 42,
+            armed: true,
+            flight_mode: 3,
+            landed_state: 4,
+            ..StateUpdate::default()
+        };
+
+        let full = state.to_bytes();
+        let legacy = &full[..STATE_UPDATE_MIN_SIZE];
+
+        let parsed = StateUpdate::from_bytes(legacy).expect("legacy frame must parse");
+        assert_eq!(parsed.timestamp_us, 42);
+        assert_eq!(parsed.flight_mode, 3);
+        assert!(parsed.armed);
+        assert_eq!(
+            parsed.landed_state, 0,
+            "a frame without the byte must decode as UNDEFINED, not carry stale data"
+        );
+    }
+
+    /// Anything shorter than the legacy frame is genuinely malformed.
+    #[test]
+    fn state_update_rejects_short_frame() {
+        let short = [MSG_TYPE_STATE_UPDATE; 40];
+        assert!(StateUpdate::from_bytes(&short).is_err());
+    }
+
     #[test]
     fn test_state_update_roundtrip() {
         let state = StateUpdate {
@@ -904,11 +955,13 @@ mod tests {
             armed: true,
             flight_mode: 3,
             packets_per_sec: 349,
+            landed_state: 2, // MAV_LANDED_STATE_IN_AIR
         };
 
         let bytes = state.to_bytes();
         assert_eq!(bytes.len(), STATE_UPDATE_SIZE);
         assert_eq!(bytes[0], MSG_TYPE_STATE_UPDATE);
+        assert_eq!(bytes[86], 2, "landed_state must occupy the trailing byte");
 
         let parsed = StateUpdate::from_bytes(&bytes).unwrap();
         assert_eq!(parsed.timestamp_us, state.timestamp_us);
@@ -921,6 +974,7 @@ mod tests {
         assert_eq!(parsed.battery_percent, state.battery_percent);
         assert_eq!(parsed.armed, state.armed);
         assert_eq!(parsed.flight_mode, state.flight_mode);
+        assert_eq!(parsed.landed_state, state.landed_state);
         assert_eq!(parsed.packets_per_sec, state.packets_per_sec);
     }
 

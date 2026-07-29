@@ -40,7 +40,7 @@ impl Default for SimulationConfig {
             reference_lon: -105.2705,
             reference_alt: 1655.0,
             tick_rate_hz: 400,
-            gps_rate_hz: 5,
+            gps_rate_hz: 10,
             terrain: None,
         }
     }
@@ -80,6 +80,12 @@ pub struct SimulationStateInner {
     pub armed: bool,
     /// Flight mode from flight controller (PX4 custom_mode)
     pub flight_mode: u8,
+    /// Landed state reported by the flight controller's land detector, as
+    /// MAV_LANDED_STATE (0=undefined, 1=on ground, 2=in air, 3=takeoff,
+    /// 4=landing). The simulation never infers this — it is PX4's own verdict,
+    /// which is what makes it useful: comparing it against the sim's ground
+    /// contact reveals when synthesized sensors have misled the EKF.
+    pub landed_state: u8,
 }
 
 impl SimulationStateInner {
@@ -94,6 +100,7 @@ impl SimulationStateInner {
             running: true,
             armed: false,
             flight_mode: 0,
+            landed_state: 0,
         }
     }
 
@@ -106,6 +113,7 @@ impl SimulationStateInner {
         self.motor_commands = [0.0; 4];
         self.armed = false;
         self.flight_mode = 0;
+        self.landed_state = 0;
     }
 }
 
@@ -113,7 +121,8 @@ impl SimulationStateInner {
 #[derive(Clone)]
 pub struct SimulationState {
     inner: Arc<RwLock<SimulationStateInner>>,
-    config: Arc<SimulationConfig>,
+    /// Swappable config: written by `reconfigure`, read by all callers via `config()`.
+    config: Arc<RwLock<SimulationConfig>>,
 }
 
 impl SimulationState {
@@ -122,7 +131,7 @@ impl SimulationState {
         let inner = SimulationStateInner::new(&config);
         Self {
             inner: Arc::new(RwLock::new(inner)),
-            config: Arc::new(config),
+            config: Arc::new(RwLock::new(config)),
         }
     }
 
@@ -136,9 +145,13 @@ impl SimulationState {
         self.inner.write()
     }
 
-    /// Get simulation configuration
-    pub fn config(&self) -> &SimulationConfig {
-        &self.config
+    /// Get a snapshot clone of the current simulation configuration.
+    ///
+    /// Returns a clone so callers hold no lock across the slow path. For the
+    /// hot 400 Hz loop, `SimulationLoop` owns its own `self.config` copy and
+    /// never calls this — only the WebSocket broadcast path (30 Hz) uses it.
+    pub fn config(&self) -> SimulationConfig {
+        self.config.read().clone()
     }
 
     /// Update motor commands from actuator outputs
@@ -166,6 +179,17 @@ impl SimulationState {
         self.inner.read().flight_mode
     }
 
+    /// Update the landed state reported by the flight controller
+    /// (MAV_LANDED_STATE from EXTENDED_SYS_STATE).
+    pub fn set_landed_state(&self, landed_state: u8) {
+        self.inner.write().landed_state = landed_state;
+    }
+
+    /// Get the flight controller's current landed state (MAV_LANDED_STATE).
+    pub fn landed_state(&self) -> u8 {
+        self.inner.read().landed_state
+    }
+
     /// Get current simulation time in microseconds
     pub fn sim_time_us(&self) -> u64 {
         self.inner.read().sim_time_us
@@ -181,18 +205,87 @@ impl SimulationState {
         self.inner.write().running = false;
     }
 
-    /// Reset simulation state
+    /// Reset simulation state using the current live config.
     pub fn reset(&self) {
-        self.inner.write().reset(&self.config);
+        let cfg = self.config.read().clone();
+        self.inner.write().reset(&cfg);
     }
 
-    /// Reconfigure: reset inner state for new physics parameters
-    pub fn reconfigure(&self) {
-        self.inner.write().reset(&self.config);
+    /// Reconfigure: store the new config as the live config, then reset inner
+    /// state so battery capacity, sensor noise, etc. reflect the new build.
+    pub fn reconfigure(&self, new_config: SimulationConfig) {
+        // First, store the new config so `reset` (and all readers) see the
+        // live values. Then reset inner state using the freshly-stored config.
+        *self.config.write() = new_config;
+        let cfg = self.config.read().clone();
+        self.inner.write().reset(&cfg);
     }
 
     /// Recharge the battery to full
     pub fn recharge_battery(&self) {
         self.inner.write().battery.recharge();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hitl_physics::BatteryConfig;
+
+    /// After `reconfigure` with a different battery spec, the inner battery
+    /// state must reflect the NEW capacity and cell count — not the stale ones.
+    #[test]
+    fn reconfigure_updates_battery_state() {
+        // Build the initial state with a 1000 mAh, 4-cell battery.
+        let initial_battery = BatteryConfig {
+            capacity_mah: 1000.0,
+            cell_count: 4,
+            ..BatteryConfig::default()
+        };
+        let initial_config = SimulationConfig {
+            battery: initial_battery,
+            ..SimulationConfig::default()
+        };
+        let sim_state = SimulationState::new(initial_config);
+
+        // Verify initial values.
+        {
+            let inner = sim_state.read();
+            // A fully-charged 4S pack is ~4.2 V × 4 = 16.8 V.
+            assert!(
+                inner.battery.voltage() > 16.0,
+                "Initial voltage should be >16 V (4S full), got {}",
+                inner.battery.voltage()
+            );
+        }
+
+        // Reconfigure with a larger 2000 mAh, 6-cell battery.
+        let new_battery = BatteryConfig {
+            capacity_mah: 2000.0,
+            cell_count: 6,
+            ..BatteryConfig::default()
+        };
+        let new_config = SimulationConfig {
+            battery: new_battery,
+            ..SimulationConfig::default()
+        };
+        sim_state.reconfigure(new_config);
+
+        // After reconfigure the battery state must reflect 6S, not the stale 4S.
+        {
+            let inner = sim_state.read();
+            // A fully-charged 6S pack is ~4.2 V × 6 = 25.2 V.
+            assert!(
+                inner.battery.voltage() > 24.0,
+                "After reconfigure, voltage should be >24 V (6S full), got {}",
+                inner.battery.voltage()
+            );
+        }
+
+        // The live config stored inside SimulationState must also reflect the
+        // new cell count and capacity.
+        let live = sim_state.config();
+        assert_eq!(live.battery.cell_count, 6);
+        assert!((live.battery.capacity_mah - 2000.0).abs() < 0.1);
     }
 }

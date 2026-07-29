@@ -32,10 +32,20 @@ const ACTUATOR_STALE_TIMEOUT: Duration = Duration::from_millis(100);
 /// Minimum interval between stale-actuator warning log lines.
 const STALE_WARN_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Minimum interval between out-of-terrain-coverage warning log lines.
+const TERRAIN_MISS_WARN_INTERVAL: Duration = Duration::from_secs(5);
+
 /// If the HIL_SENSOR channel stays full continuously for this long, escalate
 /// to `error!` — the FC has likely disconnected without the serial layer
 /// detecting it yet.
 const DROP_ERROR_THRESHOLD: Duration = Duration::from_secs(2);
+
+/// Length of the ground-impact deceleration impulse, in ticks (40 @ 400 Hz = 100 ms).
+const IMPACT_DURATION_TICKS: u32 = 40;
+
+/// Minimum downward speed (m/s) that generates an impact impulse. Below this a
+/// landing is gentle enough that the clamp alone does not confuse the EKF.
+const IMPACT_VEL_THRESHOLD: f64 = 0.5;
 
 /// Mag sensor update divider (400 Hz / 8 = 50 Hz)
 const MAG_UPDATE_DIVIDER: u64 = 8;
@@ -96,6 +106,10 @@ pub struct SimulationLoop {
     last_actuator_time: Instant,
     /// Last time a stale-actuator warning was emitted (rate-limits log spam).
     last_stale_warning: Instant,
+    /// Last time an out-of-terrain-coverage warning was emitted. Rate-limits
+    /// what would otherwise be a 400 Hz log stream once the drone flies past
+    /// the edge of the cached tile block.
+    last_terrain_miss_warning: Instant,
     /// Set by step_physics when the ground clamp fires or the quad is at z=0.
     /// Read by sample_and_send_sensors to produce clean [0,0,-g] accel on ground.
     ground_contact_active: bool,
@@ -133,6 +147,7 @@ impl SimulationLoop {
             channel_full_since: None,
             last_actuator_time: Instant::now(),
             last_stale_warning: Instant::now(),
+            last_terrain_miss_warning: Instant::now(),
             ground_contact_active: true,
             ground_impact_ticks_remaining: 0,
             ground_impact_accel: [0.0; 3],
@@ -186,7 +201,12 @@ impl SimulationLoop {
                     self.config.physics = new_physics;
                     self.config.battery = new_battery;
                     self.config.sensors = new_sensors;
-                    self.state.reconfigure();
+                    // Pass the freshly-updated config so SimulationState stores the
+                    // live values (battery capacity, cell count, sensors) before it
+                    // resets inner state. Without this, the stale Arc inside
+                    // SimulationState would be used for the battery reset, producing
+                    // wrong SoC/voltage for any non-default build.
+                    self.state.reconfigure(self.config.clone());
                     self.last_mag = None;
                     self.last_baro = None;
                     self.build_configured = true;
@@ -311,23 +331,35 @@ impl SimulationLoop {
     fn step_physics(&mut self, dt: f64) {
         let mut state = self.state.write();
 
-        // NED: Z>ground_z means below ground (clamped).
-        // If terrain loaded, sample ground elevation; otherwise use flat ground at Z=0.
-        let ground_z = self
-            .config
-            .terrain
-            .as_ref()
-            .and_then(|t| {
-                t.sample_ground_ned(
+        // Ground height in NED (Z > ground_z means below ground). `None` means
+        // the height is *unknown*: terrain is configured but the drone has left
+        // the cached tile block. Unknown must not be conflated with "flat at the
+        // origin datum" — doing so teleports a drone flying below the origin
+        // straight up to it, a discontinuity the EKF cannot reconcile.
+        // Flat ground at Z=0 applies only when no terrain is configured at all.
+        let ground_z: Option<f64> = match self.config.terrain.as_ref() {
+            Some(terrain) => terrain
+                .sample_ground_ned(
                     state.quadrotor.position[0], // north
                     state.quadrotor.position[1], // east
                 )
-            })
-            .map(|z| z as f64)
-            .unwrap_or(0.0);
+                .map(|z| z as f64),
+            None => Some(0.0),
+        };
 
-        // Skip physics only when disarmed on the ground (gyro calibration)
-        let on_ground = state.quadrotor.position[2] >= ground_z;
+        if ground_z.is_none() && self.last_terrain_miss_warning.elapsed() >= TERRAIN_MISS_WARN_INTERVAL
+        {
+            warn!(
+                north = state.quadrotor.position[0],
+                east = state.quadrotor.position[1],
+                "Outside terrain coverage — ground collision disabled until the drone returns"
+            );
+            self.last_terrain_miss_warning = Instant::now();
+        }
+
+        // Skip physics only when disarmed on the ground (gyro calibration).
+        // Unknown ground is never "on the ground".
+        let on_ground = ground_z.is_some_and(|g| state.quadrotor.position[2] >= g);
         let motors_active = state.motor_commands.iter().any(|&c| c > 0.01);
 
         if motors_active || !on_ground {
@@ -361,6 +393,10 @@ impl SimulationLoop {
 
             // Step physics using RK4 integration
             state.quadrotor = rk4_step(&state.quadrotor, &self.config.physics, motor_omegas, dt);
+
+            // Debug-only invariant checks: zero cost in release builds because
+            // every assertion inside check_all is gated on `#[cfg(debug_assertions)]`.
+            hitl_physics::conservation::check_all(&state.quadrotor, &self.config.physics);
         }
 
         // Ground contact model with impact deceleration.
@@ -375,17 +411,14 @@ impl SimulationLoop {
         // 3. Sensor ground mode (hysteresis): keeps accel at [0,0,-g] until
         //    the quad is clearly airborne (z < -0.10m). This prevents EKF
         //    contamination during the liftoff bounce phase.
-        const IMPACT_DURATION_TICKS: u32 = 40; // 40 ticks @ 400Hz = 100ms
-        const IMPACT_VEL_THRESHOLD: f64 = 0.5; // m/s — only generate impulse for hard landings
-
         let velocity_before_clamp = [
             state.quadrotor.velocity[0],
             state.quadrotor.velocity[1],
             state.quadrotor.velocity[2],
         ];
 
-        let physics_on_ground = state.quadrotor.position[2] >= ground_z;
-        if physics_on_ground {
+        let physics_on_ground = ground_z.is_some_and(|g| state.quadrotor.position[2] >= g);
+        if let Some(ground_z) = ground_z.filter(|_| physics_on_ground) {
             state.quadrotor.position[2] = ground_z;
 
             // Trigger impact deceleration if hitting ground with significant downward velocity.
@@ -396,23 +429,35 @@ impl SimulationLoop {
                 && self.ground_impact_ticks_remaining == 0
             {
                 let impact_dt = IMPACT_DURATION_TICKS as f64 * dt;
-                // Deceleration needed to bring velocity to zero over impact_dt.
-                // In NED: vz>0 means downward, so deceleration is negative-Z (upward).
-                // Body-frame accel reported to IMU = deceleration + gravity reaction.
-                let decel_z = -velocity_before_clamp[2] / impact_dt;
-                let decel_x = -velocity_before_clamp[0] / impact_dt;
-                let decel_y = -velocity_before_clamp[1] / impact_dt;
-                // Accelerometer measures specific force: normal force - gravity.
-                // On impact: F_ground/m = decel + g (ground pushes up harder than gravity).
-                // Specific force (what accel measures) = F_ground/m - g = decel.
-                // In body FRD frame: z-accel = decel_z + (-g) = -(vz/dt) - g
+                // Deceleration needed to bring velocity to zero over impact_dt,
+                // in NED. vz>0 means downward, so this is negative-Z (upward).
+                let decel_ned = nalgebra::Vector3::new(
+                    -velocity_before_clamp[0] / impact_dt,
+                    -velocity_before_clamp[1] / impact_dt,
+                    -velocity_before_clamp[2] / impact_dt,
+                );
+                // The accelerometer measures specific force = a - g, and it does
+                // so in the BODY frame. `decel_ned` is in NED, so it must be
+                // rotated by the impact attitude before being reported — a yawed
+                // drone otherwise reports its lateral impact on the wrong body
+                // axis and the EKF integrates a phantom sideways acceleration.
+                // Rotating the whole (a - g) vector reduces to the old
+                // [decel_x, decel_y, decel_z - g] when the drone is level.
                 let gravity = self.config.physics.gravity;
-                self.ground_impact_accel = [decel_x, decel_y, decel_z - gravity];
+                let specific_force_ned =
+                    decel_ned - nalgebra::Vector3::new(0.0, 0.0, gravity);
+                let specific_force_body =
+                    state.quadrotor.quaternion.inverse() * specific_force_ned;
+                self.ground_impact_accel = [
+                    specific_force_body.x,
+                    specific_force_body.y,
+                    specific_force_body.z,
+                ];
                 self.ground_impact_ticks_remaining = IMPACT_DURATION_TICKS;
                 debug!(
                     vz = velocity_before_clamp[2],
                     impact_ms = (impact_dt * 1000.0) as u32,
-                    decel_z,
+                    decel_z = decel_ned.z,
                     "Ground impact: generating deceleration impulse"
                 );
             }
@@ -442,8 +487,16 @@ impl SimulationLoop {
         // gets clean [0,0,-g] accel through the entire liftoff transition.
         if physics_on_ground {
             self.ground_contact_active = true;
-        } else if state.quadrotor.position[2] < ground_z - 0.10 {
-            self.ground_contact_active = false;
+        } else {
+            let airborne = match ground_z {
+                Some(g) => state.quadrotor.position[2] < g - 0.10,
+                // Outside terrain coverage there is no surface to be in contact
+                // with, so the drone is by definition airborne.
+                None => true,
+            };
+            if airborne {
+                self.ground_contact_active = false;
+            }
         }
 
         // Update simulation time
@@ -801,5 +854,243 @@ impl SimulationLoop {
     /// Get current statistics
     pub fn stats(&self) -> SimulationStats {
         self.stats.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nalgebra::{UnitQuaternion, Vector3};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use terrain::{BBox, ElevationMeta, TerrainCache, TileCoord, TileMeta, TILE_SIZE};
+
+    const DT: f64 = 1.0 / 400.0;
+    const TEST_LAT: f64 = 40.015;
+    const TEST_LON: f64 = -105.2705;
+    const TEST_ZOOM: u32 = 14;
+
+    /// Build a loop with idle channels — enough to drive `step_physics`
+    /// directly without a flight controller or a running `run()` loop. The
+    /// senders are kept alive for the test's lifetime so the receivers never
+    /// report `Disconnected`.
+    fn test_loop(config: SimulationConfig) -> (SimulationLoop, TestChannels) {
+        let (actuator_tx, actuator_rx) = crossbeam_channel::unbounded();
+        let (config_tx, config_rx) = crossbeam_channel::unbounded();
+        let (mav_tx, mav_rx) = crossbeam_channel::unbounded();
+        let sim = SimulationLoop::new(config, actuator_rx, config_rx, mav_tx);
+        (
+            sim,
+            TestChannels {
+                _actuator_tx: actuator_tx,
+                _config_tx: config_tx,
+                _mav_rx: mav_rx,
+            },
+        )
+    }
+
+    #[allow(dead_code)]
+    struct TestChannels {
+        _actuator_tx: Sender<ActuatorOutputs>,
+        _config_tx: Sender<(PhysicsConfig, BatteryConfig, hitl_sensors::SensorsConfig)>,
+        _mav_rx: Receiver<MavMessage>,
+    }
+
+    /// 3x3 tiles of flat terrain at `elevation_msl` around the reference point.
+    fn flat_terrain(elevation_msl: f32) -> Arc<TerrainCache> {
+        let center = TileCoord::from_lon_lat(TEST_LON, TEST_LAT, TEST_ZOOM);
+        let mut tiles = HashMap::new();
+        for dy in -1i32..=1 {
+            for dx in -1i32..=1 {
+                let coord = TileCoord {
+                    x: (center.x as i32 + dx) as u32,
+                    y: (center.y as i32 + dy) as u32,
+                    z: TEST_ZOOM,
+                };
+                tiles.insert(coord, vec![elevation_msl; TILE_SIZE * TILE_SIZE]);
+            }
+        }
+
+        let meta = TileMeta {
+            schema_version: 1,
+            provider: "test".to_string(),
+            zoom: TEST_ZOOM,
+            tile_size: TILE_SIZE as u32,
+            bbox: BBox {
+                west: -180.0,
+                south: -85.0,
+                east: 180.0,
+                north: 85.0,
+            },
+            elevation: ElevationMeta {
+                units: "meters".to_string(),
+                datum: "test".to_string(),
+            },
+        };
+
+        let cache = TerrainCache::new();
+        assert!(cache.load_from_tiles(meta, tiles, TEST_LAT, TEST_LON, 0.0));
+        Arc::new(cache)
+    }
+
+    /// The accelerometer reports specific force in the **body** frame, but the
+    /// impact deceleration is derived from NED velocity. With any non-zero yaw
+    /// the two disagree, so the lateral impulse must be rotated into the body
+    /// frame before it reaches the IMU — otherwise a northward impact on an
+    /// east-facing drone lands on the wrong axis and the EKF integrates a
+    /// phantom sideways acceleration.
+    #[test]
+    fn impact_impulse_is_reported_in_the_body_frame() {
+        let (mut sim, _ch) = test_loop(SimulationConfig::default());
+
+        // Nose east (yaw +90 deg), travelling north and descending fast.
+        let yaw = std::f64::consts::FRAC_PI_2;
+        let velocity_ned = [3.0, 0.0, 2.0];
+        {
+            let mut state = sim.state.write();
+            state.quadrotor.quaternion = UnitQuaternion::from_euler_angles(0.0, 0.0, yaw);
+            state.quadrotor.position = [0.0, 0.0, -0.001];
+            state.quadrotor.velocity = velocity_ned;
+        }
+
+        sim.step_physics(DT);
+
+        assert!(
+            sim.ground_impact_ticks_remaining > 0,
+            "a 2 m/s descent onto the ground must trigger the impact impulse"
+        );
+
+        // Expected: NED velocity rotated into the body frame, then divided by
+        // the impulse window. Yaw +90 deg puts 3 m/s north onto body -Y.
+        let impact_dt = IMPACT_DURATION_TICKS as f64 * DT;
+        let q = UnitQuaternion::from_euler_angles(0.0, 0.0, yaw);
+        let v_body = q.inverse() * Vector3::new(velocity_ned[0], velocity_ned[1], 0.0);
+        let expected_x = -v_body.x / impact_dt;
+        let expected_y = -v_body.y / impact_dt;
+
+        let got = sim.ground_impact_accel;
+        assert!(
+            (got[0] - expected_x).abs() < 1.0,
+            "body-X impact accel: expected ~{expected_x:.2}, got {:.2}",
+            got[0]
+        );
+        assert!(
+            (got[1] - expected_y).abs() < 1.0,
+            "body-Y impact accel: expected ~{expected_y:.2}, got {:.2}",
+            got[1]
+        );
+    }
+
+    /// When terrain is loaded but the drone has flown outside the cached tile
+    /// block, the ground height is *unknown*. Treating unknown as "flat at the
+    /// origin datum" teleports a drone that is below the origin straight up to
+    /// it, zeroing velocity and levelling attitude — a discontinuity the EKF
+    /// cannot reconcile. Unknown ground must mean "do not clamp".
+    #[test]
+    fn missing_terrain_sample_does_not_teleport_the_drone() {
+        let config = SimulationConfig {
+            terrain: Some(flat_terrain(1655.0)),
+            ..SimulationConfig::default()
+        };
+        let (mut sim, _ch) = test_loop(config);
+
+        // A zoom-14 tile is ~1.9 km tall at this latitude, so the 3x3 block
+        // reaches at most ~2.8 km from the origin: 4 km north is outside
+        // coverage while staying inside the simulation's 10 km position bound.
+        // 50 m down puts the drone *below* the origin ground datum — a valley
+        // the loaded tiles do not cover.
+        {
+            let mut state = sim.state.write();
+            state.quadrotor.position = [4_000.0, 0.0, 50.0];
+            state.quadrotor.velocity = [0.0, 0.0, 0.0];
+        }
+        assert!(
+            sim.config
+                .terrain
+                .as_ref()
+                .unwrap()
+                .sample_ground_ned(4_000.0, 0.0)
+                .is_none(),
+            "fixture precondition: 4 km north must be outside the tile block"
+        );
+
+        sim.step_physics(DT);
+
+        let down = sim.state.read().quadrotor.position[2];
+        assert!(
+            down > 49.0,
+            "drone must not be clamped to the origin datum when the ground \
+             height is unknown; expected to stay near 50 m down, got {down}"
+        );
+    }
+
+    /// Inside coverage the clamp must still fire, at the sampled terrain height.
+    #[test]
+    fn clamp_uses_sampled_terrain_height() {
+        let config = SimulationConfig {
+            terrain: Some(flat_terrain(1655.0)),
+            ..SimulationConfig::default()
+        };
+        let (mut sim, _ch) = test_loop(config);
+
+        let ground_z = sim
+            .config
+            .terrain
+            .as_ref()
+            .and_then(|t| t.sample_ground_ned(0.0, 0.0))
+            .map(|z| z as f64)
+            .expect("origin is inside the loaded tiles");
+        assert!(
+            ground_z.abs() < 1e-3,
+            "flat terrain at the origin must put ground at NED 0, got {ground_z}"
+        );
+
+        {
+            let mut state = sim.state.write();
+            state.quadrotor.position = [0.0, 0.0, 5.0]; // 5 m below ground
+        }
+        sim.step_physics(DT);
+
+        let down = sim.state.read().quadrotor.position[2];
+        assert!(
+            (down - ground_z).abs() < 1e-6,
+            "inside coverage the drone must be clamped to the sampled ground \
+             height {ground_z}, got {down}"
+        );
+    }
+
+    /// Sensor ground mode latches on contact and only releases once the drone
+    /// is clearly airborne, so the EKF sees clean [0,0,-g] through liftoff.
+    #[test]
+    fn ground_contact_latches_until_clearly_airborne() {
+        let (mut sim, _ch) = test_loop(SimulationConfig::default());
+
+        sim.state.write().quadrotor.position = [0.0, 0.0, 0.0];
+        sim.step_physics(DT);
+        assert!(sim.ground_contact_active, "resting on ground must latch on");
+
+        // 5 cm up is inside the hysteresis band — still latched.
+        {
+            let mut state = sim.state.write();
+            state.quadrotor.position = [0.0, 0.0, -0.05];
+            state.quadrotor.velocity = [0.0, 0.0, 0.0];
+        }
+        sim.step_physics(DT);
+        assert!(
+            sim.ground_contact_active,
+            "5 cm above ground is inside the 10 cm hysteresis band"
+        );
+
+        // 50 cm up is clearly airborne — latch releases.
+        {
+            let mut state = sim.state.write();
+            state.quadrotor.position = [0.0, 0.0, -0.5];
+            state.quadrotor.velocity = [0.0, 0.0, 0.0];
+        }
+        sim.step_physics(DT);
+        assert!(
+            !sim.ground_contact_active,
+            "50 cm above ground must release the ground latch"
+        );
     }
 }

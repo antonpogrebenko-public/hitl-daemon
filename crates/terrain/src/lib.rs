@@ -5,7 +5,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-const TILE_SIZE: usize = 256;
+/// Samples per tile edge. Part of the public tile contract: callers of
+/// [`TerrainCache::load_from_tiles`] must supply `TILE_SIZE * TILE_SIZE` heights.
+pub const TILE_SIZE: usize = 256;
 const R_EARTH: f64 = 6378137.0;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -340,6 +342,23 @@ impl TerrainCache {
             }
         }
 
+        self.load_from_tiles(meta, tiles, lat, lon, reference_alt)
+    }
+
+    /// Populate the cache from already-decoded height tiles, bypassing HTTP.
+    ///
+    /// `tiles` maps tile coordinates to `TILE_SIZE * TILE_SIZE` f32 samples in
+    /// MSL metres, row-major from the tile's north-west corner. Shared by
+    /// [`TerrainCache::load`] and by callers that source tiles from disk, a
+    /// bundle, or a test fixture. Returns whether any tile was stored.
+    pub fn load_from_tiles(
+        &self,
+        meta: TileMeta,
+        tiles: HashMap<TileCoord, Vec<f32>>,
+        lat: f64,
+        lon: f64,
+        reference_alt: f64,
+    ) -> bool {
         let tile_count = tiles.len();
 
         let origin_elevation = Self::sample_elevation_raw(&tiles, &meta, lat, lon);
@@ -505,5 +524,139 @@ mod tests {
         let coord = TileCoord::from_lon_lat(lon + 0.001, lat - 0.001, 14);
         assert_eq!(coord.x, 3400);
         assert_eq!(coord.y, 6200);
+    }
+
+    const TEST_LAT: f64 = 40.015;
+    const TEST_LON: f64 = -105.2705;
+    const TEST_ZOOM: u32 = 14;
+
+    fn test_meta() -> TileMeta {
+        TileMeta {
+            schema_version: 1,
+            provider: "test".to_string(),
+            zoom: TEST_ZOOM,
+            tile_size: TILE_SIZE as u32,
+            bbox: BBox {
+                west: -180.0,
+                south: -85.0,
+                east: 180.0,
+                north: 85.0,
+            },
+            elevation: ElevationMeta {
+                units: "meters".to_string(),
+                datum: "test".to_string(),
+            },
+        }
+    }
+
+    /// Build a cache holding the 3x3 tile block around (TEST_LAT, TEST_LON) —
+    /// the same footprint the real HTTP loader fetches. `height_at(lat, lon)`
+    /// supplies MSL metres, so tests can express real-world gradients without
+    /// caring which tile a sample lands in.
+    fn cache_with_tiles(height_at: impl Fn(f64, f64) -> f32) -> TerrainCache {
+        let center = TileCoord::from_lon_lat(TEST_LON, TEST_LAT, TEST_ZOOM);
+        let mut tiles = HashMap::new();
+
+        for dy in -1i32..=1 {
+            for dx in -1i32..=1 {
+                let coord = TileCoord {
+                    x: (center.x as i32 + dx) as u32,
+                    y: (center.y as i32 + dy) as u32,
+                    z: TEST_ZOOM,
+                };
+                // Invert the sampler's fx/fy mapping so sample (col, row)
+                // resolves back to the lat/lon the sampler will ask for.
+                let (nw_lon, nw_lat) = tile_to_lon_lat(coord.x, coord.y, coord.z);
+                let (se_lon, se_lat) = tile_to_lon_lat(coord.x + 1, coord.y + 1, coord.z);
+                let last = (TILE_SIZE - 1) as f64;
+
+                let mut heights = vec![0.0f32; TILE_SIZE * TILE_SIZE];
+                for row in 0..TILE_SIZE {
+                    let lat = nw_lat - (row as f64 / last) * (nw_lat - se_lat);
+                    for col in 0..TILE_SIZE {
+                        let lon = nw_lon + (col as f64 / last) * (se_lon - nw_lon);
+                        heights[row * TILE_SIZE + col] = height_at(lat, lon);
+                    }
+                }
+                tiles.insert(coord, heights);
+            }
+        }
+
+        let cache = TerrainCache::new();
+        assert!(cache.load_from_tiles(test_meta(), tiles, TEST_LAT, TEST_LON, 0.0));
+        cache
+    }
+
+    /// The NED ground datum is defined so that ground == 0 exactly at the
+    /// origin, whatever the terrain's absolute MSL elevation. The frontend
+    /// mesh puts local Y=0 at the same point, so any drift here shows up as
+    /// the viewer's ground disagreeing with the physics ground.
+    #[test]
+    fn sample_ground_ned_is_zero_at_origin() {
+        for elevation in [0.0f32, 1655.0, -50.0] {
+            let cache = cache_with_tiles(|_, _| elevation);
+            let ground = cache
+                .sample_ground_ned(0.0, 0.0)
+                .expect("origin is inside the loaded tile");
+            assert!(
+                ground.abs() < 1e-3,
+                "ground at origin must be 0 for elevation {elevation}, got {ground}"
+            );
+        }
+    }
+
+    /// NED is down-positive: terrain higher than the origin must report a
+    /// negative ground coordinate, terrain lower must report positive.
+    #[test]
+    fn sample_ground_ned_sign_follows_ned_down_convention() {
+        // Ground rises 1 m per 0.001 deg of latitude (~9 m per 100 m north).
+        let cache = cache_with_tiles(|lat, _| (1655.0 + (lat - TEST_LAT) * 1000.0) as f32);
+
+        let north = cache
+            .sample_ground_ned(500.0, 0.0)
+            .expect("500 m north stays inside the 3x3 block");
+        let south = cache
+            .sample_ground_ned(-500.0, 0.0)
+            .expect("500 m south stays inside the 3x3 block");
+
+        assert!(
+            north < 0.0,
+            "higher terrain to the north must be negative in NED, got {north}"
+        );
+        assert!(
+            south > 0.0,
+            "lower terrain to the south must be positive in NED, got {south}"
+        );
+    }
+
+    /// Outside the cached tiles the sampler must report "unknown" rather than
+    /// silently implying flat ground at the origin datum. The physics loop
+    /// depends on this distinction to avoid clamping the drone to the wrong
+    /// height.
+    #[test]
+    fn sample_ground_ned_returns_none_outside_coverage() {
+        let cache = cache_with_tiles(|_, _| 1655.0);
+        // 50 km north is many tiles away at zoom 14.
+        assert!(cache.sample_ground_ned(50_000.0, 0.0).is_none());
+        assert!(cache.sample_ground_ned(0.0, 50_000.0).is_none());
+    }
+
+    #[test]
+    fn sample_ground_ned_returns_none_when_not_loaded() {
+        let cache = TerrainCache::new();
+        assert!(!cache.is_loaded());
+        assert!(cache.sample_ground_ned(0.0, 0.0).is_none());
+    }
+
+    /// `origin_elevation_msl` is the bridge between the terrain datum and the
+    /// baro/GPS reference altitude; it must report the sampled DEM value.
+    #[test]
+    fn origin_elevation_msl_reports_sampled_dem_value() {
+        let cache = cache_with_tiles(|_, _| 1655.0);
+        let elev = cache.origin_elevation_msl().expect("origin inside tile");
+        assert!(
+            (elev - 1655.0).abs() < 1e-3,
+            "expected 1655 m MSL at origin, got {elev}"
+        );
     }
 }

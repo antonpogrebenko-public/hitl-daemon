@@ -277,9 +277,13 @@ fn spawn_sim_only_actuator_thread(
 
 /// Create WebSocket state update from simulation state
 fn create_state_update(sim_state: &SimulationState, packets_per_sec: u16) -> StateUpdate {
+    // Read the live config first (clone — no lock held across the inner read).
+    // This ensures motor RPM computation uses the current build's physics
+    // (max_motor_speed, etc.) rather than the stale config that was set at
+    // construction time.
+    let config = sim_state.config();
     let state = sim_state.read();
     let q = &state.quadrotor;
-    let config = sim_state.config();
 
     StateUpdate {
         timestamp_us: state.sim_time_us,
@@ -317,6 +321,7 @@ fn create_state_update(sim_state: &SimulationState, packets_per_sec: u16) -> Sta
         armed: state.armed,
         flight_mode: state.flight_mode,
         packets_per_sec,
+        landed_state: state.landed_state,
     }
 }
 
@@ -375,8 +380,36 @@ async fn main() {
     let terrain_ref = (args.reference_lat, args.reference_lon, args.reference_alt);
 
     // Load terrain tiles if URL provided via CLI (blocking - must complete before sim starts)
+    //
+    // The DEM's elevation at the origin becomes the vertical datum for the whole
+    // simulation. Three things reference "altitude" and they must agree:
+    //   - ground collision  (terrain: origin_elevation - msl)
+    //   - barometer         (reference_alt - position.down)
+    //   - HIL_GPS MSL       (reference_alt + height above origin)
+    // Keeping the CLI --alt when the DEM says otherwise leaves baro and GPS
+    // self-consistent but both offset from true MSL, so the vehicle plots below
+    // real terrain in QGC. Adopt the sampled elevation instead.
+    let mut reference_alt = args.reference_alt;
     if let Some(ref url) = args.terrain_url {
         if terrain_cache.load(url, terrain_ref.0, terrain_ref.1, terrain_ref.2).await {
+            match terrain_cache.origin_elevation_msl() {
+                Some(dem_alt) => {
+                    if (dem_alt - args.reference_alt).abs() > 1.0 {
+                        info!(
+                            cli_alt = args.reference_alt,
+                            dem_alt,
+                            "Terrain loaded — adopting DEM elevation at the origin as the \
+                             altitude datum (overrides --alt)"
+                        );
+                    }
+                    reference_alt = dem_alt;
+                }
+                None => warn!(
+                    "Terrain loaded but the origin is outside tile coverage — \
+                     keeping --alt {} as the altitude datum",
+                    args.reference_alt
+                ),
+            }
             info!("Terrain loaded for ground collision detection");
         } else {
             warn!("Failed to load terrain from CLI URL - using flat ground at Z=0");
@@ -386,7 +419,7 @@ async fn main() {
     let sim_config = SimulationConfig {
         reference_lat: args.reference_lat,
         reference_lon: args.reference_lon,
-        reference_alt: args.reference_alt,
+        reference_alt,
         tick_rate_hz: args.tick_rate,
         gps_rate_hz: args.gps_rate,
         sensors: clean_sensors,
@@ -1233,6 +1266,15 @@ async fn main() {
                                     }
 
                                     // Extract flight mode and FC model from HEARTBEAT
+                                    // PX4's land detector verdict. The simulation
+                                    // deliberately does not infer this — surfacing
+                                    // the FC's own answer is what lets the UI (and
+                                    // a human) spot a disagreement between the sim's
+                                    // ground contact and what the EKF believes.
+                                    if let MavMessage::EXTENDED_SYS_STATE(ess) = &msg {
+                                        sim_state_recv.set_landed_state(ess.landed_state as u8);
+                                    }
+
                                     if let MavMessage::HEARTBEAT(hb) = &msg {
                                         heartbeat_received = true;
 
