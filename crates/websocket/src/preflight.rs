@@ -86,6 +86,14 @@ const QUADROTOR_AUTOSTART_ID: f32 = 4001.0;
 const PREFLIGHT_RECONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const PREFLIGHT_RECONNECT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Minimum continuous silence (no HEARTBEAT) required after clearing the
+/// cache before a subsequent HEARTBEAT is trusted as a genuine post-reboot
+/// reconnect rather than a straggler the FC sent before it actually
+/// processed the reboot command. PX4 takes 3-5s to clear its bootloader on
+/// power-up; a straggler heartbeat lands within about one HEARTBEAT period
+/// (~1s) of the reboot command being sent. 2s cleanly separates the two.
+const PREFLIGHT_QUIET_PERIOD: Duration = Duration::from_secs(2);
+
 pub struct PreflightHandler {
     mav_tx: Option<Sender<MavMessage>>,
     param_value_tx: Option<broadcast::Sender<(String, f32)>>,
@@ -190,7 +198,11 @@ impl PreflightHandler {
 
         send_progress(&progress_tx, PreflightApplyState::Reconnecting).await;
         if !self
-            .wait_for_reconnect(PREFLIGHT_RECONNECT_TIMEOUT, PREFLIGHT_RECONNECT_POLL_INTERVAL)
+            .wait_for_reconnect(
+                PREFLIGHT_RECONNECT_TIMEOUT,
+                PREFLIGHT_RECONNECT_POLL_INTERVAL,
+                PREFLIGHT_QUIET_PERIOD,
+            )
             .await
         {
             return PreflightApplyResult {
@@ -217,19 +229,44 @@ impl PreflightHandler {
         }
     }
 
-    /// Poll the cached heartbeat status until `heartbeat_seen` becomes true
-    /// or `timeout` elapses. Extracted from `apply()` so tests can inject a
-    /// short timeout instead of waiting out the real 30s budget.
-    async fn wait_for_reconnect(&self, timeout: Duration, poll_interval: Duration) -> bool {
+    /// Poll the cached heartbeat status until a HEARTBEAT arrives that is
+    /// trustworthy as a genuine post-reboot reconnect, or `timeout` elapses.
+    /// A HEARTBEAT is only trusted once `quiet_period` of continuous silence
+    /// has been observed first — anything arriving before that is treated
+    /// as a stale pre-reboot straggler (cleared, and the quiet-period
+    /// countdown restarts), because the physical FC keeps heartbeating with
+    /// its old pre-fix state for a while after the reboot command is sent,
+    /// well before it has actually rebooted.
+    async fn wait_for_reconnect(
+        &self,
+        timeout: Duration,
+        poll_interval: Duration,
+        quiet_period: Duration,
+    ) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
+        let mut quiet_start = tokio::time::Instant::now();
+        let mut confirmed_quiet = false;
+
         loop {
-            let (seen, _, _) = self.sim_state.heartbeat_status();
-            if seen {
-                return true;
-            }
             if tokio::time::Instant::now() >= deadline {
                 return false;
             }
+
+            let (seen, _, _) = self.sim_state.heartbeat_status();
+            if seen {
+                if confirmed_quiet {
+                    // Arrived only after we confirmed real silence — genuine.
+                    return true;
+                }
+                // Straggler during the quiet-confirmation phase. Clear it
+                // and restart the countdown; we haven't confirmed the FC
+                // actually went quiet yet.
+                self.sim_state.clear_heartbeat_status();
+                quiet_start = tokio::time::Instant::now();
+            } else if !confirmed_quiet && tokio::time::Instant::now() >= quiet_start + quiet_period {
+                confirmed_quiet = true;
+            }
+
             tokio::time::sleep(poll_interval).await;
         }
     }
@@ -339,9 +376,11 @@ mod apply_tests {
         let sim_state_for_reboot = sim_state.clone();
         // Simulate the FC coming back post-reboot: a real HEARTBEAT would
         // call SimulationState::set_heartbeat_status via main.rs; here we do
-        // it directly after a short delay to model the reconnect.
+        // it directly after modeling genuine silence past the real
+        // PREFLIGHT_QUIET_PERIOD (2s) — anything sooner would be (correctly)
+        // treated as a stale pre-reboot straggler and cleared.
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::time::sleep(Duration::from_millis(2200)).await;
             sim_state_for_reboot.set_heartbeat_status(true, true);
         });
 
@@ -398,9 +437,38 @@ mod apply_tests {
         let sim_state = SimulationState::new(SimulationConfig::default());
         let handler = make_handler(None, None, sim_state);
         let ok = handler
-            .wait_for_reconnect(Duration::from_millis(100), Duration::from_millis(20))
+            .wait_for_reconnect(
+                Duration::from_millis(100),
+                Duration::from_millis(20),
+                Duration::from_millis(30),
+            )
             .await;
         assert!(!ok);
+    }
+
+    #[tokio::test]
+    async fn wait_for_reconnect_rejects_straggler_before_quiet_period() {
+        let sim_state = SimulationState::new(SimulationConfig::default());
+        let sim_state_for_straggler = sim_state.clone();
+        // A single stale heartbeat lands early — well before the 150ms quiet
+        // period could have elapsed — and nothing genuine ever follows it.
+        // wait_for_reconnect must reject it as a straggler (clear it,
+        // restart the countdown) rather than accept it, and since no real
+        // reconnect ever arrives, it must time out.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            sim_state_for_straggler.set_heartbeat_status(true, true);
+        });
+
+        let handler = make_handler(None, None, sim_state);
+        let ok = handler
+            .wait_for_reconnect(
+                Duration::from_millis(500),
+                Duration::from_millis(20),
+                Duration::from_millis(150),
+            )
+            .await;
+        assert!(!ok, "a lone straggler heartbeat must not be trusted as a genuine reconnect");
     }
 
     #[tokio::test]
