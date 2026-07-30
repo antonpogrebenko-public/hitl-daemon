@@ -202,6 +202,14 @@ impl ConnectionHandler {
                 self.shutdown_signal.store(true, Ordering::SeqCst);
                 Ok(None)
             }
+            IncomingMessage::RequestPreflightCheck => {
+                // Task 5 wires this to PreflightHandler
+                Err("RequestPreflightCheck not yet dispatched".to_string())
+            }
+            IncomingMessage::ApplyPreflightParams => {
+                // Task 5 wires this to PreflightHandler
+                Err("ApplyPreflightParams not yet dispatched".to_string())
+            }
         }
     }
 

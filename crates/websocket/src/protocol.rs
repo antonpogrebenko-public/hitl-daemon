@@ -64,6 +64,10 @@ pub const MSG_TYPE_COMMAND: u8 = 0x10;
 pub const MSG_TYPE_HANDSHAKE: u8 = 0x11;
 pub const MSG_TYPE_NSH_COMMAND: u8 = 0x12;
 pub const MSG_TYPE_CONFIGURE_BUILD: u8 = 0x13;
+pub const MSG_TYPE_PREFLIGHT_STATUS: u8 = 0x0A;
+pub const MSG_TYPE_PREFLIGHT_APPLY_RESULT: u8 = 0x0B;
+pub const MSG_TYPE_REQUEST_PREFLIGHT_CHECK: u8 = 0x14;
+pub const MSG_TYPE_APPLY_PREFLIGHT_PARAMS: u8 = 0x15;
 
 // State update size (current wire format)
 pub const STATE_UPDATE_SIZE: usize = 87;
@@ -533,6 +537,68 @@ pub struct AppliedConfig {
     pub verified_params: u32,
 }
 
+/// Result of a `RequestPreflightCheck` — an instant, cache-only read of the
+/// FC's last-known HITL/quadrotor status (no MAVLink round-trip).
+///
+/// ## Binary format (0x0A)
+/// - `[0]`: 0x0A message type
+/// - `[1-N]`: JSON body `{ "connected": bool, "hitl_enabled": bool, "is_quadrotor": bool }`
+#[derive(Debug, Clone, Serialize)]
+pub struct PreflightStatus {
+    /// Whether any HEARTBEAT has ever been received (false in --sim-only or
+    /// before the first HEARTBEAT arrives).
+    pub connected: bool,
+    pub hitl_enabled: bool,
+    pub is_quadrotor: bool,
+}
+
+impl PreflightStatus {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let json = serde_json::to_vec(self).expect("PreflightStatus serialization cannot fail");
+        let mut buf = Vec::with_capacity(1 + json.len());
+        buf.push(MSG_TYPE_PREFLIGHT_STATUS);
+        buf.extend_from_slice(&json);
+        buf
+    }
+}
+
+/// Lifecycle stage of an `ApplyPreflightParams` request. Mirrors
+/// `ConfigState`'s two-stage shape: the same message type carries both
+/// interim progress (`success: true`, non-terminal `state`) and the final
+/// result (`Done`/`Error`).
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreflightApplyState {
+    Applying,
+    Rebooting,
+    Reconnecting,
+    Verifying,
+    Done,
+    Error,
+}
+
+/// ## Binary format (0x0B)
+/// - `[0]`: 0x0B message type
+/// - `[1-N]`: JSON body `{ "state": ..., "success": bool, "error"?: string }`
+#[derive(Debug, Clone, Serialize)]
+pub struct PreflightApplyResult {
+    pub state: PreflightApplyState,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl PreflightApplyResult {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let json =
+            serde_json::to_vec(self).expect("PreflightApplyResult serialization cannot fail");
+        let mut buf = Vec::with_capacity(1 + json.len());
+        buf.push(MSG_TYPE_PREFLIGHT_APPLY_RESULT);
+        buf.extend_from_slice(&json);
+        buf
+    }
+}
+
 /// JSON-friendly view of `hitl_physics::px4_pids::Px4Pids` for transport over
 /// the WebSocket. Kept here (rather than re-exporting upstream) so the wire
 /// schema is owned by the protocol crate and can evolve independently.
@@ -854,6 +920,8 @@ pub enum OutgoingMessage {
     VehicleMessage(VehicleMessage),
     ConfigResult(ConfigResult),
     TerrainOrigin(TerrainOrigin),
+    PreflightStatus(PreflightStatus),
+    PreflightApplyResult(PreflightApplyResult),
 }
 
 impl OutgoingMessage {
@@ -867,6 +935,8 @@ impl OutgoingMessage {
             OutgoingMessage::VehicleMessage(v) => v.to_bytes(),
             OutgoingMessage::ConfigResult(r) => r.to_bytes(),
             OutgoingMessage::TerrainOrigin(t) => t.to_bytes(),
+            OutgoingMessage::PreflightStatus(p) => p.to_bytes(),
+            OutgoingMessage::PreflightApplyResult(p) => p.to_bytes(),
         }
     }
 }
@@ -879,6 +949,8 @@ pub enum IncomingMessage {
     NshCommand(NshCommand),
     ConfigureBuild(ConfigureBuild),
     Shutdown,
+    RequestPreflightCheck,
+    ApplyPreflightParams,
 }
 
 impl IncomingMessage {
@@ -899,6 +971,8 @@ impl IncomingMessage {
                 ConfigureBuild::from_bytes(data)?,
             )),
             MSG_TYPE_SHUTDOWN => Ok(IncomingMessage::Shutdown),
+            MSG_TYPE_REQUEST_PREFLIGHT_CHECK => Ok(IncomingMessage::RequestPreflightCheck),
+            MSG_TYPE_APPLY_PREFLIGHT_PARAMS => Ok(IncomingMessage::ApplyPreflightParams),
             other => Err(ProtocolError::UnknownMessageType(other)),
         }
     }

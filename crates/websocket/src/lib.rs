@@ -5,13 +5,16 @@
 
 pub mod build_config;
 pub mod handler;
+pub mod preflight;
 pub mod protocol;
 pub mod server;
 
 pub use build_config::BuildConfigHandler;
 pub use handler::{ConnectionHandler, ValidatedCommand, ValidatedNshCommand};
+pub use preflight::heartbeat_hitl_signals;
 pub use protocol::{
     Command, CommandType, ConnectionStatus, HandshakeAck, IncomingMessage, NshCommand, NshResponse,
-    OutgoingMessage, StateUpdate, TerrainOrigin, VehicleMessage,
+    OutgoingMessage, PreflightApplyResult, PreflightApplyState, PreflightStatus, StateUpdate,
+    TerrainOrigin, VehicleMessage,
 };
 pub use server::{WebSocketServer, WebSocketServerConfig};
