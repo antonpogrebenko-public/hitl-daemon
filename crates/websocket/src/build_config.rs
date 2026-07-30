@@ -23,7 +23,7 @@ const PARAM_ACK_TIMEOUT: Duration = Duration::from_millis(800);
 /// How many times we resend a single PARAM_SET before giving up and failing
 /// the whole `ConfigureBuild`. Three covers a transient drop without making
 /// the user wait minutes on a truly unreachable FC.
-const PARAM_RETRY_COUNT: u8 = 3;
+pub(crate) const PARAM_RETRY_COUNT: u8 = 3;
 
 /// Float epsilon for matching PX4's `PARAM_VALUE` against the value we sent.
 /// PX4 stores rate-controller gains as `float32`, so any round-trip drift is
@@ -33,8 +33,8 @@ const PARAM_ACK_EPSILON: f32 = 1.0e-4;
 const DEFAULT_API_URL: &str = "https://api.th3seus.net";
 
 /// Default MAVLink routing for the connected PX4 autopilot.
-const PX4_TARGET_SYSTEM: u8 = 1;
-const PX4_TARGET_COMPONENT: u8 = 1;
+pub(crate) const PX4_TARGET_SYSTEM: u8 = 1;
+pub(crate) const PX4_TARGET_COMPONENT: u8 = 1;
 
 pub struct BuildConfigHandler {
     api_url: String,
@@ -989,7 +989,7 @@ fn parse_baro_chip(s: &str) -> BaroChip {
 /// whose value is within `PARAM_ACK_EPSILON` of `expected`. Returns the
 /// matched (name, value) tuple, or `None` if `PARAM_ACK_TIMEOUT` elapses
 /// without a match. Lagged/closed receivers are treated as "no ack".
-async fn wait_for_param_ack(
+pub(crate) async fn wait_for_param_ack(
     rx: &mut broadcast::Receiver<(String, f32)>,
     name: &str,
     expected: f32,
@@ -1020,7 +1020,7 @@ async fn wait_for_param_ack(
     }
 }
 
-fn make_param_set(name: &str, value: f32) -> MavMessage {
+pub(crate) fn make_param_set(name: &str, value: f32) -> MavMessage {
     let mut param_id = [0u8; 16];
     let bytes = name.as_bytes();
     let copy_len = bytes.len().min(param_id.len());
@@ -1037,7 +1037,7 @@ fn make_param_set(name: &str, value: f32) -> MavMessage {
 /// MAV_CMD_PREFLIGHT_STORAGE with `param1 = 1.0` (write parameter storage).
 /// PX4 commits the in-RAM parameter table to flash so subsequent reboots
 /// keep the per-build PIDs / `MPC_THR_HOVER` / `THR_MDL_FAC` we just pushed.
-fn make_param_save() -> MavMessage {
+pub(crate) fn make_param_save() -> MavMessage {
     MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
         target_system: PX4_TARGET_SYSTEM,
         target_component: PX4_TARGET_COMPONENT,

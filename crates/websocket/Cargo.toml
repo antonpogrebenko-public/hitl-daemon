@@ -8,6 +8,7 @@ license = "MIT"
 [dependencies]
 protocol = { path = "../protocol" }
 terrain = { path = "../terrain" }
+simulation = { path = "../simulation" }
 hitl-physics = { path = "../../../hitl-physics" }
 hitl-sensors = { path = "../../../hitl-sensors" }
 axum = { version = "0.7", features = ["ws"] }
