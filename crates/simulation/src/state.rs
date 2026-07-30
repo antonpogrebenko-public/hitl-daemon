@@ -86,6 +86,20 @@ pub struct SimulationStateInner {
     /// which is what makes it useful: comparing it against the sim's ground
     /// contact reveals when synthesized sensors have misled the EKF.
     pub landed_state: u8,
+    /// Whether any HEARTBEAT has ever been received from the FC. False in
+    /// --sim-only mode or before the first HEARTBEAT arrives. Also cleared
+    /// deliberately by `clear_heartbeat_status` right before a preflight-
+    /// triggered reboot, so the reconnect wait can distinguish "still the old
+    /// connection" from "a fresh HEARTBEAT after reboot".
+    pub heartbeat_seen: bool,
+    /// Cached from the latest HEARTBEAT's `base_mode`: whether PX4 reports
+    /// MAV_MODE_FLAG_HIL_ENABLED. Used by the preflight gate ahead of
+    /// ConfigureBuild — HITL cannot function with this false.
+    pub hitl_enabled: bool,
+    /// Cached from the latest HEARTBEAT's `mavtype`: whether PX4 reports
+    /// MAV_TYPE_QUADROTOR (any quad airframe variant, not tied to a specific
+    /// SYS_AUTOSTART id).
+    pub is_quadrotor: bool,
 }
 
 impl SimulationStateInner {
@@ -101,6 +115,9 @@ impl SimulationStateInner {
             armed: false,
             flight_mode: 0,
             landed_state: 0,
+            heartbeat_seen: false,
+            hitl_enabled: false,
+            is_quadrotor: false,
         }
     }
 
@@ -188,6 +205,32 @@ impl SimulationState {
     /// Get the flight controller's current landed state (MAV_LANDED_STATE).
     pub fn landed_state(&self) -> u8 {
         self.inner.read().landed_state
+    }
+
+    /// Update the cached HITL/quadrotor status from the latest HEARTBEAT.
+    pub fn set_heartbeat_status(&self, hitl_enabled: bool, is_quadrotor: bool) {
+        let mut inner = self.inner.write();
+        inner.heartbeat_seen = true;
+        inner.hitl_enabled = hitl_enabled;
+        inner.is_quadrotor = is_quadrotor;
+    }
+
+    /// Read the cached HITL/quadrotor status: `(heartbeat_seen, hitl_enabled,
+    /// is_quadrotor)`. `heartbeat_seen == false` means no HEARTBEAT has been
+    /// received since start (or since the last `clear_heartbeat_status`).
+    pub fn heartbeat_status(&self) -> (bool, bool, bool) {
+        let inner = self.inner.read();
+        (inner.heartbeat_seen, inner.hitl_enabled, inner.is_quadrotor)
+    }
+
+    /// Invalidate the cached HITL/quadrotor status. Called right before a
+    /// preflight-triggered FC reboot so the reconnect wait can tell a fresh
+    /// post-reboot HEARTBEAT apart from a stale pre-reboot one.
+    pub fn clear_heartbeat_status(&self) {
+        let mut inner = self.inner.write();
+        inner.heartbeat_seen = false;
+        inner.hitl_enabled = false;
+        inner.is_quadrotor = false;
     }
 
     /// Get current simulation time in microseconds
@@ -287,5 +330,37 @@ mod tests {
         let live = sim_state.config();
         assert_eq!(live.battery.cell_count, 6);
         assert!((live.battery.capacity_mah - 2000.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn heartbeat_status_starts_unseen() {
+        let state = SimulationState::new(SimulationConfig::default());
+        assert_eq!(state.heartbeat_status(), (false, false, false));
+    }
+
+    #[test]
+    fn set_heartbeat_status_marks_seen_and_stores_flags() {
+        let state = SimulationState::new(SimulationConfig::default());
+        state.set_heartbeat_status(true, false);
+        assert_eq!(state.heartbeat_status(), (true, true, false));
+    }
+
+    #[test]
+    fn clear_heartbeat_status_resets_to_unseen() {
+        let state = SimulationState::new(SimulationConfig::default());
+        state.set_heartbeat_status(true, true);
+        state.clear_heartbeat_status();
+        assert_eq!(state.heartbeat_status(), (false, false, false));
+    }
+
+    #[test]
+    fn reset_does_not_clear_heartbeat_status() {
+        // Reconfiguring the sim (new build) does not mean the FC's boot-time
+        // HITL/frame config changed — only a deliberate reboot (via
+        // clear_heartbeat_status) should invalidate this cache.
+        let state = SimulationState::new(SimulationConfig::default());
+        state.set_heartbeat_status(true, true);
+        state.reset();
+        assert_eq!(state.heartbeat_status(), (true, true, true));
     }
 }
