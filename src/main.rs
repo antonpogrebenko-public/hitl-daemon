@@ -1283,6 +1283,13 @@ async fn main() {
                                         let main_mode = ((hb.custom_mode >> 16) & 0xFF) as u8;
                                         sim_state_recv.set_flight_mode(main_mode);
 
+                                        // Preflight gate: cache whether PX4 reports HITL mode and
+                                        // quadrotor type so "Launch Simulation" can read this
+                                        // synchronously instead of a fresh MAVLink round-trip.
+                                        let (hitl_enabled, is_quadrotor) =
+                                            websocket::heartbeat_hitl_signals(hb);
+                                        sim_state_recv.set_heartbeat_status(hitl_enabled, is_quadrotor);
+
                                         use mavlink::ardupilotmega::{MavAutopilot, MavType};
                                         let mut model = fc_model_recv.write().await;
                                         if model.is_none() {
