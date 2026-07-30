@@ -5,6 +5,36 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.1] - 2026-07-29
+
+### Fixed
+- **Ground impact/sliding-friction desync** — the accelerometer impact impulse assumed the whole velocity vector was arrested in 100ms, which stopped being true once slopes could slide (tangential speed decays only ~4% in that window at the sliding damping rate). The slide decision is now made before the impulse, and on sliding ground only the into-surface component is arrested.
+- **Surface normal coverage gap at tile-block edges** — central-difference normal sampling needs all four probes, so a 5m shell along the tile-block boundary had a resolvable height but no normal and silently defaulted to level. Boundary probes now fall back to one-sided differences, matching the height field's coverage exactly.
+- **`ground_rest_accel_body` seeded from wrong config** — was read from `SimulationConfig::default()` instead of the constructor's config. Not exploitable today (gravity is identical in both paths and the field is refreshed before first sample), but correctness depended on an unenforced cross-crate invariant.
+
+## [0.11.0] - 2026-07-29
+
+### Added
+- **Sloped ground contact** — `TerrainCache::sample_ground_normal_ned` derives a unit surface normal from central differences over the height field. Resting attitude now follows the normal with heading preserved instead of snapping to `(0, 0, yaw)` on every slope.
+- **Coulomb friction threshold** — replaces the flat 0.9/tick damping (effectively infinite stiction at 400Hz) with a slope-angle threshold (`tan(theta) = 0.6`): below it the drone stays parked, above it gravity along the surface wins and it slides.
+
+### Changed
+- Resting accelerometer reading splits by branch: level ground keeps the exact `[0, 0, -g]` the EKF depends on; genuine slopes report the gravity reaction rotated into the tilted airframe's own frame.
+
+## [0.10.1] - 2026-07-29
+
+### Removed
+- **Dead `TerrainProvider`** — a second, unused terrain implementation (192 lines) with a different vertical datum than the live `TerrainCache`; reviving it would have silently disagreed with physics ground.
+- **Write-only `reference_alt`** on `TerrainCache` — never read after datum unification; removed from `load`/`load_from_tiles` and all call sites. Workspace now builds with zero warnings.
+
+## [0.10.0] - 2026-07-29
+
+### Fixed
+- **Ground coverage gaps no longer clamp to flat ground** — `ground_z` is now `Option<f64>`; sampling outside cached terrain previously collapsed to `0.0` via `unwrap_or`, teleporting a drone flying below the origin datum straight up to it. Unknown ground now disables the clamp and logs a rate-limited warning.
+- **Ground impact impulse rotated into body frame** — was computed from NED velocity and reported verbatim as body-frame specific force, putting the lateral component on the wrong body axis at any non-zero yaw. The full `(a - g)` vector is now rotated by the impact attitude.
+- **Landing detection now visible** — daemon consumes `EXTENDED_SYS_STATE` and forwards PX4's `MAV_LANDED_STATE` to the browser (wire format grows to 87 bytes, byte `[86]`), so a disagreement with simulated ground contact is a diagnostic instead of invisible.
+- **Altitude datum unified** — DEM elevation at origin becomes `reference_alt` on terrain load, so ground collision, baro, and HIL_GPS share one datum instead of collision using DEM while baro/GPS used `--alt`.
+
 ## [0.9.9] - 2026-06-22
 
 ### Added
