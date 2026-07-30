@@ -596,6 +596,11 @@ async fn main() {
     } else {
         Some(param_value_tx.clone())
     };
+    let preflight_handler = std::sync::Arc::new(websocket::PreflightHandler::new(
+        build_config_mav_tx.clone(),
+        build_config_param_value_tx.clone(),
+        sim_state.clone(),
+    ));
     let build_config_handler = std::sync::Arc::new(websocket::BuildConfigHandler::new(
         build_config_tx,
         nsh_tx_for_config,
@@ -607,6 +612,7 @@ async fn main() {
     // Keep a clone for the reconnect task so it can re-push PIDs after FC power cycles.
     let build_config_handler_for_reconnect = build_config_handler.clone();
     ws_server.set_build_config_handler(build_config_handler);
+    ws_server.set_preflight_handler(preflight_handler);
     let sim_state_for_recharge = sim_state.clone();
     ws_server.set_recharge_callback(std::sync::Arc::new(move || {
         sim_state_for_recharge.recharge_battery();

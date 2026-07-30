@@ -5,6 +5,7 @@
 
 use crate::build_config::BuildConfigHandler;
 use crate::handler::{ConnectionHandler, ValidatedCommand, ValidatedNshCommand};
+use crate::preflight::PreflightHandler;
 use crate::protocol::{ConnectionStatus, OutgoingMessage, StateUpdate, VehicleMessage};
 use axum::{
     extract::{
@@ -90,6 +91,8 @@ pub struct WebSocketServer {
     shutdown_signal: Arc<AtomicBool>,
     /// Build configuration handler
     build_config_handler: Option<Arc<BuildConfigHandler>>,
+    /// Preflight HITL/quadrotor gate handler
+    preflight_handler: Option<Arc<PreflightHandler>>,
     /// Recharge callback (for recharge command)
     recharge_fn: Option<crate::handler::RechargeCallback>,
 }
@@ -112,6 +115,7 @@ impl WebSocketServer {
             terrain_origin_rx: None,
             shutdown_signal: Arc::new(AtomicBool::new(false)),
             build_config_handler: None,
+            preflight_handler: None,
             recharge_fn: None,
         }
     }
@@ -161,6 +165,11 @@ impl WebSocketServer {
     /// Set the build configuration handler
     pub fn set_build_config_handler(&mut self, handler: Arc<BuildConfigHandler>) {
         self.build_config_handler = Some(handler);
+    }
+
+    /// Set the preflight handler
+    pub fn set_preflight_handler(&mut self, handler: Arc<PreflightHandler>) {
+        self.preflight_handler = Some(handler);
     }
 
     /// Set the battery recharge callback
@@ -230,6 +239,9 @@ impl WebSocketServer {
             } else {
                 None
             };
+        if let Some(preflight_handler) = self.preflight_handler {
+            handler.set_preflight_handler(preflight_handler);
+        }
         // Enable recharge callback
         if let Some(recharge_fn) = self.recharge_fn {
             handler.set_recharge_callback(recharge_fn);

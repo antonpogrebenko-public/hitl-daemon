@@ -4,9 +4,11 @@
 //! sending state updates.
 
 use crate::build_config::BuildConfigHandler;
+use crate::preflight::PreflightHandler;
 use crate::protocol::{
     Command, CommandAck, CommandType, ConfigResult, ConfigState, HandshakeAck, IncomingMessage,
-    NshCommand, NshResponse, OutgoingMessage, StateUpdate,
+    NshCommand, NshResponse, OutgoingMessage, PreflightApplyResult, PreflightApplyState,
+    PreflightStatus, StateUpdate,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -63,6 +65,8 @@ pub struct ConnectionHandler {
     nsh_tx: Option<mpsc::Sender<ValidatedNshCommand>>,
     /// Handler for build configuration requests
     build_config: Option<Arc<BuildConfigHandler>>,
+    /// Handler for the preflight HITL/quadrotor gate
+    preflight: Option<Arc<PreflightHandler>>,
     /// Callback to recharge battery in simulation
     recharge_fn: Option<RechargeCallback>,
     /// Broadcast channel to receive state updates
@@ -95,6 +99,7 @@ impl ConnectionHandler {
             command_tx,
             nsh_tx: None,
             build_config: None,
+            preflight: None,
             recharge_fn: None,
             state_rx,
             rate_limits: Arc::new(RwLock::new(HashMap::new())),
@@ -116,6 +121,11 @@ impl ConnectionHandler {
     /// Set the build config handler
     pub fn set_build_config_handler(&mut self, handler: Arc<BuildConfigHandler>) {
         self.build_config = Some(handler);
+    }
+
+    /// Set the preflight handler
+    pub fn set_preflight_handler(&mut self, handler: Arc<PreflightHandler>) {
+        self.preflight = Some(handler);
     }
 
     /// Set the battery recharge callback
@@ -203,12 +213,33 @@ impl ConnectionHandler {
                 Ok(None)
             }
             IncomingMessage::RequestPreflightCheck => {
-                // Task 5 wires this to PreflightHandler
-                Err("RequestPreflightCheck not yet dispatched".to_string())
+                debug!(client_id, "Received preflight check request");
+                let status = match &self.preflight {
+                    Some(h) => h.check().await,
+                    None => PreflightStatus {
+                        connected: false,
+                        hitl_enabled: false,
+                        is_quadrotor: false,
+                    },
+                };
+                Ok(Some(OutgoingMessage::PreflightStatus(status)))
             }
             IncomingMessage::ApplyPreflightParams => {
-                // Task 5 wires this to PreflightHandler
-                Err("ApplyPreflightParams not yet dispatched".to_string())
+                debug!(client_id, "Received apply preflight params request");
+                let handler = match &self.preflight {
+                    Some(h) => h.clone(),
+                    None => {
+                        return Ok(Some(OutgoingMessage::PreflightApplyResult(
+                            PreflightApplyResult {
+                                state: PreflightApplyState::Error,
+                                success: false,
+                                error: Some("Preflight handler not available".to_string()),
+                            },
+                        )));
+                    }
+                };
+                let result = handler.apply(progress_tx.clone()).await;
+                Ok(Some(OutgoingMessage::PreflightApplyResult(result)))
             }
         }
     }
@@ -474,6 +505,7 @@ impl Clone for ConnectionHandler {
             command_tx: self.command_tx.clone(),
             nsh_tx: self.nsh_tx.clone(),
             build_config: self.build_config.clone(),
+            preflight: self.preflight.clone(),
             state_rx: self.state_rx.resubscribe(),
             rate_limits: Arc::clone(&self.rate_limits),
             next_client_id: Arc::clone(&self.next_client_id),
@@ -486,6 +518,7 @@ impl Clone for ConnectionHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol;
     use tokio::sync::broadcast;
 
     async fn create_test_handler() -> (ConnectionHandler, mpsc::Receiver<ValidatedCommand>) {
@@ -612,5 +645,42 @@ mod tests {
         assert_eq!(validated.command.command_id, 42);
         assert_eq!(validated.command.command_type, CommandType::Arm);
         assert_eq!(validated.client_id, client_id);
+    }
+
+    #[tokio::test]
+    async fn preflight_check_without_handler_reports_disconnected() {
+        let (handler, _) = create_test_handler().await;
+        let (progress_tx, _rx) = mpsc::channel(8);
+        let response = handler
+            .handle_message(1, &[protocol::MSG_TYPE_REQUEST_PREFLIGHT_CHECK], &progress_tx)
+            .await
+            .unwrap()
+            .unwrap();
+        match response {
+            OutgoingMessage::PreflightStatus(status) => {
+                assert!(!status.connected);
+                assert!(!status.hitl_enabled);
+                assert!(!status.is_quadrotor);
+            }
+            _ => panic!("Expected PreflightStatus"),
+        }
+    }
+
+    #[tokio::test]
+    async fn preflight_apply_without_handler_reports_error() {
+        let (handler, _) = create_test_handler().await;
+        let (progress_tx, _rx) = mpsc::channel(8);
+        let response = handler
+            .handle_message(1, &[protocol::MSG_TYPE_APPLY_PREFLIGHT_PARAMS], &progress_tx)
+            .await
+            .unwrap()
+            .unwrap();
+        match response {
+            OutgoingMessage::PreflightApplyResult(result) => {
+                assert!(!result.success);
+                assert!(matches!(result.state, protocol::PreflightApplyState::Error));
+            }
+            _ => panic!("Expected PreflightApplyResult"),
+        }
     }
 }

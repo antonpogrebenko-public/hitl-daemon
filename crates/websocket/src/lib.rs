@@ -11,7 +11,7 @@ pub mod server;
 
 pub use build_config::BuildConfigHandler;
 pub use handler::{ConnectionHandler, ValidatedCommand, ValidatedNshCommand};
-pub use preflight::heartbeat_hitl_signals;
+pub use preflight::{heartbeat_hitl_signals, PreflightHandler};
 pub use protocol::{
     Command, CommandType, ConnectionStatus, HandshakeAck, IncomingMessage, NshCommand, NshResponse,
     OutgoingMessage, PreflightApplyResult, PreflightApplyState, PreflightStatus, StateUpdate,
