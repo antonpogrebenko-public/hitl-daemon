@@ -121,6 +121,16 @@ pub struct PreflightHandler {
     mav_tx: Option<Sender<MavMessage>>,
     param_value_tx: Option<broadcast::Sender<(String, f32)>>,
     sim_state: SimulationState,
+    /// Guards against two concurrent `apply()` runs against the same
+    /// physical FC. `ApplyPreflightParams` is now dispatched onto a
+    /// detached task rather than awaited inline (so the WebSocket receive
+    /// loop is never blocked for the 20-60s reboot window), which removed
+    /// the incidental serialization a blocking await used to provide. This
+    /// handler is shared (via `Arc`) across every connected browser client,
+    /// so the guard has to live here, not on any one connection — a double
+    /// click on one tab and a second tab hitting "Apply" both dispatch
+    /// through this same instance.
+    applying: std::sync::atomic::AtomicBool,
 }
 
 impl PreflightHandler {
@@ -132,6 +142,7 @@ impl PreflightHandler {
         Self {
             mav_tx,
             param_value_tx,
+            applying: std::sync::atomic::AtomicBool::new(false),
             sim_state,
         }
     }
@@ -154,7 +165,29 @@ impl PreflightHandler {
     /// Push SYS_HITL=1 + SYS_AUTOSTART=4001, save, reboot the FC, and wait for
     /// it to reconnect before re-verifying. Fail-closed: any ack failure
     /// aborts before the reboot is sent.
+    ///
+    /// Rejects a second call while one is already running (`self.applying`),
+    /// checked before anything else so a concurrent call never sends a
+    /// duplicate PARAM_SET/reboot to the FC. Since `ApplyPreflightParams` is
+    /// dispatched onto a detached task rather than awaited inline (the
+    /// receive loop can't afford to block for the 20-60s reboot window), the
+    /// blocking-await serialization that used to make this a non-issue is
+    /// gone — this guard replaces it.
     pub async fn apply(&self, progress_tx: mpsc::Sender<OutgoingMessage>) -> PreflightApplyResult {
+        if self
+            .applying
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return PreflightApplyResult {
+                state: PreflightApplyState::Error,
+                success: false,
+                error: Some("A preflight apply is already in progress".to_string()),
+            };
+        }
+        // Releases the guard on every return path below, including early
+        // returns, without needing to touch each one individually.
+        let _guard = ApplyGuard(&self.applying);
+
         let (Some(mav_tx), Some(param_value_tx)) =
             (self.mav_tx.as_ref(), self.param_value_tx.as_ref())
         else {
@@ -326,6 +359,17 @@ impl PreflightHandler {
 
             tokio::time::sleep(poll_interval).await;
         }
+    }
+}
+
+/// Resets `PreflightHandler::applying` to `false` on drop, so `apply()`
+/// releases its in-flight guard on every return path — including early
+/// returns and panics — without each one needing to reset it explicitly.
+struct ApplyGuard<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for ApplyGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -629,5 +673,53 @@ mod apply_tests {
         assert!(after.connected);
         assert!(after.hitl_enabled);
         assert!(after.is_quadrotor);
+    }
+
+    #[tokio::test]
+    async fn concurrent_apply_is_rejected_without_touching_the_fc() {
+        // ApplyPreflightParams is dispatched onto a detached task rather than
+        // awaited inline (so the WebSocket receive loop is never blocked for
+        // the real 20-60s reboot window), which removed the incidental
+        // serialization a blocking await used to provide. Without a guard, a
+        // second concurrent call would send a duplicate PARAM_SET/reboot to
+        // the same FC. No fake PX4 drains mav_rx here, so the first apply()
+        // sits in its PARAM_SET retry loop (~2.4s) for the whole test.
+        let (mav_tx, _mav_rx) = bounded::<MavMessage>(64);
+        let (pv_tx, _) = broadcast::channel::<(String, f32)>(64);
+        let sim_state = SimulationState::new(SimulationConfig::default());
+        let handler = std::sync::Arc::new(make_handler(Some(mav_tx), Some(pv_tx), sim_state));
+
+        let first_handler = handler.clone();
+        let (first_tx, _first_rx) = mpsc::channel(8);
+        let first = tokio::spawn(async move { first_handler.apply(first_tx).await });
+
+        // Give the first call a moment to acquire the guard.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let (second_tx, _second_rx) = mpsc::channel(8);
+        let second = handler.apply(second_tx).await;
+        assert!(!second.success);
+        assert!(matches!(second.state, PreflightApplyState::Error));
+        assert!(second
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("already in progress"));
+
+        let first_result = first.await.unwrap();
+        assert!(!first_result.success, "unrelated ack-timeout failure expected: {first_result:?}");
+
+        // The guard must release once the first call finishes, so a
+        // subsequent apply() is not permanently locked out.
+        let (third_tx, _third_rx) = mpsc::channel(8);
+        let third = handler.apply(third_tx).await;
+        assert!(
+            !third
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("already in progress"),
+            "guard should have released after the first apply() finished, got: {third:?}"
+        );
     }
 }
