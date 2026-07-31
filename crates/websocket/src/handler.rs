@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{debug, info, warn};
 
-/// Callback for battery recharge (avoids websocket → simulation crate dependency)
+/// Callback for battery recharge, invoked directly rather than routed through
+/// a channel — the simplest way to reach the simulation loop's state for this
+/// one operation, which needs no ordering against the actuator/sensor flow.
 pub type RechargeCallback = Arc<dyn Fn() + Send + Sync>;
 
 /// Rate limiting configuration
@@ -169,6 +171,10 @@ impl ConnectionHandler {
     /// it and return their single response via `Ok(Some(...))`. ConfigureBuild
     /// uses it to push an interim `state: Configuring` ConfigResult before
     /// the final result is returned (two-stage flow — see `BuildConfigHandler::handle`).
+    /// ApplyPreflightParams goes further: it dispatches its (minutes-long)
+    /// work onto a detached task and returns `Ok(None)`, delivering *every*
+    /// message including the terminal one over `progress_tx`, so the caller's
+    /// receive loop is never blocked.
     pub async fn handle_message(
         &self,
         client_id: u64,
@@ -238,8 +244,25 @@ impl ConnectionHandler {
                         )));
                     }
                 };
-                let result = handler.apply(progress_tx.clone()).await;
-                Ok(Some(OutgoingMessage::PreflightApplyResult(result)))
+                // apply() legitimately runs for 20-60s against real hardware:
+                // it reboots the FC and then waits out the daemon's own
+                // reconnect ladder. Awaiting it here would block this
+                // connection's receive loop, so nothing would refresh the
+                // liveness timestamp, the send task's 15s pong watchdog would
+                // tear the socket down, and the terminal result would never
+                // reach the browser. Run it detached and deliver the final
+                // result over the same channel the interim progress already
+                // uses — identical 0x0B message type, so the wire format is
+                // unchanged and the frontend still just treats any
+                // done/error PreflightApplyResult as terminal.
+                let progress_tx = progress_tx.clone();
+                tokio::spawn(async move {
+                    let result = handler.apply(progress_tx.clone()).await;
+                    let _ = progress_tx
+                        .send(OutgoingMessage::PreflightApplyResult(result))
+                        .await;
+                });
+                Ok(None)
             }
         }
     }
@@ -682,5 +705,60 @@ mod tests {
             }
             _ => panic!("Expected PreflightApplyResult"),
         }
+    }
+
+    #[tokio::test]
+    async fn preflight_apply_dispatches_async_and_delivers_terminal_result() {
+        let (mut handler, _) = create_test_handler().await;
+
+        // A PreflightHandler whose MAVLink channel is never drained, so
+        // apply() spends ~2.4s (3 retries x 800ms ack timeout) before it can
+        // report its terminal Error. That delay is the point: dispatch must
+        // return immediately and deliver the result later, because on real
+        // hardware apply() blocks for 20-60s and an inline await would let
+        // the send task's 15s pong watchdog tear the socket down first — the
+        // browser would then get neither Done nor Error.
+        let (mav_tx, _mav_rx) = crossbeam_channel::bounded(64);
+        let (pv_tx, _pv_rx) = broadcast::channel(64);
+        let sim_state = simulation::SimulationState::new(simulation::SimulationConfig::default());
+        handler.set_preflight_handler(Arc::new(PreflightHandler::new(
+            Some(mav_tx),
+            Some(pv_tx),
+            sim_state,
+        )));
+
+        let (progress_tx, mut progress_rx) = mpsc::channel(8);
+        let dispatch_start = Instant::now();
+        let response = handler
+            .handle_message(1, &[protocol::MSG_TYPE_APPLY_PREFLIGHT_PARAMS], &progress_tx)
+            .await
+            .unwrap();
+        let dispatch_elapsed = dispatch_start.elapsed();
+
+        assert!(
+            response.is_none(),
+            "ApplyPreflightParams must dispatch asynchronously, not return the result inline"
+        );
+        assert!(
+            dispatch_elapsed < Duration::from_millis(500),
+            "dispatch blocked for {dispatch_elapsed:?} — the receive loop must never await apply()"
+        );
+
+        // The terminal result still reaches the client, over progress_tx.
+        let mut terminal = None;
+        while let Ok(Some(msg)) =
+            tokio::time::timeout(Duration::from_secs(10), progress_rx.recv()).await
+        {
+            if let OutgoingMessage::PreflightApplyResult(result) = msg {
+                if matches!(result.state, protocol::PreflightApplyState::Error) {
+                    terminal = Some(result);
+                    break;
+                }
+            }
+        }
+        let terminal =
+            terminal.expect("terminal PreflightApplyResult never arrived on the progress channel");
+        assert!(!terminal.success);
+        assert!(terminal.error.unwrap().contains("SYS_HITL"));
     }
 }

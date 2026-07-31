@@ -1128,6 +1128,49 @@ mod tests {
         assert_eq!(bytes[6], 1); // bootloader_suspected = true
     }
 
+    /// Pins the exact bytes of the preflight status frame. The frontend builds
+    /// its own fixture bytes independently, so a field rename here would pass
+    /// every other test in both repos and only fail on real hardware.
+    #[test]
+    fn test_preflight_status_to_bytes() {
+        let status = PreflightStatus {
+            connected: true,
+            hitl_enabled: false,
+            is_quadrotor: true,
+        };
+        let bytes = status.to_bytes();
+        assert_eq!(bytes[0], MSG_TYPE_PREFLIGHT_STATUS);
+
+        let body: serde_json::Value = serde_json::from_slice(&bytes[1..]).unwrap();
+        assert_eq!(body["connected"], serde_json::json!(true));
+        assert_eq!(body["hitl_enabled"], serde_json::json!(false));
+        assert_eq!(body["is_quadrotor"], serde_json::json!(true));
+        // Exactly those three keys — no stray or renamed fields.
+        assert_eq!(body.as_object().unwrap().len(), 3);
+    }
+
+    /// Pins the snake_case rendering of `PreflightApplyState` (the frontend's
+    /// TypeScript union matches on these literals) and the omission of
+    /// `error` when it is `None`.
+    #[test]
+    fn test_preflight_apply_result_to_bytes() {
+        let result = PreflightApplyResult {
+            state: PreflightApplyState::Rebooting,
+            success: true,
+            error: None,
+        };
+        let bytes = result.to_bytes();
+        assert_eq!(bytes[0], MSG_TYPE_PREFLIGHT_APPLY_RESULT);
+
+        let body: serde_json::Value = serde_json::from_slice(&bytes[1..]).unwrap();
+        assert_eq!(body["state"], serde_json::json!("rebooting"));
+        assert_eq!(body["success"], serde_json::json!(true));
+        assert!(
+            body.get("error").is_none(),
+            "error must be skipped entirely when None, got: {body}"
+        );
+    }
+
     #[test]
     fn test_handshake_ack_to_bytes() {
         let ack = HandshakeAck {

@@ -86,12 +86,23 @@ pub struct SimulationStateInner {
     /// which is what makes it useful: comparing it against the sim's ground
     /// contact reveals when synthesized sensors have misled the EKF.
     pub landed_state: u8,
-    /// Whether any HEARTBEAT has ever been received from the FC. False in
-    /// --sim-only mode or before the first HEARTBEAT arrives. Also cleared
-    /// deliberately by `clear_heartbeat_status` right before a preflight-
-    /// triggered reboot, so the reconnect wait can distinguish "still the old
-    /// connection" from "a fresh HEARTBEAT after reboot".
-    pub heartbeat_seen: bool,
+    /// Monotonic count of HEARTBEATs received from the FC, incremented on
+    /// every one. Zero in --sim-only mode or before the first HEARTBEAT
+    /// arrives.
+    ///
+    /// Nothing ever resets this — not `reset()`, not `reconfigure()`, and
+    /// deliberately not a preflight-triggered reboot. `heartbeat_count > 0`
+    /// is therefore a fact that stays true for the daemon's whole lifetime
+    /// once the first HEARTBEAT lands, so a concurrent reader (a second
+    /// browser tab, a page reload) always sees an accurate "is an FC
+    /// physically connected" signal — even while a reboot-wait is in
+    /// progress elsewhere. A destructive clear would make `connected` read
+    /// false mid-reboot, which the preflight gate interprets as "no FC to
+    /// misconfigure, skip the check" and would silently bypass the gate.
+    /// The reboot-wait instead works by comparing counter *snapshots*: the
+    /// caller records the count before sending the reboot and watches for
+    /// it to increase, mutating no shared state.
+    pub heartbeat_count: u64,
     /// Cached from the latest HEARTBEAT's `base_mode`: whether PX4 reports
     /// MAV_MODE_FLAG_HIL_ENABLED. Used by the preflight gate ahead of
     /// ConfigureBuild — HITL cannot function with this false.
@@ -115,7 +126,7 @@ impl SimulationStateInner {
             armed: false,
             flight_mode: 0,
             landed_state: 0,
-            heartbeat_seen: false,
+            heartbeat_count: 0,
             hitl_enabled: false,
             is_quadrotor: false,
         }
@@ -207,30 +218,23 @@ impl SimulationState {
         self.inner.read().landed_state
     }
 
-    /// Update the cached HITL/quadrotor status from the latest HEARTBEAT.
+    /// Record a HEARTBEAT: bump the monotonic counter and store the latest
+    /// HITL/quadrotor flags.
     pub fn set_heartbeat_status(&self, hitl_enabled: bool, is_quadrotor: bool) {
         let mut inner = self.inner.write();
-        inner.heartbeat_seen = true;
+        inner.heartbeat_count = inner.heartbeat_count.saturating_add(1);
         inner.hitl_enabled = hitl_enabled;
         inner.is_quadrotor = is_quadrotor;
     }
 
-    /// Read the cached HITL/quadrotor status: `(heartbeat_seen, hitl_enabled,
-    /// is_quadrotor)`. `heartbeat_seen == false` means no HEARTBEAT has been
-    /// received since start (or since the last `clear_heartbeat_status`).
-    pub fn heartbeat_status(&self) -> (bool, bool, bool) {
+    /// Read the cached HEARTBEAT status: `(heartbeat_count, hitl_enabled,
+    /// is_quadrotor)`. `heartbeat_count == 0` means no HEARTBEAT has ever
+    /// been received. The count only ever increases, so callers watching for
+    /// a post-reboot reconnect compare it against a snapshot they took
+    /// themselves rather than clearing shared state.
+    pub fn heartbeat_status(&self) -> (u64, bool, bool) {
         let inner = self.inner.read();
-        (inner.heartbeat_seen, inner.hitl_enabled, inner.is_quadrotor)
-    }
-
-    /// Invalidate the cached HITL/quadrotor status. Called right before a
-    /// preflight-triggered FC reboot so the reconnect wait can tell a fresh
-    /// post-reboot HEARTBEAT apart from a stale pre-reboot one.
-    pub fn clear_heartbeat_status(&self) {
-        let mut inner = self.inner.write();
-        inner.heartbeat_seen = false;
-        inner.hitl_enabled = false;
-        inner.is_quadrotor = false;
+        (inner.heartbeat_count, inner.hitl_enabled, inner.is_quadrotor)
     }
 
     /// Get current simulation time in microseconds
@@ -335,32 +339,37 @@ mod tests {
     #[test]
     fn heartbeat_status_starts_unseen() {
         let state = SimulationState::new(SimulationConfig::default());
-        assert_eq!(state.heartbeat_status(), (false, false, false));
+        assert_eq!(state.heartbeat_status(), (0, false, false));
     }
 
     #[test]
     fn set_heartbeat_status_marks_seen_and_stores_flags() {
         let state = SimulationState::new(SimulationConfig::default());
         state.set_heartbeat_status(true, false);
-        assert_eq!(state.heartbeat_status(), (true, true, false));
+        assert_eq!(state.heartbeat_status(), (1, true, false));
     }
 
     #[test]
-    fn clear_heartbeat_status_resets_to_unseen() {
+    fn heartbeat_count_increases_monotonically_and_keeps_latest_flags() {
+        // The counter is the whole reason the preflight reboot-wait needs no
+        // destructive clear: it only ever goes up, so "an FC is connected"
+        // stays true for a concurrent reader even mid-reboot, while the flags
+        // always describe the most recent HEARTBEAT.
         let state = SimulationState::new(SimulationConfig::default());
+        state.set_heartbeat_status(false, false);
+        assert_eq!(state.heartbeat_status(), (1, false, false));
         state.set_heartbeat_status(true, true);
-        state.clear_heartbeat_status();
-        assert_eq!(state.heartbeat_status(), (false, false, false));
+        assert_eq!(state.heartbeat_status(), (2, true, true));
     }
 
     #[test]
     fn reset_does_not_clear_heartbeat_status() {
         // Reconfiguring the sim (new build) does not mean the FC's boot-time
-        // HITL/frame config changed — only a deliberate reboot (via
-        // clear_heartbeat_status) should invalidate this cache.
+        // HITL/frame config changed, so reset() must leave the counter and
+        // the cached flags alone.
         let state = SimulationState::new(SimulationConfig::default());
         state.set_heartbeat_status(true, true);
         state.reset();
-        assert_eq!(state.heartbeat_status(), (true, true, true));
+        assert_eq!(state.heartbeat_status(), (1, true, true));
     }
 }

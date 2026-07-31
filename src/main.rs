@@ -1165,6 +1165,14 @@ async fn main() {
                         // We wait 3 s for PX4 to boot and EKF2 to start accepting
                         // PARAM_SET before attempting the push.
                         if was_reconnect {
+                            // Drop the fingerprint cache *now*, not in 3 s: PX4's
+                            // RAM params are already gone, and a browser-initiated
+                            // ConfigureBuild (the preflight overlay sends one the
+                            // instant its reboot reports Done) can easily land
+                            // inside that delay and be skipped as a no-op,
+                            // leaving the FC on airframe defaults.
+                            build_config_handler_reconnect.invalidate_pid_fingerprint();
+
                             let handler_clone = build_config_handler_reconnect.clone();
                             tokio::spawn(async move {
                                 tokio::time::sleep(Duration::from_secs(3)).await;

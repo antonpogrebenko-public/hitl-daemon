@@ -836,6 +836,22 @@ impl BuildConfigHandler {
     ///   simulation loop (physics are already correct in the running sim).
     /// - Returns `Err` only if the PARAM_SET sequence fails, so the caller
     ///   can log a warning; the sim continues with whatever PX4 has loaded.
+    /// Invalidate the cached PID fingerprint so the next `ConfigureBuild` is
+    /// not skipped as a no-op. Called synchronously the moment an FC
+    /// reconnect is detected — PX4's RAM parameters (including any
+    /// previously-pushed PIDs) are gone after any reboot, but the fingerprint
+    /// cache cannot know that on its own, and `repush_if_configured`'s
+    /// 3s-delayed re-push is too slow to close the window: after a
+    /// preflight-triggered reboot the browser sends its `ConfigureBuild`
+    /// immediately, and a fingerprint match would leave the FC on airframe
+    /// defaults with the daemon reporting success.
+    pub fn invalidate_pid_fingerprint(&self) {
+        *self
+            .last_pid_fingerprint
+            .lock()
+            .expect("PID cache poisoned") = None;
+    }
+
     pub async fn repush_if_configured(&self) -> Result<(), String> {
         // Snapshot the last verified params under the lock, then release.
         let params = {
@@ -1381,6 +1397,41 @@ mod tests {
             .unwrap();
         assert!(view.is_none());
         assert_eq!(verified_second, 0);
+    }
+
+    #[tokio::test]
+    async fn invalidate_pid_fingerprint_forces_a_re_push() {
+        let (mav_tx, mav_rx) = bounded::<MavMessage>(64);
+        let (pv_tx, _) = broadcast::channel::<(String, f32)>(64);
+        let _px4 = spawn_fake_px4(mav_rx, pv_tx.clone(), 0);
+
+        let handler = make_handler(Some(mav_tx), Some(pv_tx));
+        let (_, verified_first) = handler
+            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN)
+            .await
+            .unwrap();
+        assert_eq!(verified_first, 21);
+
+        // Baseline: the identical push is skipped while the fingerprint stands.
+        let (view, verified_skipped) = handler
+            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN)
+            .await
+            .unwrap();
+        assert!(view.is_none());
+        assert_eq!(verified_skipped, 0);
+
+        // An FC reconnect wipes PX4's RAM params. Invalidating makes the very
+        // next ConfigureBuild push for real instead of trusting the cache.
+        handler.invalidate_pid_fingerprint();
+        let (view, verified_after) = handler
+            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN)
+            .await
+            .unwrap();
+        assert!(
+            view.is_some(),
+            "after invalidation an identical push must not be skipped"
+        );
+        assert_eq!(verified_after, 21);
     }
 
     #[tokio::test]

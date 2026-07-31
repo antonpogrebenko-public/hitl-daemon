@@ -83,15 +83,38 @@ const QUADROTOR_AUTOSTART_ID: f32 = 4001.0;
 /// Total time budget for the FC to come back after a preflight-triggered
 /// reboot. Bounded so a cable/power issue surfaces as an explicit error
 /// instead of an indefinite spinner.
-const PREFLIGHT_RECONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// The budget has to cover the *daemon's* whole reconnect ladder, not just
+/// the FC's boot: the serial link only drops once PX4 actually resets, then
+/// the daemon spends 5s on its heartbeat watchdog and 10s on the bootloader
+/// backoff (`main.rs`) before it even reopens the port, PX4 itself sits in
+/// its bootloader for another 3-5s, and only then can a first HEARTBEAT
+/// arrive — which this function still discounts until
+/// `PREFLIGHT_QUIET_PERIOD` (2s) of silence has been confirmed. That is
+/// ~20-22s in the good case, and a single extra bootloader cycle adds
+/// another ~15s. 30s left no headroom at all and reported "FC did not
+/// reconnect" for perfectly healthy hardware; 60s absorbs one full extra
+/// cycle plus margin.
+const PREFLIGHT_RECONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 const PREFLIGHT_RECONNECT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// Minimum continuous silence (no HEARTBEAT) required after clearing the
-/// cache before a subsequent HEARTBEAT is trusted as a genuine post-reboot
-/// reconnect rather than a straggler the FC sent before it actually
-/// processed the reboot command. PX4 takes 3-5s to clear its bootloader on
-/// power-up; a straggler heartbeat lands within about one HEARTBEAT period
-/// (~1s) of the reboot command being sent. 2s cleanly separates the two.
+/// Number of times the post-reboot verification re-reads the cached
+/// HEARTBEAT flags before declaring the settings did not take effect. The
+/// very first HEARTBEAT after a reboot can plausibly race ahead of PX4's
+/// own internal state publication, and a single false reading would
+/// otherwise be a hard, unrecoverable failure.
+const VERIFY_SETTLE_ATTEMPTS: u8 = 3;
+/// Gap between verification re-reads (~1s of extra worst-case latency
+/// against the 60s reconnect budget).
+const VERIFY_SETTLE_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Minimum continuous silence (no HEARTBEAT counter increments) required
+/// after the reboot command goes out before a subsequent HEARTBEAT is
+/// trusted as a genuine post-reboot reconnect rather than a straggler the FC
+/// sent before it actually processed the reboot command. PX4 takes 3-5s to
+/// clear its bootloader on power-up; a straggler heartbeat lands within about
+/// one HEARTBEAT period (~1s) of the reboot command being sent. 2s cleanly
+/// separates the two.
 const PREFLIGHT_QUIET_PERIOD: Duration = Duration::from_secs(2);
 
 pub struct PreflightHandler {
@@ -114,10 +137,15 @@ impl PreflightHandler {
     }
 
     /// Instant, cache-only read of the FC's last-known HITL/quadrotor status.
+    ///
+    /// `connected` is derived from the monotonic HEARTBEAT counter, which is
+    /// never reset — so a client that checks while another client's `apply()`
+    /// is mid-reboot still correctly sees `connected: true` and is gated,
+    /// rather than reading a cleared "no FC" and silently skipping the gate.
     pub async fn check(&self) -> PreflightStatus {
-        let (connected, hitl_enabled, is_quadrotor) = self.sim_state.heartbeat_status();
+        let (count, hitl_enabled, is_quadrotor) = self.sim_state.heartbeat_status();
         PreflightStatus {
-            connected,
+            connected: count > 0,
             hitl_enabled,
             is_quadrotor,
         }
@@ -182,6 +210,14 @@ impl PreflightHandler {
             Err(e) => warn!(error = ?e, "Failed to send PARAM_SAVE before preflight reboot"),
         }
 
+        // Snapshot the HEARTBEAT counter before anything else can happen, so
+        // the reconnect wait below has a watermark to compare against. Taken
+        // instead of clearing shared state: a destructive clear would make a
+        // concurrent `check()` report `connected: false` for the whole reboot
+        // window, which the preflight gate reads as "no FC to misconfigure"
+        // and silently skips.
+        let baseline_count = self.sim_state.heartbeat_status().0;
+
         send_progress(&progress_tx, PreflightApplyState::Rebooting).await;
         if let Err(e) = mav_tx.try_send(make_reboot_autopilot()) {
             return PreflightApplyResult {
@@ -191,14 +227,10 @@ impl PreflightHandler {
             };
         }
 
-        // Invalidate the cache now, before the FC actually drops — otherwise
-        // the reconnect wait below would see the stale pre-reboot "seen=true"
-        // and return immediately.
-        self.sim_state.clear_heartbeat_status();
-
         send_progress(&progress_tx, PreflightApplyState::Reconnecting).await;
         if !self
             .wait_for_reconnect(
+                baseline_count,
                 PREFLIGHT_RECONNECT_TIMEOUT,
                 PREFLIGHT_RECONNECT_POLL_INTERVAL,
                 PREFLIGHT_QUIET_PERIOD,
@@ -212,8 +244,24 @@ impl PreflightHandler {
             };
         }
 
+        // Re-read the flags a few times instead of trusting the single
+        // HEARTBEAT that ended the reconnect wait: PX4's first post-reboot
+        // HEARTBEAT can plausibly precede its own internal state
+        // publication, and a lone false reading here is otherwise a hard
+        // failure with no automatic recovery.
         send_progress(&progress_tx, PreflightApplyState::Verifying).await;
-        let (_, hitl_enabled, is_quadrotor) = self.sim_state.heartbeat_status();
+        let (mut hitl_enabled, mut is_quadrotor) = (false, false);
+        for attempt in 0..VERIFY_SETTLE_ATTEMPTS {
+            let (_, h, q) = self.sim_state.heartbeat_status();
+            hitl_enabled = h;
+            is_quadrotor = q;
+            if hitl_enabled && is_quadrotor {
+                break;
+            }
+            if attempt + 1 < VERIFY_SETTLE_ATTEMPTS {
+                tokio::time::sleep(VERIFY_SETTLE_INTERVAL).await;
+            }
+        }
         if !hitl_enabled || !is_quadrotor {
             return PreflightApplyResult {
                 state: PreflightApplyState::Error,
@@ -229,42 +277,51 @@ impl PreflightHandler {
         }
     }
 
-    /// Poll the cached heartbeat status until a HEARTBEAT arrives that is
-    /// trustworthy as a genuine post-reboot reconnect, or `timeout` elapses.
-    /// A HEARTBEAT is only trusted once `quiet_period` of continuous silence
-    /// has been observed first — anything arriving before that is treated
-    /// as a stale pre-reboot straggler (cleared, and the quiet-period
-    /// countdown restarts), because the physical FC keeps heartbeating with
-    /// its old pre-fix state for a while after the reboot command is sent,
-    /// well before it has actually rebooted.
+    /// Poll the monotonic HEARTBEAT counter until it advances past a
+    /// HEARTBEAT that is trustworthy as a genuine post-reboot reconnect, or
+    /// `timeout` elapses.
+    ///
+    /// `baseline` is the count the caller snapshotted immediately before
+    /// sending the reboot — this function mutates no shared state, so a
+    /// concurrent `check()` keeps seeing an accurate `connected` for the
+    /// whole window. A HEARTBEAT is only trusted once `quiet_period` of
+    /// continuous silence (no further increments) has been observed first:
+    /// the physical FC keeps heartbeating its old pre-fix state for a while
+    /// after the reboot command goes out, well before it has actually
+    /// rebooted, so each such straggler just moves the watermark up and
+    /// restarts the countdown.
+    ///
+    /// Trustworthiness is checked *before* the deadline, so a heartbeat that
+    /// becomes trustworthy on the same tick the deadline expires is still
+    /// accepted rather than discarded as a timeout.
     async fn wait_for_reconnect(
         &self,
+        baseline: u64,
         timeout: Duration,
         poll_interval: Duration,
         quiet_period: Duration,
     ) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
+        let mut last_seen_count = baseline;
         let mut quiet_start = tokio::time::Instant::now();
         let mut confirmed_quiet = false;
 
         loop {
-            if tokio::time::Instant::now() >= deadline {
-                return false;
-            }
-
-            let (seen, _, _) = self.sim_state.heartbeat_status();
-            if seen {
+            let (count, ..) = self.sim_state.heartbeat_status();
+            if count > last_seen_count {
                 if confirmed_quiet {
                     // Arrived only after we confirmed real silence — genuine.
                     return true;
                 }
-                // Straggler during the quiet-confirmation phase. Clear it
-                // and restart the countdown; we haven't confirmed the FC
-                // actually went quiet yet.
-                self.sim_state.clear_heartbeat_status();
+                // Straggler: bump our watermark and restart the quiet countdown.
+                last_seen_count = count;
                 quiet_start = tokio::time::Instant::now();
             } else if !confirmed_quiet && tokio::time::Instant::now() >= quiet_start + quiet_period {
                 confirmed_quiet = true;
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                return false;
             }
 
             tokio::time::sleep(poll_interval).await;
@@ -435,9 +492,11 @@ mod apply_tests {
     #[tokio::test]
     async fn wait_for_reconnect_times_out_when_heartbeat_never_seen() {
         let sim_state = SimulationState::new(SimulationConfig::default());
+        let baseline = sim_state.heartbeat_status().0;
         let handler = make_handler(None, None, sim_state);
         let ok = handler
             .wait_for_reconnect(
+                baseline,
                 Duration::from_millis(100),
                 Duration::from_millis(20),
                 Duration::from_millis(30),
@@ -460,9 +519,11 @@ mod apply_tests {
             sim_state_for_straggler.set_heartbeat_status(true, true);
         });
 
+        let baseline = sim_state.heartbeat_status().0;
         let handler = make_handler(None, None, sim_state);
         let ok = handler
             .wait_for_reconnect(
+                baseline,
                 Duration::from_millis(500),
                 Duration::from_millis(20),
                 Duration::from_millis(150),
@@ -480,5 +541,93 @@ mod apply_tests {
         assert!(status.connected);
         assert!(!status.hitl_enabled);
         assert!(status.is_quadrotor);
+    }
+
+    #[tokio::test]
+    async fn check_reports_connected_during_reconnect_wait() {
+        // The exact hole the monotonic counter closes. While apply() waits out
+        // the reboot, a concurrent RequestPreflightCheck (page reload, second
+        // browser tab) must still report connected: true. Under the old
+        // destructive clear it read connected: false, which the gate treats as
+        // "no FC to misconfigure, skip silently" — letting a build be pushed
+        // to a flight controller that is mid-reboot.
+        let (mav_tx, mav_rx) = bounded::<MavMessage>(64);
+        let (pv_tx, _) = broadcast::channel::<(String, f32)>(64);
+        let (_px4, _captured) = spawn_fake_px4(mav_rx, pv_tx.clone());
+
+        let sim_state = SimulationState::new(SimulationConfig::default());
+        // An FC is connected but misconfigured — exactly what triggers apply().
+        sim_state.set_heartbeat_status(false, false);
+
+        let handler =
+            std::sync::Arc::new(make_handler(Some(mav_tx), Some(pv_tx), sim_state.clone()));
+        let apply_handler = handler.clone();
+        let (progress_tx, mut progress_rx) = mpsc::channel(8);
+        let apply_task = tokio::spawn(async move { apply_handler.apply(progress_tx).await });
+
+        // Wait until apply() has actually entered the reconnect wait.
+        loop {
+            let msg = progress_rx
+                .recv()
+                .await
+                .expect("progress channel closed before Reconnecting");
+            if let OutgoingMessage::PreflightApplyResult(r) = msg {
+                if matches!(r.state, PreflightApplyState::Reconnecting) {
+                    break;
+                }
+            }
+        }
+
+        let status = handler.check().await;
+        assert!(
+            status.connected,
+            "a concurrent check during the reboot wait must still see the FC as connected"
+        );
+
+        // Let apply() finish so nothing outlives the test: model the FC coming
+        // back after genuine silence past PREFLIGHT_QUIET_PERIOD.
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        sim_state.set_heartbeat_status(true, true);
+        let result = apply_task.await.unwrap();
+        assert!(result.success, "apply() failed: {:?}", result.error);
+    }
+
+    #[tokio::test]
+    async fn check_before_and_after_apply_reflects_reboot_outcome() {
+        // The public pair exercised together rather than in isolation:
+        // check() reports the pre-apply reality, apply() runs the whole
+        // reboot cycle, and check() then reports the post-reboot reality.
+        let (mav_tx, mav_rx) = bounded::<MavMessage>(64);
+        let (pv_tx, _) = broadcast::channel::<(String, f32)>(64);
+        let (_px4, _captured) = spawn_fake_px4(mav_rx, pv_tx.clone());
+
+        let sim_state = SimulationState::new(SimulationConfig::default());
+        let handler =
+            std::sync::Arc::new(make_handler(Some(mav_tx), Some(pv_tx), sim_state.clone()));
+
+        let before = handler.check().await;
+        assert!(!before.connected, "nothing has heartbeated yet");
+        assert!(!before.hitl_enabled);
+        assert!(!before.is_quadrotor);
+
+        let sim_state_for_reboot = sim_state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(2200)).await;
+            sim_state_for_reboot.set_heartbeat_status(true, true);
+        });
+
+        let apply_handler = handler.clone();
+        let (progress_tx, mut progress_rx) = mpsc::channel(8);
+        let apply_task = tokio::spawn(async move { apply_handler.apply(progress_tx).await });
+        // Drain progress so a full channel can never stall the apply task.
+        tokio::spawn(async move { while progress_rx.recv().await.is_some() {} });
+
+        let result = apply_task.await.unwrap();
+        assert!(result.success, "apply() failed: {:?}", result.error);
+
+        let after = handler.check().await;
+        assert!(after.connected);
+        assert!(after.hitl_enabled);
+        assert!(after.is_quadrotor);
     }
 }
