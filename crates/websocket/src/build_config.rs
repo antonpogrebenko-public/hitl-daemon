@@ -18,7 +18,7 @@ use tracing::{debug, error, info, warn};
 /// Per-parameter ack budget. PX4 typically responds within 20-50 ms on a
 /// healthy 921600-baud link; 800 ms covers serial backpressure and busy
 /// EEPROM writes.
-const PARAM_ACK_TIMEOUT: Duration = Duration::from_millis(800);
+pub(crate) const PARAM_ACK_TIMEOUT: Duration = Duration::from_millis(800);
 
 /// How many times we resend a single PARAM_SET before giving up and failing
 /// the whole `ConfigureBuild`. Three covers a transient drop without making

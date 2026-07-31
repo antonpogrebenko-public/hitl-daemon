@@ -62,15 +62,44 @@ mod tests {
         let hb = heartbeat(flags, MavType::MAV_TYPE_QUADROTOR);
         assert_eq!(heartbeat_hitl_signals(&hb), (true, true));
     }
+
+    /// Root-cause regression test: SYS_HITL/SYS_AUTOSTART are genuinely
+    /// INT32 params on PX4. Sending a numeric `1.0f32` with
+    /// `param_type = MAV_PARAM_TYPE_REAL32` (what `make_param_set` — correct
+    /// for every other param this daemon pushes — would send) makes real
+    /// PX4 silently reject the PARAM_SET: no PARAM_VALUE reply at all,
+    /// observed on real hardware as a plain ack timeout, not a value
+    /// mismatch. The correct encoding bit-reinterprets the int's bytes into
+    /// the wire float slot and declares MAV_PARAM_TYPE_INT32.
+    #[test]
+    fn make_param_set_i32_bit_encodes_value_and_declares_int32_type() {
+        let msg = make_param_set_i32("SYS_HITL", 1);
+        match msg {
+            MavMessage::PARAM_SET(p) => {
+                assert_eq!(p.param_type, MavParamType::MAV_PARAM_TYPE_INT32);
+                assert_eq!(
+                    p.param_value.to_bits() as i32,
+                    1,
+                    "value must be bit-encoded, not numerically cast"
+                );
+                assert_ne!(
+                    p.param_value, 1.0,
+                    "a literal 1.0f32 is exactly the wire encoding PX4 silently rejects for an INT32 param"
+                );
+            }
+            other => panic!("expected PARAM_SET, got {other:?}"),
+        }
+    }
 }
 
 use crate::build_config::{
-    make_param_save, make_param_set, wait_for_param_ack, PARAM_RETRY_COUNT, PX4_TARGET_COMPONENT,
-    PX4_TARGET_SYSTEM,
+    make_param_save, PARAM_ACK_TIMEOUT, PARAM_RETRY_COUNT, PX4_TARGET_COMPONENT, PX4_TARGET_SYSTEM,
 };
 use crate::protocol::{OutgoingMessage, PreflightApplyResult, PreflightApplyState, PreflightStatus};
 use crossbeam_channel::Sender;
-use mavlink::ardupilotmega::{MavCmd, MavMessage, COMMAND_LONG_DATA};
+use mavlink::ardupilotmega::{
+    MavCmd, MavMessage, MavParamType, COMMAND_LONG_DATA, PARAM_SET_DATA,
+};
 use simulation::SimulationState;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
@@ -78,7 +107,11 @@ use tracing::warn;
 
 /// PX4 SYS_AUTOSTART id for "Generic Quadcopter X" — the fixed target this
 /// feature applies. No per-build airframe selection.
-const QUADROTOR_AUTOSTART_ID: f32 = 4001.0;
+///
+/// INT32, not f32: SYS_AUTOSTART (and SYS_HITL below) are genuinely INT32
+/// parameters in PX4's metadata, unlike every other param this daemon pushes
+/// (PID gains, CAL offsets — all genuinely REAL32). See `make_param_set_i32`.
+const QUADROTOR_AUTOSTART_ID: i32 = 4001;
 
 /// Total time budget for the FC to come back after a preflight-triggered
 /// reboot. Bounded so a cable/power issue surfaces as an explicit error
@@ -200,11 +233,11 @@ impl PreflightHandler {
 
         send_progress(&progress_tx, PreflightApplyState::Applying).await;
 
-        for (name, value) in [("SYS_HITL", 1.0f32), ("SYS_AUTOSTART", QUADROTOR_AUTOSTART_ID)] {
+        for (name, value) in [("SYS_HITL", 1i32), ("SYS_AUTOSTART", QUADROTOR_AUTOSTART_ID)] {
             let mut acked = false;
             for attempt in 1..=PARAM_RETRY_COUNT {
                 let mut rx = param_value_tx.subscribe();
-                match mav_tx.try_send(make_param_set(name, value)) {
+                match mav_tx.try_send(make_param_set_i32(name, value)) {
                     Ok(()) => {}
                     Err(crossbeam_channel::TrySendError::Full(_)) => {
                         warn!(param = name, attempt, "MAVLink tx channel full — retrying PARAM_SET");
@@ -220,7 +253,7 @@ impl PreflightHandler {
                     }
                 }
 
-                if wait_for_param_ack(&mut rx, name, value).await.is_some() {
+                if wait_for_int_param_ack(&mut rx, name, value).await {
                     acked = true;
                     break;
                 }
@@ -381,6 +414,67 @@ async fn send_progress(progress_tx: &mpsc::Sender<OutgoingMessage>, state: Prefl
             error: None,
         }))
         .await;
+}
+
+/// Build a `PARAM_SET` for a genuinely INT32 PX4 parameter (`SYS_HITL`,
+/// `SYS_AUTOSTART`). MAVLink's `PARAM_SET` always carries `param_value` as a
+/// raw 4-byte wire field regardless of the parameter's real type; the
+/// correct encoding for a non-float param is to bit-reinterpret the int's
+/// bytes into that slot and declare `param_type` accordingly. Every other
+/// param this daemon pushes (PID gains, CAL offsets) is genuinely REAL32,
+/// so `make_param_set` sending a numeric `1.0f32` with `param_type =
+/// MAV_PARAM_TYPE_REAL32` had always been correct there — but for an INT32
+/// param PX4 silently rejects the mismatched-type message: no PARAM_VALUE
+/// reply at all, not even an incorrect one, which is why this surfaced as a
+/// plain ack timeout rather than a value mismatch.
+fn make_param_set_i32(name: &str, value: i32) -> MavMessage {
+    let mut param_id = [0u8; 16];
+    let bytes = name.as_bytes();
+    let copy_len = bytes.len().min(param_id.len());
+    param_id[..copy_len].copy_from_slice(&bytes[..copy_len]);
+    MavMessage::PARAM_SET(PARAM_SET_DATA {
+        param_value: f32::from_bits(value as u32),
+        target_system: PX4_TARGET_SYSTEM,
+        target_component: PX4_TARGET_COMPONENT,
+        param_id,
+        param_type: MavParamType::MAV_PARAM_TYPE_INT32,
+    })
+}
+
+/// Drain `rx` until a `PARAM_VALUE` arrives whose name matches `name` and
+/// whose bit-reinterpreted value equals `expected`. PX4 echoes INT32 params
+/// by bit-packing them into the same 4-byte wire slot every param uses, not
+/// by numeric cast — mirrors `wait_for_param_ack` but compares as bits, not
+/// as a float value within an epsilon.
+async fn wait_for_int_param_ack(
+    rx: &mut broadcast::Receiver<(String, f32)>,
+    name: &str,
+    expected: i32,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + PARAM_ACK_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Ok((got_name, got_value))) => {
+                if got_name == name && got_value.to_bits() as i32 == expected {
+                    return true;
+                }
+                // Unrelated PARAM_VALUE (QGC pull, other params) — keep draining.
+            }
+            Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
+                warn!(
+                    param = name,
+                    lagged = n,
+                    "PARAM_VALUE receiver lagged — continuing to wait"
+                );
+            }
+            Ok(Err(broadcast::error::RecvError::Closed)) => return false,
+            Err(_) => return false,
+        }
+    }
 }
 
 fn make_reboot_autopilot() -> MavMessage {
