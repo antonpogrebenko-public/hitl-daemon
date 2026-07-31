@@ -820,22 +820,6 @@ impl BuildConfigHandler {
         Ok(())
     }
 
-    /// Re-push the last verified PID + thrust-curve parameters to PX4 after a
-    /// FC power cycle / reconnect.
-    ///
-    /// Behaviour:
-    /// - If no config was ever applied during this session, returns `Ok(())`
-    ///   immediately — nothing to push.
-    /// - Clears the PID fingerprint cache before pushing so the dedup check
-    ///   inside `push_pids_and_verify` does not skip the re-push.
-    /// - Broadcasts `ConfigState::Configuring` on `system_config_tx` so all
-    ///   connected browser clients can show a spinner, then `ConfigState::Ready`
-    ///   on success (or `ConfigState::Error` on failure).  Broadcasts silently
-    ///   drop when no clients are subscribed.
-    /// - Only re-pushes PIDs to PX4 — does NOT resend `PhysicsConfig` to the
-    ///   simulation loop (physics are already correct in the running sim).
-    /// - Returns `Err` only if the PARAM_SET sequence fails, so the caller
-    ///   can log a warning; the sim continues with whatever PX4 has loaded.
     /// Invalidate the cached PID fingerprint so the next `ConfigureBuild` is
     /// not skipped as a no-op. Called synchronously the moment an FC
     /// reconnect is detected — PX4's RAM parameters (including any
@@ -852,6 +836,22 @@ impl BuildConfigHandler {
             .expect("PID cache poisoned") = None;
     }
 
+    /// Re-push the last verified PID + thrust-curve parameters to PX4 after a
+    /// FC power cycle / reconnect.
+    ///
+    /// Behaviour:
+    /// - If no config was ever applied during this session, returns `Ok(())`
+    ///   immediately — nothing to push.
+    /// - Clears the PID fingerprint cache before pushing so the dedup check
+    ///   inside `push_pids_and_verify` does not skip the re-push.
+    /// - Broadcasts `ConfigState::Configuring` on `system_config_tx` so all
+    ///   connected browser clients can show a spinner, then `ConfigState::Ready`
+    ///   on success (or `ConfigState::Error` on failure).  Broadcasts silently
+    ///   drop when no clients are subscribed.
+    /// - Only re-pushes PIDs to PX4 — does NOT resend `PhysicsConfig` to the
+    ///   simulation loop (physics are already correct in the running sim).
+    /// - Returns `Err` only if the PARAM_SET sequence fails, so the caller
+    ///   can log a warning; the sim continues with whatever PX4 has loaded.
     pub async fn repush_if_configured(&self) -> Result<(), String> {
         // Snapshot the last verified params under the lock, then release.
         let params = {
