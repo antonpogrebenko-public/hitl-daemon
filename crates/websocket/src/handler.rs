@@ -724,6 +724,7 @@ mod tests {
         handler.set_preflight_handler(Arc::new(PreflightHandler::new(
             Some(mav_tx),
             Some(pv_tx),
+            None,
             sim_state,
         )));
 

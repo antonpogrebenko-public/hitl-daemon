@@ -599,6 +599,7 @@ async fn main() {
     let preflight_handler = std::sync::Arc::new(websocket::PreflightHandler::new(
         build_config_mav_tx.clone(),
         build_config_param_value_tx.clone(),
+        nsh_tx_for_config.clone(),
         sim_state.clone(),
     ));
     let build_config_handler = std::sync::Arc::new(websocket::BuildConfigHandler::new(

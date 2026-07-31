@@ -95,11 +95,10 @@ mod tests {
 use crate::build_config::{
     make_param_save, PARAM_ACK_TIMEOUT, PARAM_RETRY_COUNT, PX4_TARGET_COMPONENT, PX4_TARGET_SYSTEM,
 };
+use crate::handler::ValidatedNshCommand;
 use crate::protocol::{OutgoingMessage, PreflightApplyResult, PreflightApplyState, PreflightStatus};
 use crossbeam_channel::Sender;
-use mavlink::ardupilotmega::{
-    MavCmd, MavMessage, MavParamType, COMMAND_LONG_DATA, PARAM_SET_DATA,
-};
+use mavlink::ardupilotmega::{MavMessage, MavParamType, PARAM_SET_DATA};
 use simulation::SimulationState;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
@@ -153,6 +152,15 @@ const PREFLIGHT_QUIET_PERIOD: Duration = Duration::from_secs(2);
 pub struct PreflightHandler {
     mav_tx: Option<Sender<MavMessage>>,
     param_value_tx: Option<broadcast::Sender<(String, f32)>>,
+    /// Used to trigger the post-apply reboot via PX4's own NSH `reboot`
+    /// command rather than `MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN`. On at least
+    /// one real board this command construction (`COMMAND_LONG`, correct
+    /// per the MAVLink spec, byte-identical in shape to the working
+    /// `make_param_save`) got zero `COMMAND_ACK` — not even a denial — while
+    /// NSH's `reboot` reliably triggers a real reset every time. NSH goes
+    /// through PX4's own shell rather than its MAVLink command router, so it
+    /// isn't affected by whatever is silently dropping this one command.
+    nsh_tx: Option<mpsc::Sender<ValidatedNshCommand>>,
     sim_state: SimulationState,
     /// Guards against two concurrent `apply()` runs against the same
     /// physical FC. `ApplyPreflightParams` is now dispatched onto a
@@ -170,11 +178,13 @@ impl PreflightHandler {
     pub fn new(
         mav_tx: Option<Sender<MavMessage>>,
         param_value_tx: Option<broadcast::Sender<(String, f32)>>,
+        nsh_tx: Option<mpsc::Sender<ValidatedNshCommand>>,
         sim_state: SimulationState,
     ) -> Self {
         Self {
             mav_tx,
             param_value_tx,
+            nsh_tx,
             applying: std::sync::atomic::AtomicBool::new(false),
             sim_state,
         }
@@ -285,7 +295,7 @@ impl PreflightHandler {
         let baseline_count = self.sim_state.heartbeat_status().0;
 
         send_progress(&progress_tx, PreflightApplyState::Rebooting).await;
-        if let Err(e) = mav_tx.try_send(make_reboot_autopilot()) {
+        if let Err(e) = self.send_reboot_via_nsh().await {
             return PreflightApplyResult {
                 state: PreflightApplyState::Error,
                 success: false,
@@ -341,6 +351,29 @@ impl PreflightHandler {
             success: true,
             error: None,
         }
+    }
+
+    /// Trigger a reboot via PX4's own NSH `reboot` command rather than
+    /// `MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN`. See the doc comment on the
+    /// `nsh_tx` field for why: the MAVLink command path got zero
+    /// `COMMAND_ACK` on real hardware despite correct construction, while
+    /// NSH's `reboot` reliably triggers a real reset. Fire-and-forget, like
+    /// `BuildConfigHandler::restart_ekf2`'s internal NSH commands — a reboot
+    /// makes any response moot.
+    async fn send_reboot_via_nsh(&self) -> Result<(), String> {
+        let Some(ref nsh_tx) = self.nsh_tx else {
+            return Err("NSH channel not available".to_string());
+        };
+        let cmd = ValidatedNshCommand {
+            request_id: 0xFFFF_FF04, // internal-use id, distinct from build_config.rs's 0xFFFF_FF01/02
+            command: "reboot".to_string(),
+            timeout_ms: 2000,
+            client_id: 0, // system client
+        };
+        nsh_tx
+            .send(cmd)
+            .await
+            .map_err(|e| format!("Failed to send reboot via NSH: {e}"))
     }
 
     /// Poll the monotonic HEARTBEAT counter until it advances past a
@@ -477,22 +510,6 @@ async fn wait_for_int_param_ack(
     }
 }
 
-fn make_reboot_autopilot() -> MavMessage {
-    MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
-        target_system: PX4_TARGET_SYSTEM,
-        target_component: PX4_TARGET_COMPONENT,
-        confirmation: 0,
-        command: MavCmd::MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN,
-        param1: 1.0, // 1 = reboot autopilot
-        param2: 0.0,
-        param3: 0.0,
-        param4: 0.0,
-        param5: 0.0,
-        param6: 0.0,
-        param7: 0.0,
-    })
-}
-
 #[cfg(test)]
 mod apply_tests {
     use super::*;
@@ -505,7 +522,12 @@ mod apply_tests {
         param_value_tx: Option<broadcast::Sender<(String, f32)>>,
         sim_state: SimulationState,
     ) -> PreflightHandler {
-        PreflightHandler::new(mav_tx, param_value_tx, sim_state)
+        // A fire-and-forget NSH channel with a task draining it forever, so
+        // send_reboot_via_nsh's send succeeds without needing a real NSH
+        // handler task — apply() never awaits a response to the reboot.
+        let (nsh_tx, mut nsh_rx) = mpsc::channel::<ValidatedNshCommand>(4);
+        tokio::spawn(async move { while nsh_rx.recv().await.is_some() {} });
+        PreflightHandler::new(mav_tx, param_value_tx, Some(nsh_tx), sim_state)
     }
 
     #[derive(Debug, Clone)]
@@ -567,6 +589,18 @@ mod apply_tests {
         let (pv_tx, _) = broadcast::channel::<(String, f32)>(64);
         let (_px4, captured) = spawn_fake_px4(mav_rx, pv_tx.clone());
 
+        // Capture NSH commands instead of silently draining them, so this
+        // test can confirm the reboot actually went out as an NSH "reboot"
+        // rather than the unacked MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN.
+        let (nsh_tx, mut nsh_rx) = mpsc::channel::<ValidatedNshCommand>(4);
+        let nsh_captured = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
+        let nsh_captured_clone = nsh_captured.clone();
+        tokio::spawn(async move {
+            while let Some(cmd) = nsh_rx.recv().await {
+                nsh_captured_clone.lock().unwrap().push(cmd.command);
+            }
+        });
+
         let sim_state = SimulationState::new(SimulationConfig::default());
         let sim_state_for_reboot = sim_state.clone();
         // Simulate the FC coming back post-reboot: a real HEARTBEAT would
@@ -579,7 +613,7 @@ mod apply_tests {
             sim_state_for_reboot.set_heartbeat_status(true, true);
         });
 
-        let handler = make_handler(Some(mav_tx), Some(pv_tx), sim_state);
+        let handler = PreflightHandler::new(Some(mav_tx), Some(pv_tx), Some(nsh_tx), sim_state);
         let (progress_tx, mut progress_rx) = mpsc::channel(8);
         let apply_task = tokio::spawn(async move { handler.apply(progress_tx).await });
 
@@ -606,10 +640,11 @@ mod apply_tests {
         assert!(param_names.contains(&"SYS_HITL"));
         assert!(param_names.contains(&"SYS_AUTOSTART"));
 
-        const MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN: u32 = 246;
-        assert!(snapshot
-            .iter()
-            .any(|m| matches!(m, CapturedMsg::CommandLong(c) if *c == MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN)));
+        assert_eq!(
+            nsh_captured.lock().unwrap().as_slice(),
+            ["reboot"],
+            "reboot must go out via NSH, not MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN"
+        );
     }
 
     #[tokio::test]
