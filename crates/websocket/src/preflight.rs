@@ -149,6 +149,22 @@ const VERIFY_SETTLE_INTERVAL: Duration = Duration::from_millis(500);
 /// separates the two.
 const PREFLIGHT_QUIET_PERIOD: Duration = Duration::from_secs(2);
 
+/// Delay between the fire-and-forget PARAM_SAVE (flash write) and the reboot
+/// that follows it. `MAV_CMD_PREFLIGHT_STORAGE`'s flash commit on PX4 is
+/// asynchronous and best-effort-acked (~100ms typical, per `make_param_save`'s
+/// doc comment) — writing the command's bytes to the serial port is not the
+/// same as PX4 finishing the write. Without this gap, the reboot used to be
+/// sent essentially back-to-back with the save (both queue onto the same
+/// serial writer, which drains the NSH queue before the MAVLink queue each
+/// tick, so ordering on the wire wasn't even guaranteed to match program
+/// order), racing an in-flight flash commit against a hard MCU reset.
+/// Observed on real hardware as both non-deterministic loss of the
+/// just-applied SYS_HITL/SYS_AUTOSTART params (the write never landed before
+/// the reset) and a wedged FC that a daemon restart alone could not recover
+/// (an interrupted flash erase/write left the parameter store corrupted,
+/// requiring a physical power cycle). 500ms is 5x the typical commit time.
+const PARAM_SAVE_SETTLE_DELAY: Duration = Duration::from_millis(500);
+
 pub struct PreflightHandler {
     mav_tx: Option<Sender<MavMessage>>,
     param_value_tx: Option<broadcast::Sender<(String, f32)>>,
@@ -285,6 +301,10 @@ impl PreflightHandler {
             Ok(()) => {}
             Err(e) => warn!(error = ?e, "Failed to send PARAM_SAVE before preflight reboot"),
         }
+
+        // Let PX4's async flash commit finish before the reboot resets the
+        // MCU. See PARAM_SAVE_SETTLE_DELAY.
+        tokio::time::sleep(PARAM_SAVE_SETTLE_DELAY).await;
 
         // Snapshot the HEARTBEAT counter before anything else can happen, so
         // the reconnect wait below has a watermark to compare against. Taken
@@ -516,6 +536,7 @@ mod apply_tests {
     use crossbeam_channel::bounded;
     use simulation::SimulationConfig;
     use std::sync::Mutex;
+    use std::time::Instant;
 
     fn make_handler(
         mav_tx: Option<Sender<MavMessage>>,
@@ -533,7 +554,7 @@ mod apply_tests {
     #[derive(Debug, Clone)]
     enum CapturedMsg {
         ParamSet(String, f32),
-        CommandLong(u32),
+        CommandLong(u32, Instant),
     }
 
     fn spawn_fake_px4(
@@ -563,7 +584,7 @@ mod apply_tests {
                         captured_clone
                             .lock()
                             .unwrap()
-                            .push(CapturedMsg::CommandLong(c.command as u32));
+                            .push(CapturedMsg::CommandLong(c.command as u32, Instant::now()));
                     }
                     _ => {}
                 }
@@ -589,15 +610,20 @@ mod apply_tests {
         let (pv_tx, _) = broadcast::channel::<(String, f32)>(64);
         let (_px4, captured) = spawn_fake_px4(mav_rx, pv_tx.clone());
 
-        // Capture NSH commands instead of silently draining them, so this
-        // test can confirm the reboot actually went out as an NSH "reboot"
-        // rather than the unacked MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN.
+        // Capture NSH commands (with arrival time) instead of silently
+        // draining them, so this test can confirm both that the reboot went
+        // out as an NSH "reboot" (rather than the unacked
+        // MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN) and that it didn't race the
+        // preceding PARAM_SAVE's flash commit (PARAM_SAVE_SETTLE_DELAY).
         let (nsh_tx, mut nsh_rx) = mpsc::channel::<ValidatedNshCommand>(4);
-        let nsh_captured = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
+        let nsh_captured = std::sync::Arc::new(Mutex::new(Vec::<(String, Instant)>::new()));
         let nsh_captured_clone = nsh_captured.clone();
         tokio::spawn(async move {
             while let Some(cmd) = nsh_rx.recv().await {
-                nsh_captured_clone.lock().unwrap().push(cmd.command);
+                nsh_captured_clone
+                    .lock()
+                    .unwrap()
+                    .push((cmd.command, Instant::now()));
             }
         });
 
@@ -609,7 +635,11 @@ mod apply_tests {
         // PREFLIGHT_QUIET_PERIOD (2s) — anything sooner would be (correctly)
         // treated as a stale pre-reboot straggler and cleared.
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(2200)).await;
+            // Comfortably past PARAM_SAVE_SETTLE_DELAY (500ms, now part of
+            // apply()'s pre-reboot sequence) + PREFLIGHT_QUIET_PERIOD (2s)
+            // from whenever wait_for_reconnect actually starts polling, plus
+            // the same ~200ms margin the original 2200ms value carried.
+            tokio::time::sleep(Duration::from_millis(2700)).await;
             sim_state_for_reboot.set_heartbeat_status(true, true);
         });
 
@@ -640,10 +670,30 @@ mod apply_tests {
         assert!(param_names.contains(&"SYS_HITL"));
         assert!(param_names.contains(&"SYS_AUTOSTART"));
 
+        let param_save_at = snapshot
+            .iter()
+            .find_map(|m| match m {
+                CapturedMsg::CommandLong(245, t) => Some(*t),
+                _ => None,
+            })
+            .expect("PARAM_SAVE (MAV_CMD_PREFLIGHT_STORAGE) was not sent");
+
+        let nsh_snapshot = nsh_captured.lock().unwrap().clone();
         assert_eq!(
-            nsh_captured.lock().unwrap().as_slice(),
+            nsh_snapshot
+                .iter()
+                .map(|(cmd, _)| cmd.as_str())
+                .collect::<Vec<_>>(),
             ["reboot"],
             "reboot must go out via NSH, not MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN"
+        );
+        let reboot_at = nsh_snapshot[0].1;
+        assert!(
+            reboot_at.duration_since(param_save_at) >= PARAM_SAVE_SETTLE_DELAY,
+            "reboot fired only {:?} after PARAM_SAVE, need >= {:?} so PX4's flash \
+             commit isn't interrupted by the reset",
+            reboot_at.duration_since(param_save_at),
+            PARAM_SAVE_SETTLE_DELAY
         );
     }
 
@@ -785,7 +835,11 @@ mod apply_tests {
 
         let sim_state_for_reboot = sim_state.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(2200)).await;
+            // Comfortably past PARAM_SAVE_SETTLE_DELAY (500ms, now part of
+            // apply()'s pre-reboot sequence) + PREFLIGHT_QUIET_PERIOD (2s)
+            // from whenever wait_for_reconnect actually starts polling, plus
+            // the same ~200ms margin the original 2200ms value carried.
+            tokio::time::sleep(Duration::from_millis(2700)).await;
             sim_state_for_reboot.set_heartbeat_status(true, true);
         });
 
