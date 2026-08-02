@@ -93,7 +93,8 @@ mod tests {
 }
 
 use crate::build_config::{
-    make_param_save, PARAM_ACK_TIMEOUT, PARAM_RETRY_COUNT, PX4_TARGET_COMPONENT, PX4_TARGET_SYSTEM,
+    make_param_save, make_param_set, wait_for_param_ack, PARAM_ACK_TIMEOUT, PARAM_RETRY_COUNT,
+    PX4_TARGET_COMPONENT, PX4_TARGET_SYSTEM,
 };
 use crate::handler::ValidatedNshCommand;
 use crate::protocol::{OutgoingMessage, PreflightApplyResult, PreflightApplyState, PreflightStatus};
@@ -111,6 +112,49 @@ use tracing::warn;
 /// parameters in PX4's metadata, unlike every other param this daemon pushes
 /// (PID gains, CAL offsets — all genuinely REAL32). See `make_param_set_i32`.
 const QUADROTOR_AUTOSTART_ID: i32 = 4001;
+
+/// PX4 params — beyond SYS_HITL/SYS_AUTOSTART — required for a genuinely
+/// armable HITL session, not just a mode switch. SYS_HITL alone tells PX4
+/// to accept HIL_SENSOR/HIL_GPS instead of real hardware; it does nothing
+/// about the real-hardware preflight/EKF gates that check for a real IMU,
+/// baro, compass, and SD card, so arming failed with "Accel/Gyro/Compass/
+/// Baro ... missing/uncalibrated", "Missing FMU SD Card", and "Strong
+/// magnetic interference" even with SYS_HITL=1 verified. Values sourced
+/// from this repo's own prior-working `params-hitl-backup.txt` snapshot
+/// for this board — a known-good HITL config, not a guess.
+///
+/// INT32: confirmed by the backup file's own `param show` formatting (no
+/// decimal point in what PX4 itself printed) — the same signal that caught
+/// SYS_HITL/SYS_AUTOSTART's type mismatch (see `make_param_set_i32`), and
+/// cross-checked 3-for-3 against ground truth already established this
+/// session (SYS_HITL, RC1_MIN, RC_CHAN_CNT).
+const HITL_SUPPORT_PARAMS_I32: &[(&str, i32)] = &[
+    ("SYS_HAS_BARO", 0),
+    ("CBRK_SUPPLY_CHK", 894281),
+    ("COM_ARM_HFLT_CHK", 0),
+    ("COM_ARM_MAG_ANG", 180),
+    ("COM_ARM_MAG_STR", 0),
+    ("COM_ARM_SDCARD", 0),
+    ("EKF2_GPS_CHECK", 0),
+    ("EKF2_MAG_CHECK", 0),
+    ("EKF2_MULTI_IMU", 1),
+    ("GPS_1_CONFIG", 0),
+    ("HIL_ACT_FUNC1", 101),
+    ("HIL_ACT_FUNC2", 102),
+    ("HIL_ACT_FUNC3", 103),
+    ("HIL_ACT_FUNC4", 104),
+    ("SENS_IMU_MODE", 0),
+    ("SENS_MAG_AUTOCAL", 0),
+];
+
+/// REAL32 counterparts of the above (backup file shows decimals for these).
+/// Loosens EKF innovation-drift gates that a simulated IMU with zero
+/// physical mounting bias can otherwise trip.
+const HITL_SUPPORT_PARAMS_F32: &[(&str, f32)] = &[
+    ("EKF2_ABL_LIM", 0.0),
+    ("EKF2_REQ_HDRIFT", 3.0),
+    ("EKF2_REQ_VDRIFT", 3.0),
+];
 
 /// Total time budget for the FC to come back after a preflight-triggered
 /// reboot. Bounded so a cable/power issue surfaces as an explicit error
@@ -221,9 +265,12 @@ impl PreflightHandler {
         }
     }
 
-    /// Push SYS_HITL=1 + SYS_AUTOSTART=4001, save, reboot the FC, and wait for
-    /// it to reconnect before re-verifying. Fail-closed: any ack failure
-    /// aborts before the reboot is sent.
+    /// Push SYS_HITL=1 + SYS_AUTOSTART=4001 plus the supporting params in
+    /// `HITL_SUPPORT_PARAMS_I32`/`_F32` that disable real-hardware preflight
+    /// gates (SD card, sensor-presence, mag consistency, EKF drift checks),
+    /// save, reboot the FC, and wait for it to reconnect before
+    /// re-verifying. Fail-closed: any ack failure aborts before the reboot
+    /// is sent.
     ///
     /// Rejects a second call while one is already running (`self.applying`),
     /// checked before anything else so a concurrent call never sends a
@@ -259,7 +306,10 @@ impl PreflightHandler {
 
         send_progress(&progress_tx, PreflightApplyState::Applying).await;
 
-        for (name, value) in [("SYS_HITL", 1i32), ("SYS_AUTOSTART", QUADROTOR_AUTOSTART_ID)] {
+        for (name, value) in [("SYS_HITL", 1i32), ("SYS_AUTOSTART", QUADROTOR_AUTOSTART_ID)]
+            .into_iter()
+            .chain(HITL_SUPPORT_PARAMS_I32.iter().copied())
+        {
             let mut acked = false;
             for attempt in 1..=PARAM_RETRY_COUNT {
                 let mut rx = param_value_tx.subscribe();
@@ -280,6 +330,44 @@ impl PreflightHandler {
                 }
 
                 if wait_for_int_param_ack(&mut rx, name, value).await {
+                    acked = true;
+                    break;
+                }
+                warn!(param = name, attempt, "Preflight PARAM_VALUE ack timed out — retrying");
+            }
+
+            if !acked {
+                return PreflightApplyResult {
+                    state: PreflightApplyState::Error,
+                    success: false,
+                    error: Some(format!(
+                        "Failed to verify {name} after {PARAM_RETRY_COUNT} retries"
+                    )),
+                };
+            }
+        }
+
+        for &(name, value) in HITL_SUPPORT_PARAMS_F32 {
+            let mut acked = false;
+            for attempt in 1..=PARAM_RETRY_COUNT {
+                let mut rx = param_value_tx.subscribe();
+                match mav_tx.try_send(make_param_set(name, value)) {
+                    Ok(()) => {}
+                    Err(crossbeam_channel::TrySendError::Full(_)) => {
+                        warn!(param = name, attempt, "MAVLink tx channel full — retrying PARAM_SET");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                    Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                        return PreflightApplyResult {
+                            state: PreflightApplyState::Error,
+                            success: false,
+                            error: Some(format!("MAVLink tx disconnected while sending {name}")),
+                        };
+                    }
+                }
+
+                if wait_for_param_ack(&mut rx, name, value).await.is_some() {
                     acked = true;
                     break;
                 }
@@ -553,7 +641,7 @@ mod apply_tests {
 
     #[derive(Debug, Clone)]
     enum CapturedMsg {
-        ParamSet(String, f32),
+        ParamSet(String, f32, MavParamType),
         CommandLong(u32, Instant),
     }
 
@@ -577,7 +665,7 @@ mod apply_tests {
                         captured_clone
                             .lock()
                             .unwrap()
-                            .push(CapturedMsg::ParamSet(name.clone(), p.param_value));
+                            .push(CapturedMsg::ParamSet(name.clone(), p.param_value, p.param_type));
                         let _ = param_value_tx.send((name, p.param_value));
                     }
                     MavMessage::COMMAND_LONG(c) => {
@@ -663,12 +751,39 @@ mod apply_tests {
         let param_names: Vec<&str> = snapshot
             .iter()
             .filter_map(|m| match m {
-                CapturedMsg::ParamSet(n, _) => Some(n.as_str()),
+                CapturedMsg::ParamSet(n, _, _) => Some(n.as_str()),
                 _ => None,
             })
             .collect();
         assert!(param_names.contains(&"SYS_HITL"));
         assert!(param_names.contains(&"SYS_AUTOSTART"));
+
+        // Every HITL support param must go out, and with the type the
+        // backup file's own formatting says PX4 expects — the same
+        // int-vs-real mismatch silently dropped SYS_HITL/SYS_AUTOSTART
+        // earlier this session (see make_param_set_i32's doc comment).
+        for &(name, _) in HITL_SUPPORT_PARAMS_I32 {
+            let ty = snapshot.iter().find_map(|m| match m {
+                CapturedMsg::ParamSet(n, _, t) if n == name => Some(*t),
+                _ => None,
+            });
+            assert_eq!(
+                ty,
+                Some(MavParamType::MAV_PARAM_TYPE_INT32),
+                "{name} must be pushed as INT32"
+            );
+        }
+        for &(name, _) in HITL_SUPPORT_PARAMS_F32 {
+            let ty = snapshot.iter().find_map(|m| match m {
+                CapturedMsg::ParamSet(n, _, t) if n == name => Some(*t),
+                _ => None,
+            });
+            assert_eq!(
+                ty,
+                Some(MavParamType::MAV_PARAM_TYPE_REAL32),
+                "{name} must be pushed as REAL32"
+            );
+        }
 
         let param_save_at = snapshot
             .iter()
