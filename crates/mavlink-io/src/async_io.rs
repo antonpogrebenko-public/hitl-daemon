@@ -61,6 +61,9 @@ pub enum AsyncIoError {
 
     #[error("MAVLink write error: {0}")]
     Write(#[from] mavlink::error::MessageWriteError),
+
+    #[error("Blocking task join error: {0}")]
+    TaskJoin(String),
 }
 
 /// Raw bytes for NSH communication
@@ -170,7 +173,23 @@ impl MavlinkIo {
     ) -> Result<(), AsyncIoError> {
         info!(port = %port, baud_rate, "Opening serial port for async I/O");
 
-        let serial = tokio_serial::new(port, baud_rate).open_native_async()?;
+        // `open_native_async()` performs a synchronous, unyielding OS
+        // `open()` call under the hood — mio_serial's own debug log says
+        // "opening serial port in synchronous blocking mode". On a wedged
+        // macOS USB CDC-ACM device this can stall for tens of seconds.
+        // Run it on tokio's dedicated blocking-thread pool instead of
+        // inline in this async task: a stall then ties up a blocking-pool
+        // thread instead of one of the runtime's small number of core
+        // worker threads, which otherwise starves unrelated async work
+        // (e.g. accepting new WebSocket connections) for the same
+        // duration — observed on real hardware as WS handshakes timing out
+        // while a reconnect attempt was stuck opening the port.
+        let port_owned = port.to_string();
+        let serial = tokio::task::spawn_blocking(move || {
+            tokio_serial::new(port_owned, baud_rate).open_native_async()
+        })
+        .await
+        .map_err(|e| AsyncIoError::TaskJoin(e.to_string()))??;
         let (reader, writer) = tokio::io::split(serial);
 
         let shutdown_reader = self.shutdown.clone();
