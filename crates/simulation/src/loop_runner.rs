@@ -410,7 +410,18 @@ impl SimulationLoop {
         // origin datum" — doing so teleports a drone flying below the origin
         // straight up to it, a discontinuity the EKF cannot reconcile.
         // Flat ground at Z=0 applies only when no terrain is configured at all.
-        let ground_z: Option<f64> = match self.config.terrain.as_ref() {
+        // `self.config.terrain` is `Some` from the moment the daemon starts
+        // (main.rs always wires in a shared Arc<TerrainCache> so a later
+        // ConfigureBuild can populate it in place) — it does NOT mean tiles
+        // have actually been loaded. Gate on `is_loaded()` too, so an empty
+        // cache is treated the same as "no terrain configured" (flat Z=0)
+        // rather than "configured but outside coverage" (clamp disabled).
+        // Without this, a fresh daemon free-falls from the origin with no
+        // floor until it hits conservation::check_position_bounds's 10km
+        // debug-assert, permanently killing the simulation thread.
+        let terrain = self.config.terrain.as_ref().filter(|t| t.is_loaded());
+
+        let ground_z: Option<f64> = match terrain {
             Some(terrain) => terrain
                 .sample_ground_ned(
                     state.quadrotor.position[0], // north
@@ -422,7 +433,7 @@ impl SimulationLoop {
 
         // Surface orientation under the drone. `None` (no terrain configured,
         // or outside coverage) means level ground, matching `ground_z`.
-        let ground_normal: Option<[f32; 3]> = match self.config.terrain.as_ref() {
+        let ground_normal: Option<[f32; 3]> = match terrain {
             Some(terrain) => terrain
                 .sample_ground_normal_ned(state.quadrotor.position[0], state.quadrotor.position[1])
                 .or(Some(LEVEL_NORMAL_NED)),
@@ -1168,6 +1179,43 @@ mod tests {
             down > 49.0,
             "drone must not be clamped to the origin datum when the ground \
              height is unknown; expected to stay near 50 m down, got {down}"
+        );
+    }
+
+    /// Root-cause regression: `main.rs` always wires in `Some(Arc<TerrainCache>)`
+    /// from daemon startup (so a later ConfigureBuild can populate it in
+    /// place), even before any tiles are loaded. An unloaded cache must be
+    /// treated as "no terrain configured" (flat ground clamp at Z=0), not as
+    /// "configured but outside coverage" (clamp disabled) — the latter free-
+    /// falls the drone from the origin with no floor until it trips
+    /// conservation::check_position_bounds's 10km debug-assert, permanently
+    /// killing the simulation thread (observed on real hardware: ~5 minutes
+    /// after every daemon start, before any ConfigureBuild had run).
+    #[test]
+    fn unloaded_terrain_cache_clamps_to_flat_ground_instead_of_free_falling() {
+        let config = SimulationConfig {
+            terrain: Some(Arc::new(TerrainCache::new())),
+            ..SimulationConfig::default()
+        };
+        let (mut sim, _ch) = test_loop(config);
+        assert!(
+            !sim.config.terrain.as_ref().unwrap().is_loaded(),
+            "fixture precondition: cache must have zero tiles"
+        );
+
+        {
+            let mut state = sim.state.write();
+            state.quadrotor.position = [0.0, 0.0, 0.01];
+            state.quadrotor.velocity = [0.0, 0.0, 1.0];
+        }
+
+        sim.step_physics(DT);
+
+        let down = sim.state.read().quadrotor.position[2];
+        assert!(
+            (down - 0.0).abs() < 1e-6,
+            "an unloaded terrain cache must clamp to flat ground at Z=0, \
+             not free-fall as if the ground height were unknown; got {down}"
         );
     }
 
