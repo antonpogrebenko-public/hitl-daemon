@@ -195,19 +195,28 @@ const PREFLIGHT_QUIET_PERIOD: Duration = Duration::from_secs(2);
 
 /// Delay between the fire-and-forget PARAM_SAVE (flash write) and the reboot
 /// that follows it. `MAV_CMD_PREFLIGHT_STORAGE`'s flash commit on PX4 is
-/// asynchronous and best-effort-acked (~100ms typical, per `make_param_save`'s
-/// doc comment) — writing the command's bytes to the serial port is not the
-/// same as PX4 finishing the write. Without this gap, the reboot used to be
-/// sent essentially back-to-back with the save (both queue onto the same
-/// serial writer, which drains the NSH queue before the MAVLink queue each
-/// tick, so ordering on the wire wasn't even guaranteed to match program
-/// order), racing an in-flight flash commit against a hard MCU reset.
-/// Observed on real hardware as both non-deterministic loss of the
-/// just-applied SYS_HITL/SYS_AUTOSTART params (the write never landed before
-/// the reset) and a wedged FC that a daemon restart alone could not recover
-/// (an interrupted flash erase/write left the parameter store corrupted,
-/// requiring a physical power cycle). 500ms is 5x the typical commit time.
-const PARAM_SAVE_SETTLE_DELAY: Duration = Duration::from_millis(500);
+/// asynchronous and best-effort-acked (~100ms typical for a single dirty
+/// param, per `make_param_save`'s doc comment) — writing the command's bytes
+/// to the serial port is not the same as PX4 finishing the write. Without
+/// this gap, the reboot used to be sent essentially back-to-back with the
+/// save (both queue onto the same serial writer, which drains the NSH queue
+/// before the MAVLink queue each tick, so ordering on the wire wasn't even
+/// guaranteed to match program order), racing an in-flight flash commit
+/// against a hard MCU reset. Observed on real hardware as both
+/// non-deterministic loss of the just-applied params (the write never
+/// landed before the reset) and a wedged FC that a daemon restart alone
+/// could not recover (an interrupted flash erase/write left the parameter
+/// store corrupted — the FC's USB descriptor reports it stuck in bootloader,
+/// "PX4 BL FMU ...", indefinitely instead of the normal 3-5s dwell —
+/// requiring a physical power cycle).
+///
+/// `apply()` now pushes `HITL_SUPPORT_PARAMS_I32`/`_F32` alongside
+/// SYS_HITL/SYS_AUTOSTART (~21 dirty params total, not 2), and PX4 commits
+/// each dirty param as its own small flash write, so the total commit time
+/// scales with the count. 500ms (sized for a 2-param save) reproduced this
+/// exact bootloader-stuck failure once the push grew; 2s gives roughly the
+/// same 5x margin over a 21-param commit that 500ms gave over a 2-param one.
+const PARAM_SAVE_SETTLE_DELAY: Duration = Duration::from_millis(2000);
 
 pub struct PreflightHandler {
     mav_tx: Option<Sender<MavMessage>>,
@@ -723,11 +732,11 @@ mod apply_tests {
         // PREFLIGHT_QUIET_PERIOD (2s) — anything sooner would be (correctly)
         // treated as a stale pre-reboot straggler and cleared.
         tokio::spawn(async move {
-            // Comfortably past PARAM_SAVE_SETTLE_DELAY (500ms, now part of
+            // Comfortably past PARAM_SAVE_SETTLE_DELAY (2s, now part of
             // apply()'s pre-reboot sequence) + PREFLIGHT_QUIET_PERIOD (2s)
             // from whenever wait_for_reconnect actually starts polling, plus
             // the same ~200ms margin the original 2200ms value carried.
-            tokio::time::sleep(Duration::from_millis(2700)).await;
+            tokio::time::sleep(Duration::from_millis(4200)).await;
             sim_state_for_reboot.set_heartbeat_status(true, true);
         });
 
@@ -950,11 +959,11 @@ mod apply_tests {
 
         let sim_state_for_reboot = sim_state.clone();
         tokio::spawn(async move {
-            // Comfortably past PARAM_SAVE_SETTLE_DELAY (500ms, now part of
+            // Comfortably past PARAM_SAVE_SETTLE_DELAY (2s, now part of
             // apply()'s pre-reboot sequence) + PREFLIGHT_QUIET_PERIOD (2s)
             // from whenever wait_for_reconnect actually starts polling, plus
             // the same ~200ms margin the original 2200ms value carried.
-            tokio::time::sleep(Duration::from_millis(2700)).await;
+            tokio::time::sleep(Duration::from_millis(4200)).await;
             sim_state_for_reboot.set_heartbeat_status(true, true);
         });
 
