@@ -97,6 +97,7 @@ use crate::build_config::{
     PX4_TARGET_COMPONENT, PX4_TARGET_SYSTEM,
 };
 use crate::handler::ValidatedNshCommand;
+use crate::param_io::ParamValue;
 use crate::protocol::{OutgoingMessage, PreflightApplyResult, PreflightApplyState, PreflightStatus};
 use crossbeam_channel::Sender;
 use mavlink::ardupilotmega::{MavMessage, MavParamType, PARAM_SET_DATA};
@@ -220,7 +221,7 @@ const PARAM_SAVE_SETTLE_DELAY: Duration = Duration::from_millis(2000);
 
 pub struct PreflightHandler {
     mav_tx: Option<Sender<MavMessage>>,
-    param_value_tx: Option<broadcast::Sender<(String, f32)>>,
+    param_value_tx: Option<broadcast::Sender<ParamValue>>,
     /// Used to trigger the post-apply reboot via PX4's own NSH `reboot`
     /// command rather than `MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN`. On at least
     /// one real board this command construction (`COMMAND_LONG`, correct
@@ -246,7 +247,7 @@ pub struct PreflightHandler {
 impl PreflightHandler {
     pub fn new(
         mav_tx: Option<Sender<MavMessage>>,
-        param_value_tx: Option<broadcast::Sender<(String, f32)>>,
+        param_value_tx: Option<broadcast::Sender<ParamValue>>,
         nsh_tx: Option<mpsc::Sender<ValidatedNshCommand>>,
         sim_state: SimulationState,
     ) -> Self {
@@ -597,7 +598,7 @@ fn make_param_set_i32(name: &str, value: i32) -> MavMessage {
 /// by numeric cast — mirrors `wait_for_param_ack` but compares as bits, not
 /// as a float value within an epsilon.
 async fn wait_for_int_param_ack(
-    rx: &mut broadcast::Receiver<(String, f32)>,
+    rx: &mut broadcast::Receiver<ParamValue>,
     name: &str,
     expected: i32,
 ) -> bool {
@@ -608,8 +609,10 @@ async fn wait_for_int_param_ack(
             return false;
         }
         match tokio::time::timeout(remaining, rx.recv()).await {
-            Ok(Ok((got_name, got_value))) => {
-                if got_name == name && got_value.to_bits() as i32 == expected {
+            Ok(Ok(pv)) => {
+                // PX4 carries an INT32 parameter as the raw bit pattern of the
+                // float field, so the comparison reinterprets rather than casts.
+                if pv.name == name && pv.value.to_bits() as i32 == expected {
                     return true;
                 }
                 // Unrelated PARAM_VALUE (QGC pull, other params) — keep draining.
@@ -637,7 +640,7 @@ mod apply_tests {
 
     fn make_handler(
         mav_tx: Option<Sender<MavMessage>>,
-        param_value_tx: Option<broadcast::Sender<(String, f32)>>,
+        param_value_tx: Option<broadcast::Sender<ParamValue>>,
         sim_state: SimulationState,
     ) -> PreflightHandler {
         // A fire-and-forget NSH channel with a task draining it forever, so
@@ -656,7 +659,7 @@ mod apply_tests {
 
     fn spawn_fake_px4(
         mav_rx: crossbeam_channel::Receiver<MavMessage>,
-        param_value_tx: broadcast::Sender<(String, f32)>,
+        param_value_tx: broadcast::Sender<ParamValue>,
     ) -> (
         tokio::task::JoinHandle<()>,
         std::sync::Arc<Mutex<Vec<CapturedMsg>>>,
@@ -675,7 +678,12 @@ mod apply_tests {
                             .lock()
                             .unwrap()
                             .push(CapturedMsg::ParamSet(name.clone(), p.param_value, p.param_type));
-                        let _ = param_value_tx.send((name, p.param_value));
+                        let _ = param_value_tx.send(ParamValue {
+                        name,
+                        value: p.param_value,
+                        param_type: p.param_type,
+                        index: 0,
+                    });
                     }
                     MavMessage::COMMAND_LONG(c) => {
                         captured_clone
@@ -704,7 +712,7 @@ mod apply_tests {
     #[tokio::test]
     async fn happy_path_applies_reboots_and_verifies() {
         let (mav_tx, mav_rx) = bounded::<MavMessage>(64);
-        let (pv_tx, _) = broadcast::channel::<(String, f32)>(64);
+        let (pv_tx, _) = broadcast::channel::<ParamValue>(64);
         let (_px4, captured) = spawn_fake_px4(mav_rx, pv_tx.clone());
 
         // Capture NSH commands (with arrival time) instead of silently
@@ -824,7 +832,7 @@ mod apply_tests {
     #[tokio::test]
     async fn ack_failure_returns_error_without_reboot() {
         let (mav_tx, _mav_rx) = bounded::<MavMessage>(64);
-        let (pv_tx, _) = broadcast::channel::<(String, f32)>(64);
+        let (pv_tx, _) = broadcast::channel::<ParamValue>(64);
         // No fake PX4 draining mav_rx — every PARAM_SET times out.
         let sim_state = SimulationState::new(SimulationConfig::default());
         let handler = make_handler(Some(mav_tx), Some(pv_tx), sim_state);
@@ -899,7 +907,7 @@ mod apply_tests {
         // "no FC to misconfigure, skip silently" — letting a build be pushed
         // to a flight controller that is mid-reboot.
         let (mav_tx, mav_rx) = bounded::<MavMessage>(64);
-        let (pv_tx, _) = broadcast::channel::<(String, f32)>(64);
+        let (pv_tx, _) = broadcast::channel::<ParamValue>(64);
         let (_px4, _captured) = spawn_fake_px4(mav_rx, pv_tx.clone());
 
         let sim_state = SimulationState::new(SimulationConfig::default());
@@ -945,7 +953,7 @@ mod apply_tests {
         // check() reports the pre-apply reality, apply() runs the whole
         // reboot cycle, and check() then reports the post-reboot reality.
         let (mav_tx, mav_rx) = bounded::<MavMessage>(64);
-        let (pv_tx, _) = broadcast::channel::<(String, f32)>(64);
+        let (pv_tx, _) = broadcast::channel::<ParamValue>(64);
         let (_px4, _captured) = spawn_fake_px4(mav_rx, pv_tx.clone());
 
         let sim_state = SimulationState::new(SimulationConfig::default());
@@ -992,7 +1000,7 @@ mod apply_tests {
         // the same FC. No fake PX4 drains mav_rx here, so the first apply()
         // sits in its PARAM_SET retry loop (~2.4s) for the whole test.
         let (mav_tx, _mav_rx) = bounded::<MavMessage>(64);
-        let (pv_tx, _) = broadcast::channel::<(String, f32)>(64);
+        let (pv_tx, _) = broadcast::channel::<ParamValue>(64);
         let sim_state = SimulationState::new(SimulationConfig::default());
         let handler = std::sync::Arc::new(make_handler(Some(mav_tx), Some(pv_tx), sim_state));
 

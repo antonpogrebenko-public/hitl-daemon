@@ -68,6 +68,10 @@ pub const MSG_TYPE_PREFLIGHT_STATUS: u8 = 0x0A;
 pub const MSG_TYPE_PREFLIGHT_APPLY_RESULT: u8 = 0x0B;
 pub const MSG_TYPE_REQUEST_PREFLIGHT_CHECK: u8 = 0x14;
 pub const MSG_TYPE_APPLY_PREFLIGHT_PARAMS: u8 = 0x15;
+/// Daemon -> browser: parameters captured off the board, awaiting persistence.
+pub const MSG_TYPE_SNAPSHOT_CAPTURED: u8 = 0x0C;
+/// Browser -> daemon: the snapshot is durably stored, writes may proceed.
+pub const MSG_TYPE_SNAPSHOT_STORED: u8 = 0x16;
 
 // State update size (current wire format)
 pub const STATE_UPDATE_SIZE: usize = 87;
@@ -562,6 +566,81 @@ impl PreflightStatus {
     }
 }
 
+/// One flight-controller parameter as it stood before provisioning.
+///
+/// `param_type` is carried because PX4 silently drops a `PARAM_SET` whose type
+/// does not match the parameter's declared type. A snapshot that records only
+/// name and value cannot be replayed onto the board.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotParam {
+    pub name: String,
+    pub value: f32,
+    /// "int32" or "real32" — the two shapes PX4's PARAM_SET encoding cares
+    /// about, rather than the full MAVLink type enum.
+    pub param_type: String,
+}
+
+/// Parameters read off the board before any write, sent to the browser for
+/// durable storage.
+///
+/// ## Binary format (0x0C)
+/// - `[0]`: 0x0C message type
+/// - `[1-N]`: JSON body
+#[derive(Debug, Clone, Serialize)]
+pub struct SnapshotCaptured {
+    /// Stable key for the board these values came from. Restore is refused
+    /// when this does not match the connected board.
+    pub board_identity: String,
+    pub params: Vec<SnapshotParam>,
+}
+
+impl SnapshotCaptured {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let json = serde_json::to_vec(self).expect("SnapshotCaptured serialization cannot fail");
+        let mut buf = Vec::with_capacity(1 + json.len());
+        buf.push(MSG_TYPE_SNAPSHOT_CAPTURED);
+        buf.extend_from_slice(&json);
+        buf
+    }
+}
+
+/// Browser's confirmation that a captured snapshot is durably stored.
+///
+/// Provisioning blocks on this. Writing to the board before the restore point
+/// is safe would open a window where the board is modified and nothing can put
+/// it back, which is the exact state the snapshot exists to prevent.
+///
+/// ## Binary format (0x16)
+/// - `[0]`: 0x16 message type
+/// - `[1-N]`: JSON body
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SnapshotStored {
+    pub board_identity: String,
+    /// False when the browser could not persist (quota exceeded, storage
+    /// disabled). Provisioning must abort rather than proceed unprotected.
+    pub stored: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl SnapshotStored {
+    pub fn from_bytes(data: &[u8]) -> Result<Self, ProtocolError> {
+        if data.len() < 2 {
+            return Err(ProtocolError::MessageTooShort {
+                expected: 2,
+                actual: data.len(),
+            });
+        }
+        if data[0] != MSG_TYPE_SNAPSHOT_STORED {
+            return Err(ProtocolError::UnknownMessageType(data[0]));
+        }
+        serde_json::from_slice(&data[1..]).map_err(|e| ProtocolError::InvalidPayload {
+            command_type: CommandType::Arm,
+            reason: format!("SnapshotStored: {e}"),
+        })
+    }
+}
+
 /// Lifecycle stage of an `ApplyPreflightParams` request. Mirrors
 /// `ConfigState`'s two-stage shape: the same message type carries both
 /// interim progress (`success: true`, non-terminal `state`) and the final
@@ -920,6 +999,7 @@ pub enum OutgoingMessage {
     VehicleMessage(VehicleMessage),
     ConfigResult(ConfigResult),
     TerrainOrigin(TerrainOrigin),
+    SnapshotCaptured(SnapshotCaptured),
     PreflightStatus(PreflightStatus),
     PreflightApplyResult(PreflightApplyResult),
 }
@@ -935,6 +1015,7 @@ impl OutgoingMessage {
             OutgoingMessage::VehicleMessage(v) => v.to_bytes(),
             OutgoingMessage::ConfigResult(r) => r.to_bytes(),
             OutgoingMessage::TerrainOrigin(t) => t.to_bytes(),
+            OutgoingMessage::SnapshotCaptured(s) => s.to_bytes(),
             OutgoingMessage::PreflightStatus(p) => p.to_bytes(),
             OutgoingMessage::PreflightApplyResult(p) => p.to_bytes(),
         }
@@ -951,6 +1032,7 @@ pub enum IncomingMessage {
     Shutdown,
     RequestPreflightCheck,
     ApplyPreflightParams,
+    SnapshotStored(SnapshotStored),
 }
 
 impl IncomingMessage {
@@ -973,6 +1055,9 @@ impl IncomingMessage {
             MSG_TYPE_SHUTDOWN => Ok(IncomingMessage::Shutdown),
             MSG_TYPE_REQUEST_PREFLIGHT_CHECK => Ok(IncomingMessage::RequestPreflightCheck),
             MSG_TYPE_APPLY_PREFLIGHT_PARAMS => Ok(IncomingMessage::ApplyPreflightParams),
+            MSG_TYPE_SNAPSHOT_STORED => Ok(IncomingMessage::SnapshotStored(
+                SnapshotStored::from_bytes(data)?,
+            )),
             other => Err(ProtocolError::UnknownMessageType(other)),
         }
     }
@@ -1267,5 +1352,117 @@ mod tests {
         assert_eq!(bytes[5], 0);
         assert_eq!(&bytes[6..18], b"Rate limited");
         assert_eq!(bytes[18], 0);
+    }
+}
+
+#[cfg(test)]
+mod snapshot_protocol_tests {
+    use super::*;
+
+    fn params() -> Vec<SnapshotParam> {
+        vec![
+            SnapshotParam {
+                name: "SYS_HITL".to_string(),
+                value: 0.0,
+                param_type: "int32".to_string(),
+            },
+            SnapshotParam {
+                name: "EKF2_REQ_HDRIFT".to_string(),
+                value: 0.3,
+                param_type: "real32".to_string(),
+            },
+        ]
+    }
+
+    #[test]
+    fn captured_snapshot_encodes_with_its_message_type() {
+        let msg = SnapshotCaptured {
+            board_identity: "uid:3034510f33323831".to_string(),
+            params: params(),
+        };
+        let bytes = msg.to_bytes();
+        assert_eq!(bytes[0], MSG_TYPE_SNAPSHOT_CAPTURED);
+
+        let decoded: serde_json::Value = serde_json::from_slice(&bytes[1..]).unwrap();
+        assert_eq!(decoded["board_identity"], "uid:3034510f33323831");
+        // The type has to survive the wire: PX4 drops a type-mismatched
+        // PARAM_SET, so restore cannot reconstruct it from the value.
+        assert_eq!(decoded["params"][0]["param_type"], "int32");
+        assert_eq!(decoded["params"][1]["param_type"], "real32");
+    }
+
+    #[test]
+    fn stored_ack_round_trips() {
+        let json = serde_json::json!({
+            "board_identity": "uid:3034510f33323831",
+            "stored": true,
+        });
+        let mut bytes = vec![MSG_TYPE_SNAPSHOT_STORED];
+        bytes.extend_from_slice(&serde_json::to_vec(&json).unwrap());
+
+        let decoded = SnapshotStored::from_bytes(&bytes).expect("valid ack");
+        assert!(decoded.stored);
+        assert_eq!(decoded.board_identity, "uid:3034510f33323831");
+        assert_eq!(decoded.error, None);
+    }
+
+    #[test]
+    fn stored_ack_carries_a_persistence_failure() {
+        // The browser could not persist (quota, storage disabled). Provisioning
+        // must be able to tell this apart from success and abort.
+        let json = serde_json::json!({
+            "board_identity": "uid:abc",
+            "stored": false,
+            "error": "QuotaExceededError",
+        });
+        let mut bytes = vec![MSG_TYPE_SNAPSHOT_STORED];
+        bytes.extend_from_slice(&serde_json::to_vec(&json).unwrap());
+
+        let decoded = SnapshotStored::from_bytes(&bytes).expect("valid ack");
+        assert!(!decoded.stored);
+        assert_eq!(decoded.error.as_deref(), Some("QuotaExceededError"));
+    }
+
+    #[test]
+    fn malformed_ack_payload_is_rejected() {
+        let mut bytes = vec![MSG_TYPE_SNAPSHOT_STORED];
+        bytes.extend_from_slice(b"{not json");
+        assert!(SnapshotStored::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn ack_missing_required_fields_is_rejected() {
+        // "stored" is the whole point of the message; defaulting it to false
+        // would turn a malformed ack into a silent provisioning abort, and
+        // defaulting it to true would be catastrophic.
+        let mut bytes = vec![MSG_TYPE_SNAPSHOT_STORED];
+        bytes.extend_from_slice(br#"{"board_identity":"uid:abc"}"#);
+        assert!(SnapshotStored::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn ack_with_wrong_message_type_is_rejected() {
+        let mut bytes = vec![MSG_TYPE_CONFIGURE_BUILD];
+        bytes.extend_from_slice(br#"{"board_identity":"uid:abc","stored":true}"#);
+        assert!(matches!(
+            SnapshotStored::from_bytes(&bytes),
+            Err(ProtocolError::UnknownMessageType(_))
+        ));
+    }
+
+    #[test]
+    fn empty_ack_is_rejected() {
+        assert!(SnapshotStored::from_bytes(&[]).is_err());
+        assert!(SnapshotStored::from_bytes(&[MSG_TYPE_SNAPSHOT_STORED]).is_err());
+    }
+
+    #[test]
+    fn incoming_dispatch_routes_the_ack() {
+        let mut bytes = vec![MSG_TYPE_SNAPSHOT_STORED];
+        bytes.extend_from_slice(br#"{"board_identity":"uid:abc","stored":true}"#);
+        match IncomingMessage::from_bytes(&bytes).expect("dispatches") {
+            IncomingMessage::SnapshotStored(ack) => assert!(ack.stored),
+            other => panic!("expected SnapshotStored, got {other:?}"),
+        }
     }
 }

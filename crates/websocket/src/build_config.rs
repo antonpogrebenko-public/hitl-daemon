@@ -1,4 +1,5 @@
 use crate::handler::ValidatedNshCommand;
+use crate::param_io::ParamValue;
 use crate::protocol::{
     AppliedConfig, ConfigResult, ConfigState, ConfigureBuild, OutgoingMessage, Px4PidsView,
 };
@@ -49,7 +50,7 @@ pub struct BuildConfigHandler {
     /// MAVLink receiver task. We subscribe before sending PARAM_SETs so we
     /// can verify each parameter was applied to PX4's running config.
     /// `None` mirrors `mav_tx == None` (sim-only mode skips verification).
-    param_value_tx: Option<broadcast::Sender<(String, f32)>>,
+    param_value_tx: Option<broadcast::Sender<ParamValue>>,
     /// Fingerprint of the last set of PIDs successfully *verified*. When the
     /// next `ConfigureBuild` yields the same fingerprint, we skip the param
     /// push to avoid wearing PX4's EEPROM on rapid reconfigures. Only set
@@ -85,7 +86,7 @@ impl BuildConfigHandler {
         config_tx: Sender<(PhysicsConfig, BatteryConfig, hitl_sensors::SensorsConfig)>,
         nsh_tx: Option<mpsc::Sender<ValidatedNshCommand>>,
         mav_tx: Option<Sender<MavMessage>>,
-        param_value_tx: Option<broadcast::Sender<(String, f32)>>,
+        param_value_tx: Option<broadcast::Sender<ParamValue>>,
         terrain_cache: Option<std::sync::Arc<terrain::TerrainCache>>,
         terrain_ref: (f64, f64, f64),
     ) -> Self {
@@ -1006,7 +1007,7 @@ fn parse_baro_chip(s: &str) -> BaroChip {
 /// matched (name, value) tuple, or `None` if `PARAM_ACK_TIMEOUT` elapses
 /// without a match. Lagged/closed receivers are treated as "no ack".
 pub(crate) async fn wait_for_param_ack(
-    rx: &mut broadcast::Receiver<(String, f32)>,
+    rx: &mut broadcast::Receiver<ParamValue>,
     name: &str,
     expected: f32,
 ) -> Option<(String, f32)> {
@@ -1017,9 +1018,9 @@ pub(crate) async fn wait_for_param_ack(
             return None;
         }
         match timeout(remaining, rx.recv()).await {
-            Ok(Ok((got_name, got_value))) => {
-                if got_name == name && (got_value - expected).abs() <= PARAM_ACK_EPSILON {
-                    return Some((got_name, got_value));
+            Ok(Ok(pv)) => {
+                if pv.name == name && (pv.value - expected).abs() <= PARAM_ACK_EPSILON {
+                    return Some((pv.name, pv.value));
                 }
                 // Unrelated PARAM_VALUE (QGC pull, other params) — keep draining.
             }
@@ -1207,7 +1208,7 @@ mod tests {
     /// drop the first `drop_first` PARAM_SETs entirely (simulates lossy link).
     fn spawn_fake_px4(
         mav_rx: crossbeam_channel::Receiver<MavMessage>,
-        param_value_tx: broadcast::Sender<(String, f32)>,
+        param_value_tx: broadcast::Sender<ParamValue>,
         drop_first: usize,
     ) -> tokio::task::JoinHandle<()> {
         tokio::task::spawn_blocking(move || {
@@ -1222,7 +1223,12 @@ mod tests {
                         dropped += 1;
                         continue;
                     }
-                    let _ = param_value_tx.send((name, p.param_value));
+                    let _ = param_value_tx.send(ParamValue {
+                        name,
+                        value: p.param_value,
+                        param_type: p.param_type,
+                        index: 0,
+                    });
                 }
             }
         })
@@ -1230,7 +1236,7 @@ mod tests {
 
     fn make_handler(
         mav_tx: Option<Sender<MavMessage>>,
-        param_value_tx: Option<broadcast::Sender<(String, f32)>>,
+        param_value_tx: Option<broadcast::Sender<ParamValue>>,
     ) -> BuildConfigHandler {
         let (config_tx, _config_rx) =
             bounded::<(PhysicsConfig, BatteryConfig, hitl_sensors::SensorsConfig)>(4);
@@ -1265,7 +1271,7 @@ mod tests {
 
     fn spawn_fake_px4_with_capture(
         mav_rx: crossbeam_channel::Receiver<MavMessage>,
-        param_value_tx: broadcast::Sender<(String, f32)>,
+        param_value_tx: broadcast::Sender<ParamValue>,
     ) -> (
         tokio::task::JoinHandle<()>,
         std::sync::Arc<Mutex<Vec<CapturedMsg>>>,
@@ -1284,7 +1290,12 @@ mod tests {
                             .lock()
                             .expect("capture mutex poisoned")
                             .push(CapturedMsg::ParamSet(name.clone(), p.param_value));
-                        let _ = param_value_tx.send((name, p.param_value));
+                        let _ = param_value_tx.send(ParamValue {
+                        name,
+                        value: p.param_value,
+                        param_type: p.param_type,
+                        index: 0,
+                    });
                     }
                     MavMessage::COMMAND_LONG(c) => {
                         captured_clone
@@ -1311,7 +1322,7 @@ mod tests {
     #[tokio::test]
     async fn happy_path_acks_all_fifteen_params() {
         let (mav_tx, mav_rx) = bounded::<MavMessage>(64);
-        let (pv_tx, _) = broadcast::channel::<(String, f32)>(64);
+        let (pv_tx, _) = broadcast::channel::<ParamValue>(64);
         let (_px4, captured) = spawn_fake_px4_with_capture(mav_rx, pv_tx.clone());
 
         let handler = make_handler(Some(mav_tx), Some(pv_tx));
@@ -1347,7 +1358,7 @@ mod tests {
     #[tokio::test]
     async fn one_dropped_ack_recovers_via_retry() {
         let (mav_tx, mav_rx) = bounded::<MavMessage>(64);
-        let (pv_tx, _) = broadcast::channel::<(String, f32)>(64);
+        let (pv_tx, _) = broadcast::channel::<ParamValue>(64);
         // Drop only the first PARAM_SET — the retry should land an ack.
         let _px4 = spawn_fake_px4(mav_rx, pv_tx.clone(), 1);
 
@@ -1363,7 +1374,7 @@ mod tests {
     #[tokio::test]
     async fn persistent_silence_returns_error() {
         let (mav_tx, _mav_rx) = bounded::<MavMessage>(64);
-        let (pv_tx, _) = broadcast::channel::<(String, f32)>(64);
+        let (pv_tx, _) = broadcast::channel::<ParamValue>(64);
         // No fake PX4 — every PARAM_SET sits in mav_rx forever and no ack ever
         // comes back. Each param exhausts PARAM_RETRY_COUNT attempts.
         let handler = make_handler(Some(mav_tx), Some(pv_tx));
@@ -1380,7 +1391,7 @@ mod tests {
     #[tokio::test]
     async fn fingerprint_skips_second_call() {
         let (mav_tx, mav_rx) = bounded::<MavMessage>(64);
-        let (pv_tx, _) = broadcast::channel::<(String, f32)>(64);
+        let (pv_tx, _) = broadcast::channel::<ParamValue>(64);
         let _px4 = spawn_fake_px4(mav_rx, pv_tx.clone(), 0);
 
         let handler = make_handler(Some(mav_tx), Some(pv_tx));
@@ -1402,7 +1413,7 @@ mod tests {
     #[tokio::test]
     async fn invalidate_pid_fingerprint_forces_a_re_push() {
         let (mav_tx, mav_rx) = bounded::<MavMessage>(64);
-        let (pv_tx, _) = broadcast::channel::<(String, f32)>(64);
+        let (pv_tx, _) = broadcast::channel::<ParamValue>(64);
         let _px4 = spawn_fake_px4(mav_rx, pv_tx.clone(), 0);
 
         let handler = make_handler(Some(mav_tx), Some(pv_tx));
@@ -1441,7 +1452,7 @@ mod tests {
         const MAV_CMD_PREFLIGHT_STORAGE: u32 = 245;
 
         let (mav_tx, mav_rx) = bounded::<MavMessage>(64);
-        let (pv_tx, _) = broadcast::channel::<(String, f32)>(64);
+        let (pv_tx, _) = broadcast::channel::<ParamValue>(64);
         let (_px4, captured) = spawn_fake_px4_with_capture(mav_rx, pv_tx.clone());
 
         let handler = make_handler(Some(mav_tx), Some(pv_tx));
@@ -1480,7 +1491,7 @@ mod tests {
     #[tokio::test]
     async fn hover_cmd_change_re_pushes_even_when_pids_unchanged() {
         let (mav_tx, mav_rx) = bounded::<MavMessage>(64);
-        let (pv_tx, _) = broadcast::channel::<(String, f32)>(64);
+        let (pv_tx, _) = broadcast::channel::<ParamValue>(64);
         let _px4 = spawn_fake_px4(mav_rx, pv_tx.clone(), 0);
 
         let handler = make_handler(Some(mav_tx), Some(pv_tx));

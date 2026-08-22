@@ -6,6 +6,7 @@
 use crate::build_config::BuildConfigHandler;
 use crate::preflight::PreflightHandler;
 use crate::protocol::{
+    SnapshotStored,
     Command, CommandAck, CommandType, ConfigResult, ConfigState, HandshakeAck, IncomingMessage,
     NshCommand, NshResponse, OutgoingMessage, PreflightApplyResult, PreflightApplyState,
     PreflightStatus, StateUpdate,
@@ -69,6 +70,10 @@ pub struct ConnectionHandler {
     build_config: Option<Arc<BuildConfigHandler>>,
     /// Handler for the preflight HITL/quadrotor gate
     preflight: Option<Arc<PreflightHandler>>,
+    /// Where a browser's snapshot-persistence acknowledgement is delivered.
+    /// Provisioning blocks on this, so an unrouted ack must not be silently
+    /// swallowed — absence here means no provisioning is waiting for one.
+    snapshot_ack_tx: Option<broadcast::Sender<SnapshotStored>>,
     /// Callback to recharge battery in simulation
     recharge_fn: Option<RechargeCallback>,
     /// Broadcast channel to receive state updates
@@ -102,6 +107,7 @@ impl ConnectionHandler {
             nsh_tx: None,
             build_config: None,
             preflight: None,
+            snapshot_ack_tx: None,
             recharge_fn: None,
             state_rx,
             rate_limits: Arc::new(RwLock::new(HashMap::new())),
@@ -128,6 +134,11 @@ impl ConnectionHandler {
     /// Set the preflight handler
     pub fn set_preflight_handler(&mut self, handler: Arc<PreflightHandler>) {
         self.preflight = Some(handler);
+    }
+
+    /// Set the channel that carries snapshot-persistence acknowledgements.
+    pub fn set_snapshot_ack_sender(&mut self, tx: broadcast::Sender<SnapshotStored>) {
+        self.snapshot_ack_tx = Some(tx);
     }
 
     /// Set the battery recharge callback
@@ -229,6 +240,27 @@ impl ConnectionHandler {
                     },
                 };
                 Ok(Some(OutgoingMessage::PreflightStatus(status)))
+            }
+            IncomingMessage::SnapshotStored(ack) => {
+                debug!(
+                    client_id,
+                    board_identity = %ack.board_identity,
+                    stored = ack.stored,
+                    "Received snapshot persistence acknowledgement"
+                );
+                match &self.snapshot_ack_tx {
+                    Some(tx) => {
+                        // A send error means nothing is waiting: the provisioning
+                        // that requested the snapshot already gave up or was
+                        // never started. Not an error for the client.
+                        let _ = tx.send(ack);
+                    }
+                    None => warn!(
+                        client_id,
+                        "Snapshot acknowledgement arrived with no provisioning waiting for it"
+                    ),
+                }
+                Ok(None)
             }
             IncomingMessage::ApplyPreflightParams => {
                 debug!(client_id, "Received apply preflight params request");
@@ -529,6 +561,7 @@ impl Clone for ConnectionHandler {
             nsh_tx: self.nsh_tx.clone(),
             build_config: self.build_config.clone(),
             preflight: self.preflight.clone(),
+            snapshot_ack_tx: self.snapshot_ack_tx.clone(),
             state_rx: self.state_rx.resubscribe(),
             rate_limits: Arc::clone(&self.rate_limits),
             next_client_id: Arc::clone(&self.next_client_id),

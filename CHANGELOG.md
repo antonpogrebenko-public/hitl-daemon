@@ -5,6 +5,15 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] - 2026-08-22
+
+### Added
+- **Typed parameter values** — `PARAM_VALUE` is decoded into a `ParamValue` carrying PX4's declared `param_type` alongside name, value and table index, replacing the bare `(String, f32)` broadcast. PX4 silently drops a `PARAM_SET` whose type does not match the parameter's declared type, so a snapshot recording only name and value cannot be replayed onto the board. A zero-valued INT32 and a zero-valued REAL32 are indistinguishable by value alone.
+- **Parameter reads** — `PARAM_REQUEST_READ` addressed by name with `param_index = -1`, since table indices shift between firmware builds. Retries on silence, subscribes before sending so a fast reply cannot land in the gap, and drains unrelated traffic (a QGC parameter pull) rather than treating it as a mismatch. `read_params` returns partial success plus the list of names that produced nothing.
+- **Board identity** — derived from `AUTOPILOT_VERSION`'s hardware UID, with a composite fallback over vendor/product/board version/system id. Requested once the first HEARTBEAT proves the link, because requesting earlier races PX4's startup and the reply is lost. Firmware version is deliberately excluded from the composite so identity survives a reflash. `uid2` is not used: `mavlink` 0.13.1 does not generate that field.
+- **Snapshot hand-off protocol** — `SnapshotCaptured` (0x0C) carries parameters read off the board to the browser; `SnapshotStored` (0x16) is the browser's confirmation that they are durably persisted. Provisioning will block on the acknowledgement, so a board is never modified before a restore point exists.
+- **Session snapshot store** — the daemon holds one snapshot in memory for the session and refuses to hand it back for a different board. Deliberately never written to disk: the browser is the system of record, and a second persisted copy could disagree with it.
+
 ## [0.11.1] - 2026-07-29
 
 ### Fixed

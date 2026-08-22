@@ -149,6 +149,32 @@ fn init_tracing(log_file: Option<&str>, tui_mode: bool) -> (Option<WorkerGuard>,
     }
 }
 
+/// MAVLink system id PX4 uses for the autopilot.
+const PX4_SYSTEM_ID: u8 = 1;
+const PX4_COMPONENT_ID: u8 = 1;
+
+/// `MAV_CMD_REQUEST_MESSAGE` asking for `AUTOPILOT_VERSION` (message id 148).
+///
+/// PX4 does not broadcast this message; it answers on request. The reply
+/// carries the board's hardware UID, which is what keys a parameter snapshot to
+/// the board it was taken from.
+fn make_autopilot_version_request() -> MavMessage {
+    const AUTOPILOT_VERSION_MSG_ID: f32 = 148.0;
+    MavMessage::COMMAND_LONG(mavlink::ardupilotmega::COMMAND_LONG_DATA {
+        target_system: PX4_SYSTEM_ID,
+        target_component: PX4_COMPONENT_ID,
+        confirmation: 0,
+        command: mavlink::ardupilotmega::MavCmd::MAV_CMD_REQUEST_MESSAGE,
+        param1: AUTOPILOT_VERSION_MSG_ID,
+        param2: 0.0,
+        param3: 0.0,
+        param4: 0.0,
+        param5: 0.0,
+        param6: 0.0,
+        param7: 0.0,
+    })
+}
+
 fn detect_or_use_port(specified_port: Option<String>) -> Option<String> {
     if let Some(port) = specified_port {
         info!(port = %port, "Using specified serial port");
@@ -572,7 +598,7 @@ async fn main() {
     // was actually applied before signalling the simulation "ready" stage.
     // Capacity is generous because PX4 may emit unrelated PARAM_VALUE traffic
     // during the wait window (e.g. QGC parameter pull).
-    let (param_value_tx, _) = tokio::sync::broadcast::channel::<(String, f32)>(256);
+    let (param_value_tx, _) = tokio::sync::broadcast::channel::<websocket::param_io::ParamValue>(256);
 
     // Create WebSocket server
     let ws_config = WebSocketServerConfig {
@@ -676,6 +702,12 @@ async fn main() {
     });
 
     // Shared FC model (set once when HEARTBEAT identifies the FC)
+    // Stable per-board key for the parameter snapshot. Derived from
+    // AUTOPILOT_VERSION rather than the serial port (which changes on replug)
+    // or fc_model (which every PX4 quad shares).
+    let board_identity: Arc<tokio::sync::RwLock<Option<websocket::BoardIdentity>>> =
+        Arc::new(tokio::sync::RwLock::new(None));
+
     let fc_model: Arc<tokio::sync::RwLock<Option<String>>> =
         Arc::new(tokio::sync::RwLock::new(None));
 
@@ -996,6 +1028,7 @@ async fn main() {
         let sim_mav_rx_reconnect = sim_mav_rx.clone();
         let qgc_socket_reconnect = qgc_socket.clone();
         let fc_model_reconnect = fc_model.clone();
+        let board_identity_reconnect = board_identity.clone();
         let sim_state_reconnect = sim_state.clone();
         let param_value_tx_reconnect = param_value_tx.clone();
         let preferred_port = args.port.clone();
@@ -1192,6 +1225,7 @@ async fn main() {
                         let terrain_origin_tx_recv = terrain_origin_tx.clone();
                         let reference_alt_recv = terrain_reference_alt;
                         let fc_model_recv = fc_model_reconnect.clone();
+                        let board_identity_recv = board_identity_reconnect.clone();
                         let conn_status_tx_recv = conn_status_tx_reconnect.clone();
                         let param_value_tx_recv = param_value_tx_reconnect.clone();
                         let port_path_recv = port_path.clone();
@@ -1251,13 +1285,14 @@ async fn main() {
                                     // BuildConfigHandler so it can verify each PID parameter
                                     // was applied before transitioning the config to Ready.
                                     if let MavMessage::PARAM_VALUE(pv) = &msg {
-                                        let name = std::str::from_utf8(&pv.param_id)
-                                            .unwrap_or("")
-                                            .trim_end_matches('\0')
-                                            .to_string();
-                                        if !name.is_empty() {
-                                            let _ =
-                                                param_value_tx_recv.send((name, pv.param_value));
+                                        // Decoded into a typed value here rather than
+                                        // downstream: PX4's declared param_type is only
+                                        // present on this message, and snapshot/restore
+                                        // cannot replay a value without it.
+                                        if let Some(parsed) =
+                                            websocket::param_io::ParamValue::from_mavlink(pv)
+                                        {
+                                            let _ = param_value_tx_recv.send(parsed);
                                         }
                                     }
 
@@ -1290,8 +1325,39 @@ async fn main() {
                                         sim_state_recv.set_landed_state(ess.landed_state as u8);
                                     }
 
+                                    // Board identity for the parameter snapshot. PX4
+                                    // sends this only on request, so it arrives once
+                                    // per connection after the request below.
+                                    if let MavMessage::AUTOPILOT_VERSION(av) = &msg {
+                                        let derived = websocket::board_identity::derive(
+                                            av,
+                                            PX4_SYSTEM_ID,
+                                        );
+                                        match &derived {
+                                            Some(id) => info!(
+                                                board_identity = %id,
+                                                "Flight controller identity established"
+                                            ),
+                                            None => warn!(
+                                                "Flight controller reports no distinguishing \
+                                                 identity — parameter snapshots are unavailable \
+                                                 for this board"
+                                            ),
+                                        }
+                                        *board_identity_recv.write().await = derived;
+                                    }
+
                                     if let MavMessage::HEARTBEAT(hb) = &msg {
+                                        let first_heartbeat = !heartbeat_received;
                                         heartbeat_received = true;
+
+                                        // Ask for AUTOPILOT_VERSION once the link is
+                                        // proven. Requesting before the first heartbeat
+                                        // races PX4's own startup and the reply is lost.
+                                        if first_heartbeat {
+                                            let _ = mav_io_recv
+                                                .send(make_autopilot_version_request());
+                                        }
 
                                         // Update flight mode from custom_mode
                                         // PX4 custom_mode is a 32-bit field where main mode is in bits 16-23
