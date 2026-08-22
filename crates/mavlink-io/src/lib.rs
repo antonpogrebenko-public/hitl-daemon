@@ -15,4 +15,6 @@ pub use async_io::{
 pub use codec::MavCodec;
 pub use heartbeat::{ConnectionState, HeartbeatManager};
 pub use messages::{make_hil_gps, make_hil_sensor};
-pub use serial::{find_pixhawk_ports, open_serial, SerialConfig};
+pub use serial::{
+    detect_flight_controller, find_pixhawk_ports, open_serial, DetectionOutcome, SerialConfig,
+};

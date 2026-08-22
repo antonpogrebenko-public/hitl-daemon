@@ -9,7 +9,7 @@ use hitl_physics::{throttle_to_omega_with_config, PhysicsConfig};
 use hitl_sensors::{ImuConfig, SensorsConfig};
 use mavlink::ardupilotmega::MavMessage;
 use mavlink_io::async_io::{reconnect_delay, MavlinkIo, NshRequest};
-use mavlink_io::serial::find_pixhawk_ports;
+use mavlink_io::serial::detect_flight_controller;
 use protocol::{ActuatorOutputs, DaemonState, DaemonStatus};
 use simulation::{SimulationConfig, SimulationLoop, SimulationState, TerrainCache};
 use std::net::UdpSocket;
@@ -22,7 +22,7 @@ use tracing::{debug, error, info, trace, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use websocket::{
-    CommandType, ConnectionStatus, StateUpdate, ValidatedNshCommand, VehicleMessage,
+    CommandType, ConnectionStatus, LinkState, StateUpdate, ValidatedNshCommand, VehicleMessage,
     WebSocketServer, WebSocketServerConfig,
 };
 
@@ -182,23 +182,43 @@ fn detect_or_use_port(specified_port: Option<String>) -> Option<String> {
     }
 
     info!("No port specified, auto-detecting FC...");
-    let ports = find_pixhawk_ports();
+    // Vendor-ID allowlist first, then a read-only heartbeat probe over the
+    // remaining USB serial ports. Boards outside the four known vendors are
+    // otherwise invisible and force the user to pass --port by hand.
+    let outcome = detect_flight_controller();
 
-    if ports.is_empty() {
-        warn!("No PX4 boards detected");
+    if outcome.found.is_empty() {
+        if outcome.examined.is_empty() {
+            warn!("No serial ports to examine — is the board plugged in?");
+        } else {
+            // "No FC detected" is not actionable; the list of what was looked
+            // at is.
+            warn!(
+                examined = outcome.examined.len(),
+                "No flight controller detected. Examined: {}",
+                outcome.examined.join(", ")
+            );
+        }
         return None;
     }
 
-    if ports.len() > 1 {
-        info!("Multiple PX4 boards found:");
-        for port in &ports {
+    if outcome.found.len() > 1 {
+        info!("Multiple boards found:");
+        for port in &outcome.found {
             info!("  - {}", port);
         }
         info!("Using first detected port");
     }
 
-    let port = ports.into_iter().next().unwrap();
-    info!(port = %port, "Auto-detected FC");
+    let port = outcome.found.into_iter().next().unwrap();
+    if outcome.adopted_by_probe {
+        info!(
+            port = %port,
+            "Auto-detected FC by heartbeat probe (vendor ID not recognised)"
+        );
+    } else {
+        info!(port = %port, "Auto-detected FC");
+    }
     Some(port)
 }
 
@@ -1044,6 +1064,10 @@ async fn main() {
             info!("Connection manager started");
 
             let mut retry_count: u8 = 0;
+            // Distinguishes a first scan from a reconnect. Without it a
+            // first-time user is told their board is "reconnecting" to
+            // something it was never connected to.
+            let mut has_connected = false;
             let mut current_mav_io: Option<Arc<MavlinkIo>> = None;
             let mut receiver_handle: Option<tokio::task::JoinHandle<()>> = None;
             let mut sender_handle: Option<tokio::task::JoinHandle<()>> = None;
@@ -1056,6 +1080,7 @@ async fn main() {
                 serial_port: String::new(),
                 fc_model: None,
                 bootloader_suspected: false,
+                link_state: LinkState::Searching,
             });
 
             loop {
@@ -1104,6 +1129,11 @@ async fn main() {
                         serial_port: String::new(),
                         fc_model: None,
                         bootloader_suspected: is_bootloader,
+                        link_state: if is_bootloader {
+                            LinkState::SuspectedBootloader
+                        } else {
+                            LinkState::Reconnecting
+                        },
                     });
 
                     // Cooldown before reconnect — gives OS time to release port.
@@ -1124,11 +1154,20 @@ async fn main() {
                     }
                 }
 
-                // Try to find a Pixhawk
+                // Try to find a flight controller. Probing runs here too, so a
+                // board that comes back on a different port — or was never
+                // recognised by vendor ID — is still picked up on reconnect.
                 let port_path = if let Some(ref p) = preferred_port {
                     Some(p.clone())
                 } else {
-                    find_pixhawk_ports().into_iter().next()
+                    let outcome = detect_flight_controller();
+                    if outcome.found.is_empty() && !outcome.examined.is_empty() {
+                        debug!(
+                            examined = %outcome.examined.join(", "),
+                            "No flight controller among the examined ports"
+                        );
+                    }
+                    outcome.found.into_iter().next()
                 };
 
                 let Some(port_path) = port_path else {
@@ -1147,6 +1186,11 @@ async fn main() {
                         serial_port: String::new(),
                         fc_model: None,
                         bootloader_suspected: false,
+                        link_state: if has_connected {
+                            LinkState::Reconnecting
+                        } else {
+                            LinkState::Searching
+                        },
                     });
 
                     tokio::time::sleep(delay).await;
@@ -1176,6 +1220,7 @@ async fn main() {
                     Ok(()) => {
                         info!(port = %port_path, "Connected to FC!");
                         let was_reconnect = retry_count > 0;
+                        has_connected = true;
                         retry_count = 0;
                         // Successful connection — clear any stale bootloader flag.
                         bootloader_suspected.store(false, Ordering::SeqCst);
@@ -1192,7 +1237,8 @@ async fn main() {
                             serial_port: port_path.clone(),
                             fc_model: None,
                             bootloader_suspected: false,
-                        });
+                        link_state: LinkState::Connected,
+                    });
 
                         // After a reconnect (not the initial connection), re-push
                         // PIDs to PX4 — a power cycle resets PX4's RAM parameters.
@@ -1260,7 +1306,8 @@ async fn main() {
                                         serial_port: String::new(),
                                         fc_model: None,
                                         bootloader_suspected: true,
-                                    });
+                        link_state: LinkState::SuspectedBootloader,
+                    });
                                     mav_io_recv.signal_disconnect();
                                     break;
                                 }
@@ -1411,7 +1458,8 @@ async fn main() {
                                                         serial_port: port_path_recv.clone(),
                                                         fc_model: Some(name.to_string()),
                                                         bootloader_suspected: false,
-                                                    });
+                        link_state: LinkState::Connected,
+                    });
                                             }
                                         }
                                     }
@@ -1614,7 +1662,8 @@ async fn main() {
             serial_port: "simulation".to_string(),
             fc_model: None,
             bootloader_suspected: false,
-        });
+                        link_state: LinkState::Searching,
+                    });
         None
     };
 

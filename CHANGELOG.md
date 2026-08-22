@@ -5,6 +5,14 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] - 2026-08-22
+
+### Added
+- **Heartbeat probing for unrecognised boards** — when no attached device matches one of the four known PX4 vendor IDs, candidate USB serial ports are opened read-only and listened to for a MAVLink HEARTBEAT. Boards outside those vendors no longer require `--port` by hand. The allowlist runs first, so recognised hardware never pays for probing, and probing also runs on reconnect so a board that comes back on a different port is still found.
+- **A probe cannot transmit.** `scan_for_heartbeat` is handed a `Read` and nothing else, so the guarantee is structural rather than a convention. The device on the other end may be a 3D printer or a debug probe, and unsolicited MAVLink bytes could put it into a state its owner did not ask for. Ports whose names identify them as Bluetooth bridges, debug consoles or audio devices are excluded before any port is opened, and a port that stays quiet is released at the end of a bounded 1.5s window.
+- **Examined ports are reported** when nothing is found. "No flight controller detected" is not actionable; the list of ports that were looked at is.
+- **Explicit link state** (`searching` / `connected` / `reconnecting` / `suspected_bootloader`) alongside the existing booleans. `connected: false, reconnecting: true` could not distinguish a first scan from a reconnect, so a first-time user was told their board was "reconnecting" to something it had never been connected to. A present-but-silent board is likewise distinguishable from an absent one, because the remedy ("wait, do not unplug") is the opposite.
+
 ## [0.13.0] - 2026-08-22
 
 ### Added

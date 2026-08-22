@@ -283,6 +283,28 @@ pub struct ConnectionStatus {
     pub fc_model: Option<String>,
     /// True when the heartbeat watchdog timed out — FC is likely in bootloader mode
     pub bootloader_suspected: bool,
+    /// Explicit link state.
+    ///
+    /// The booleans above cannot distinguish a first scan from a reconnect:
+    /// both report `connected: false, reconnecting: true`, so the interface
+    /// tells a first-time user their board is "reconnecting" to something it
+    /// was never connected to.
+    pub link_state: LinkState,
+}
+
+/// What the daemon is doing about its flight-controller link.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkState {
+    /// Looking for a board that has not been seen yet this session.
+    Searching,
+    /// A board is attached and heartbeating.
+    Connected,
+    /// A previously-connected board went away and is being waited for.
+    Reconnecting,
+    /// The device is present but silent — PX4 sits in its bootloader for
+    /// 3-5s on power-up, and far longer while firmware is being flashed.
+    SuspectedBootloader,
 }
 
 impl ConnectionStatus {
@@ -1264,6 +1286,7 @@ mod tests {
             serial_port: "/dev/tty.usb".to_string(),
             fc_model: Some("Pixhawk 6C".to_string()),
             bootloader_suspected: false,
+            link_state: LinkState::Connected,
         };
         let bytes = status.to_bytes();
         assert_eq!(bytes[0], MSG_TYPE_CONNECTION_STATUS);
@@ -1294,6 +1317,7 @@ mod tests {
             serial_port: String::new(),
             fc_model: None,
             bootloader_suspected: false,
+            link_state: LinkState::Reconnecting,
         };
         let bytes = status.to_bytes();
         assert_eq!(bytes[1], 0); // not connected
@@ -1316,6 +1340,7 @@ mod tests {
             serial_port: String::new(),
             fc_model: None,
             bootloader_suspected: true,
+            link_state: LinkState::SuspectedBootloader,
         };
         let bytes = status.to_bytes();
         assert_eq!(bytes[1], 0); // not connected
@@ -1579,5 +1604,56 @@ mod snapshot_protocol_tests {
             IncomingMessage::SnapshotStored(ack) => assert!(ack.stored),
             other => panic!("expected SnapshotStored, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod link_state_tests {
+    use super::*;
+
+    fn status(link_state: LinkState) -> ConnectionStatus {
+        ConnectionStatus {
+            connected: matches!(link_state, LinkState::Connected),
+            reconnecting: matches!(link_state, LinkState::Reconnecting),
+            retry_count: 0,
+            serial_port: String::new(),
+            fc_model: None,
+            bootloader_suspected: matches!(link_state, LinkState::SuspectedBootloader),
+            link_state,
+        }
+    }
+
+    #[test]
+    fn a_first_scan_is_distinguishable_from_a_reconnect() {
+        // Both report connected: false, reconnecting: true on the wire. Without
+        // link_state a first-time user is told their board is "reconnecting" to
+        // something it was never connected to.
+        assert_ne!(
+            status(LinkState::Searching).link_state,
+            status(LinkState::Reconnecting).link_state
+        );
+    }
+
+    #[test]
+    fn a_silent_board_is_distinguishable_from_an_absent_one() {
+        // Present but quiet means firmware flashing or a bootloader dwell, and
+        // the remedy ("wait, do not unplug") is the opposite of the remedy for
+        // an absent board ("plug it in").
+        assert_ne!(
+            status(LinkState::SuspectedBootloader).link_state,
+            status(LinkState::Searching).link_state
+        );
+    }
+
+    #[test]
+    fn every_state_serialises_to_the_literal_the_frontend_matches_on() {
+        let render = |s: LinkState| serde_json::to_string(&s).unwrap();
+        assert_eq!(render(LinkState::Searching), "\"searching\"");
+        assert_eq!(render(LinkState::Connected), "\"connected\"");
+        assert_eq!(render(LinkState::Reconnecting), "\"reconnecting\"");
+        assert_eq!(
+            render(LinkState::SuspectedBootloader),
+            "\"suspected_bootloader\""
+        );
     }
 }

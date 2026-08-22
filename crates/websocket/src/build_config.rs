@@ -141,6 +141,20 @@ impl BuildConfigHandler {
     /// Subscribe to system-initiated `ConfigResult` messages.  The WebSocket
     /// server calls this once during setup so reconnect-triggered results are
     /// forwarded to all connected browsers.
+    /// Seed the verified-params cache. Test-only: production fills this from a
+    /// real successful push in `push_pids_and_verify`.
+    #[cfg(test)]
+    pub(crate) fn seed_verified_params(&self, pids: Px4Pids, hover_cmd: f32, thr_min: f32) {
+        *self
+            .last_verified_params
+            .lock()
+            .expect("PID params cache poisoned") = Some(LastVerifiedParams {
+            pids,
+            hover_cmd,
+            thr_min,
+        });
+    }
+
     pub fn subscribe_system_config(&self) -> broadcast::Receiver<OutgoingMessage> {
         self.system_config_tx.subscribe()
     }
@@ -1510,5 +1524,65 @@ mod tests {
             .unwrap();
         assert!(view.is_some());
         assert_eq!(verified_second, 21);
+    }
+}
+
+#[cfg(test)]
+mod reconnect_repush_tests {
+    use super::*;
+    use crossbeam_channel::bounded as cb_bounded;
+    use hitl_physics::px4_pids::REF_PIDS;
+
+    fn handler_with_dead_link() -> BuildConfigHandler {
+        // mav_rx is dropped, so nothing acks: the re-push cannot verify.
+        let (mav_tx, _mav_rx) = cb_bounded::<MavMessage>(64);
+        let (pv_tx, _) = broadcast::channel::<ParamValue>(64);
+        let (config_tx, _config_rx) =
+            cb_bounded::<(PhysicsConfig, BatteryConfig, hitl_sensors::SensorsConfig)>(4);
+        BuildConfigHandler::new(
+            config_tx,
+            None,
+            Some(mav_tx),
+            Some(pv_tx),
+            None,
+            (40.0, -105.0, 1655.0),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_failed_repush_after_reconnect_is_reported_to_clients() {
+        // A power cycle resets PX4's PIDs to firmware defaults. If the re-push
+        // silently fails, the browser goes on believing the build is applied
+        // and the user flies a differently-tuned aircraft than the one on
+        // screen. The failure has to be visible, not just logged.
+        let handler = handler_with_dead_link();
+        handler.seed_verified_params(REF_PIDS, 0.28, 0.06);
+
+        let mut client = handler.subscribe_system_config();
+        let result = handler.repush_if_configured().await;
+        assert!(result.is_err(), "a dead link cannot verify a re-push");
+
+        let mut saw_error = false;
+        while let Ok(msg) = client.try_recv() {
+            if let OutgoingMessage::ConfigResult(config) = msg {
+                if matches!(config.state, ConfigState::Error) {
+                    assert!(!config.success);
+                    assert!(config.error.unwrap().contains("re-push"));
+                    saw_error = true;
+                }
+            }
+        }
+        assert!(saw_error, "clients must be told the re-push did not verify");
+    }
+
+    #[tokio::test]
+    async fn nothing_is_reported_when_there_was_no_prior_configuration() {
+        // A reconnect before any build was ever applied has nothing to re-push,
+        // and reporting a failure there would be noise.
+        let handler = handler_with_dead_link();
+        let mut client = handler.subscribe_system_config();
+
+        assert!(handler.repush_if_configured().await.is_ok());
+        assert!(client.try_recv().is_err(), "no config result should be emitted");
     }
 }
