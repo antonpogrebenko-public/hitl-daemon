@@ -422,11 +422,45 @@ impl WebSocketServer {
         let addr = SocketAddr::from(([0, 0, 0, 0], self.config.port));
         info!(port = self.config.port, "Starting WebSocket server");
 
-        let listener = tokio::net::TcpListener::bind(addr).await?;
+        let listener = match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => listener,
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                // Naming the port and the likely cause matters more than the
+                // raw errno: the overwhelmingly common case is a second daemon
+                // already running, and "address in use" does not say that.
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    format!(
+                        "port {} is already in use — another hitl-daemon is probably \
+                         running. Stop it, or start this one with --websocket-port <PORT>.",
+                        self.config.port
+                    ),
+                )
+                .into());
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        // The one line a first-time user needs. Printed only once the socket is
+        // actually bound, so it is never a promise the daemon cannot keep.
+        info!(
+            "Ready. Open {} in your browser to start the simulator.",
+            simulator_url()
+        );
+
         axum::serve(listener, app).await?;
 
         Ok(())
     }
+}
+
+/// Where the user should point their browser.
+///
+/// Overridable so a developer running the web app locally, or pointing at
+/// staging, is not told to open production.
+fn simulator_url() -> String {
+    std::env::var("HITL_SIMULATOR_URL")
+        .unwrap_or_else(|_| "https://th3seus.net/simulator".to_string())
 }
 
 /// Health check endpoint
@@ -470,6 +504,26 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
     // Subscribe to terrain origin if available
     let mut terrain_origin_rx = state.terrain_origin_tx.as_ref().map(|tx| tx.subscribe());
+
+    // Capabilities go out first, before any state update, so a client never
+    // has to interpret a frame before it knows what this daemon speaks.
+    {
+        let capabilities = OutgoingMessage::Capabilities(crate::protocol::Capabilities::current(
+            format!(
+                "{}.{}.{}",
+                handler.version_major(),
+                handler.version_minor(),
+                handler.version_patch()
+            ),
+        ));
+        if ws_sender
+            .send(Message::Binary(capabilities.to_bytes().into()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
 
     // Send cached terrain origin to late-joining client
     if let Some(origin) = *state.terrain_origin_latest.read().await {

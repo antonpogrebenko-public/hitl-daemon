@@ -76,6 +76,8 @@ pub const MSG_TYPE_SNAPSHOT_STORED: u8 = 0x16;
 pub const MSG_TYPE_RESTORE_SNAPSHOT: u8 = 0x17;
 /// Daemon -> browser: progress and outcome of a restore.
 pub const MSG_TYPE_RESTORE_RESULT: u8 = 0x0D;
+/// Daemon -> browser: what this daemon can do, sent unprompted on connect.
+pub const MSG_TYPE_CAPABILITIES: u8 = 0x0E;
 
 // State update size (current wire format)
 pub const STATE_UPDATE_SIZE: usize = 87;
@@ -690,6 +692,61 @@ impl SnapshotStored {
     }
 }
 
+/// Feature names this daemon supports.
+///
+/// A version number alone forces every client to carry a table of which
+/// version gained what. Named features let a mixed fleet degrade per-feature
+/// instead of per-version.
+pub const DAEMON_FEATURES: &[&str] = &[
+    "param_snapshot",
+    "param_restore",
+    "board_identity",
+    "heartbeat_probe",
+    "provisioning_broadcast",
+    "link_state",
+];
+
+/// Current wire-protocol revision.
+///
+/// Bumped when an existing message's layout or meaning changes, not when a new
+/// message type is added — clients ignore message types they do not know.
+pub const PROTOCOL_REVISION: u16 = 2;
+
+/// What this daemon is and what it can do, sent unprompted on connect.
+///
+/// The binary handshake that predates this packs a version into fixed byte
+/// positions and already carries a legacy-layout heuristic to disambiguate two
+/// past encodings — evidence that byte-packed version fields do not survive
+/// protocol evolution. This frame is JSON and additive.
+///
+/// ## Binary format (0x0E)
+/// - `[0]`: 0x0E message type
+/// - `[1-N]`: JSON body
+#[derive(Debug, Clone, Serialize)]
+pub struct Capabilities {
+    pub daemon_version: String,
+    pub protocol_revision: u16,
+    pub features: Vec<String>,
+}
+
+impl Capabilities {
+    pub fn current(daemon_version: impl Into<String>) -> Self {
+        Self {
+            daemon_version: daemon_version.into(),
+            protocol_revision: PROTOCOL_REVISION,
+            features: DAEMON_FEATURES.iter().map(|f| (*f).to_string()).collect(),
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let json = serde_json::to_vec(self).expect("Capabilities serialization cannot fail");
+        let mut buf = Vec::with_capacity(1 + json.len());
+        buf.push(MSG_TYPE_CAPABILITIES);
+        buf.extend_from_slice(&json);
+        buf
+    }
+}
+
 /// Browser's request to write a stored snapshot back to the flight
 /// controller.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -1128,6 +1185,7 @@ pub enum OutgoingMessage {
     TerrainOrigin(TerrainOrigin),
     SnapshotCaptured(SnapshotCaptured),
     RestoreResult(RestoreResult),
+    Capabilities(Capabilities),
     PreflightStatus(PreflightStatus),
     PreflightApplyResult(PreflightApplyResult),
 }
@@ -1145,6 +1203,7 @@ impl OutgoingMessage {
             OutgoingMessage::TerrainOrigin(t) => t.to_bytes(),
             OutgoingMessage::SnapshotCaptured(s) => s.to_bytes(),
             OutgoingMessage::RestoreResult(r) => r.to_bytes(),
+            OutgoingMessage::Capabilities(c) => c.to_bytes(),
             OutgoingMessage::PreflightStatus(p) => p.to_bytes(),
             OutgoingMessage::PreflightApplyResult(p) => p.to_bytes(),
         }
@@ -1655,5 +1714,55 @@ mod link_state_tests {
             render(LinkState::SuspectedBootloader),
             "\"suspected_bootloader\""
         );
+    }
+}
+
+#[cfg(test)]
+mod capabilities_tests {
+    use super::*;
+
+    #[test]
+    fn capabilities_encode_with_their_message_type() {
+        let caps = Capabilities::current("0.14.0");
+        let bytes = caps.to_bytes();
+        assert_eq!(bytes[0], MSG_TYPE_CAPABILITIES);
+
+        let body: serde_json::Value = serde_json::from_slice(&bytes[1..]).unwrap();
+        assert_eq!(body["daemon_version"], "0.14.0");
+        assert_eq!(body["protocol_revision"], PROTOCOL_REVISION);
+    }
+
+    #[test]
+    fn every_feature_this_change_added_is_advertised() {
+        // A client gates on these names, so a feature that ships without its
+        // name here is invisible and will never be used.
+        let caps = Capabilities::current("0.14.0");
+        for expected in [
+            "param_snapshot",
+            "param_restore",
+            "board_identity",
+            "heartbeat_probe",
+            "provisioning_broadcast",
+            "link_state",
+        ] {
+            assert!(
+                caps.features.iter().any(|f| f == expected),
+                "{expected} is implemented but not advertised"
+            );
+        }
+    }
+
+    #[test]
+    fn feature_names_are_stable_identifiers() {
+        // Clients match these literally; renaming one silently disables the
+        // feature for every client that has shipped.
+        for feature in DAEMON_FEATURES {
+            assert!(
+                feature
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{feature} is not a stable snake_case identifier"
+            );
+        }
     }
 }

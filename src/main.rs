@@ -27,6 +27,7 @@ use websocket::{
 };
 
 mod tui;
+mod update;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -82,6 +83,13 @@ struct Args {
     /// UDP port for QGroundControl bridge (0 to disable)
     #[arg(long, default_value = "14550")]
     qgc_udp: u16,
+
+    /// Update this daemon to the latest release, then exit.
+    ///
+    /// Running this is the confirmation: nothing replaces the binary on its
+    /// own. The previous version is kept alongside as `.previous`.
+    #[arg(long)]
+    update: bool,
 }
 
 enum TracingMode {
@@ -374,6 +382,22 @@ fn create_state_update(sim_state: &SimulationState, packets_per_sec: u16) -> Sta
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+
+    if args.update {
+        let api_url = std::env::var("HITL_API_URL")
+            .unwrap_or_else(|_| "https://api.th3seus.net".to_string());
+        match update::run_update(&api_url, VERSION).await {
+            Ok(()) => {
+                println!("Daemon is up to date or was updated successfully.");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("Update failed: {e}");
+                // Non-zero so a script wrapping this can tell.
+                std::process::exit(1);
+            }
+        }
+    }
     let is_tty = atty::is(atty::Stream::Stdout);
     let (_log_guard, tracing_mode) = init_tracing(args.log_file.as_deref(), is_tty);
 
@@ -704,9 +728,40 @@ async fn main() {
             )
             .await
         {
+            // A daemon that cannot serve is useless, and a browser waiting on
+            // it would spin forever. Fail loudly and exit non-zero rather than
+            // appearing to run.
             error!("WebSocket server error: {}", e);
+            std::process::exit(1);
         }
     });
+
+    // Check for a newer daemon, detached and time-boxed. Deliberately spawned
+    // rather than awaited: a release channel that is down, slow, or blocked by
+    // a corporate proxy must never stop someone flying. The result is a
+    // notification, not a precondition.
+    {
+        let api_url = std::env::var("HITL_API_URL")
+            .unwrap_or_else(|_| "https://api.th3seus.net".to_string());
+        tokio::spawn(async move {
+            match update::check_for_update(&api_url, VERSION).await {
+                Ok(Some(available)) => {
+                    info!(
+                        current = VERSION,
+                        available = %available.version,
+                        "A newer daemon is available"
+                    );
+                }
+                Ok(None) => debug!(version = VERSION, "Daemon is up to date"),
+                Err(e) => {
+                    // Not a startup failure. Logged at debug so an offline
+                    // user is not greeted by a warning about something that
+                    // does not affect them.
+                    debug!(error = %e, "Skipped the update check");
+                }
+            }
+        });
+    }
 
     // Merge browser shutdown with main shutdown
     let shutdown_merge = shutdown.clone();

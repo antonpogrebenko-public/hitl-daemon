@@ -159,6 +159,18 @@ impl ConnectionHandler {
         *self.pixhawk_connected.write().await = connected;
     }
 
+    pub fn version_major(&self) -> u8 {
+        self.version_major
+    }
+
+    pub fn version_minor(&self) -> u8 {
+        self.version_minor
+    }
+
+    pub fn version_patch(&self) -> u8 {
+        self.version_patch
+    }
+
     /// Get a new state update receiver
     pub fn subscribe_state(&self) -> broadcast::Receiver<StateUpdate> {
         self.state_rx.resubscribe()

@@ -5,6 +5,18 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] - 2026-08-22
+
+### Added
+- **Capability frame on connect** — a JSON frame (0x0E) carrying daemon version, protocol revision and named feature flags is sent unprompted before any state update, so a client never has to interpret a frame before it knows what this daemon speaks. The binary handshake that predates it packs a version into fixed byte positions and already carries a legacy-layout heuristic to disambiguate two past encodings; named features let a mixed fleet degrade per-feature instead of per-version.
+- **A ready line naming the URL to open**, printed only once the WebSocket socket is actually bound, so it is never a promise the daemon cannot keep. Overridable via `HITL_SIMULATOR_URL` for local and staging work.
+- **Self-update via `--update`** — queries the release channel, downloads, checks the published SHA-256, swaps the binary atomically and keeps the previous one as `.previous`. Running the flag is the confirmation; nothing replaces the binary on its own. Signature verification is not possible: artifacts carry only an ad-hoc signature that authenticates no publisher, so integrity rests on the hash fetched over HTTPS.
+- **A startup update check that cannot block startup** — detached and time-boxed, logged at debug on failure. A release channel that is down, slow, or behind a corporate proxy must never stop someone flying.
+
+### Fixed
+- **Port collision reported usefully.** Binding an occupied WebSocket port surfaced a bare "address in use"; it now names the port, states that another daemon is probably running, and exits non-zero instead of appearing to run.
+- **Network errors no longer hide their cause.** reqwest's top-level message is "error sending request for url (...)", which does not say whether it was DNS, TLS, a timeout or a refused connection. The source chain is now flattened into the reported error.
+
 ## [0.14.0] - 2026-08-22
 
 ### Added
