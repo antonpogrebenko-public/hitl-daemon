@@ -554,6 +554,29 @@ pub struct PreflightStatus {
     pub connected: bool,
     pub hitl_enabled: bool,
     pub is_quadrotor: bool,
+    /// Explicit readiness verdict.
+    ///
+    /// Exists because `connected: false` is ambiguous: it covers both "no FC
+    /// is expected" (sim-only) and "an FC is expected but has not reported
+    /// yet". Collapsing those let the browser fall straight through the gate
+    /// while a board was still booting — the most common first-run state.
+    pub readiness: PreflightReadiness,
+}
+
+/// Whether the connected flight controller is ready for HITL.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreflightReadiness {
+    /// An FC is expected but has not reported its state yet. Must be treated
+    /// as a wait, never as a pass.
+    Unknown,
+    /// HITL mode and a quadrotor airframe both confirmed.
+    Ready,
+    /// The board reported, and one or both signals are wrong.
+    NotReady,
+    /// No flight controller is part of this session (--sim-only). Nothing to
+    /// gate on, so the flow proceeds.
+    NotApplicable,
 }
 
 impl PreflightStatus {
@@ -648,6 +671,9 @@ impl SnapshotStored {
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PreflightApplyState {
+    /// Reading the board's current parameters and waiting for the browser to
+    /// persist them. No write has happened yet at this stage.
+    Capturing,
     Applying,
     Rebooting,
     Reconnecting,
@@ -1222,6 +1248,7 @@ mod tests {
             connected: true,
             hitl_enabled: false,
             is_quadrotor: true,
+            readiness: PreflightReadiness::NotReady,
         };
         let bytes = status.to_bytes();
         assert_eq!(bytes[0], MSG_TYPE_PREFLIGHT_STATUS);
@@ -1230,8 +1257,11 @@ mod tests {
         assert_eq!(body["connected"], serde_json::json!(true));
         assert_eq!(body["hitl_enabled"], serde_json::json!(false));
         assert_eq!(body["is_quadrotor"], serde_json::json!(true));
-        // Exactly those three keys — no stray or renamed fields.
-        assert_eq!(body.as_object().unwrap().len(), 3);
+        // readiness is the field the browser gates on; connected alone is
+        // ambiguous between "no FC expected" and "FC has not reported yet".
+        assert_eq!(body["readiness"], serde_json::json!("not_ready"));
+        // Exactly those four keys — no stray or renamed fields.
+        assert_eq!(body.as_object().unwrap().len(), 4);
     }
 
     /// Pins the snake_case rendering of `PreflightApplyState` (the frontend's

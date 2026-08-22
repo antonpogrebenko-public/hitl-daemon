@@ -119,7 +119,33 @@ pub async fn read_param(
     param_value_tx: &broadcast::Sender<ParamValue>,
     name: &str,
 ) -> Result<ParamValue, ParamReadError> {
-    for attempt in 1..=PARAM_READ_RETRY_COUNT {
+    read_param_with(mav_tx, param_value_tx, name, ParamReadPolicy::default()).await
+}
+
+/// Timeout and retry budget for a read. Injectable so tests can exercise the
+/// failure paths without waiting out the production budget.
+#[derive(Debug, Clone, Copy)]
+pub struct ParamReadPolicy {
+    pub timeout: Duration,
+    pub retries: u8,
+}
+
+impl Default for ParamReadPolicy {
+    fn default() -> Self {
+        Self {
+            timeout: PARAM_READ_TIMEOUT,
+            retries: PARAM_READ_RETRY_COUNT,
+        }
+    }
+}
+
+pub async fn read_param_with(
+    mav_tx: &Sender<MavMessage>,
+    param_value_tx: &broadcast::Sender<ParamValue>,
+    name: &str,
+    policy: ParamReadPolicy,
+) -> Result<ParamValue, ParamReadError> {
+    for attempt in 1..=policy.retries {
         let mut rx = param_value_tx.subscribe();
 
         match mav_tx.try_send(make_param_request_read(name)) {
@@ -137,7 +163,7 @@ pub async fn read_param(
             }
         }
 
-        if let Some(value) = await_param(&mut rx, name).await {
+        if let Some(value) = await_param(&mut rx, name, policy.timeout).await {
             return Ok(value);
         }
         warn!(
@@ -158,11 +184,20 @@ pub async fn read_params(
     param_value_tx: &broadcast::Sender<ParamValue>,
     names: &[&str],
 ) -> (Vec<ParamValue>, Vec<String>) {
+    read_params_with(mav_tx, param_value_tx, names, ParamReadPolicy::default()).await
+}
+
+pub async fn read_params_with(
+    mav_tx: &Sender<MavMessage>,
+    param_value_tx: &broadcast::Sender<ParamValue>,
+    names: &[&str],
+    policy: ParamReadPolicy,
+) -> (Vec<ParamValue>, Vec<String>) {
     let mut values = Vec::with_capacity(names.len());
     let mut failed = Vec::new();
 
     for name in names {
-        match read_param(mav_tx, param_value_tx, name).await {
+        match read_param_with(mav_tx, param_value_tx, name, policy).await {
             Ok(value) => values.push(value),
             Err(_) => failed.push((*name).to_string()),
         }
@@ -172,8 +207,12 @@ pub async fn read_params(
 }
 
 /// Drain `rx` until a `PARAM_VALUE` for `name` arrives or the timeout elapses.
-async fn await_param(rx: &mut broadcast::Receiver<ParamValue>, name: &str) -> Option<ParamValue> {
-    let deadline = tokio::time::Instant::now() + PARAM_READ_TIMEOUT;
+async fn await_param(
+    rx: &mut broadcast::Receiver<ParamValue>,
+    name: &str,
+    timeout: Duration,
+) -> Option<ParamValue> {
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {

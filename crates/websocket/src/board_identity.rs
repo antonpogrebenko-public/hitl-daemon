@@ -24,6 +24,13 @@ impl BoardIdentity {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Construct from a literal. Test-only: production identities must come
+    /// from `derive` so the derivation rules cannot be bypassed.
+    #[cfg(test)]
+    pub fn from_raw_for_test(raw: &str) -> Self {
+        Self(raw.to_string())
+    }
 }
 
 impl std::fmt::Display for BoardIdentity {

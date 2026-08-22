@@ -6,7 +6,7 @@
 use crate::build_config::BuildConfigHandler;
 use crate::preflight::PreflightHandler;
 use crate::protocol::{
-    SnapshotStored,
+    PreflightReadiness, SnapshotStored,
     Command, CommandAck, CommandType, ConfigResult, ConfigState, HandshakeAck, IncomingMessage,
     NshCommand, NshResponse, OutgoingMessage, PreflightApplyResult, PreflightApplyState,
     PreflightStatus, StateUpdate,
@@ -237,6 +237,9 @@ impl ConnectionHandler {
                         connected: false,
                         hitl_enabled: false,
                         is_quadrotor: false,
+                        // No preflight handler configured at all, so there is
+                        // no board this session could gate on.
+                        readiness: PreflightReadiness::NotApplicable,
                     },
                 };
                 Ok(Some(OutgoingMessage::PreflightStatus(status)))
@@ -744,13 +747,12 @@ mod tests {
     async fn preflight_apply_dispatches_async_and_delivers_terminal_result() {
         let (mut handler, _) = create_test_handler().await;
 
-        // A PreflightHandler whose MAVLink channel is never drained, so
-        // apply() spends ~2.4s (3 retries x 800ms ack timeout) before it can
-        // report its terminal Error. That delay is the point: dispatch must
-        // return immediately and deliver the result later, because on real
-        // hardware apply() blocks for 20-60s and an inline await would let
-        // the send task's 15s pong watchdog tear the socket down first — the
-        // browser would then get neither Done nor Error.
+        // A PreflightHandler with no board identity, so apply() refuses at the
+        // snapshot stage and reports a terminal Error. What is under test is
+        // the dispatch contract, not which stage fails: on real hardware
+        // apply() blocks for 20-60s, and an inline await would let the send
+        // task's 15s pong watchdog tear the socket down first — the browser
+        // would then get neither Done nor Error.
         let (mav_tx, _mav_rx) = crossbeam_channel::bounded(64);
         let (pv_tx, _pv_rx) = broadcast::channel(64);
         let sim_state = simulation::SimulationState::new(simulation::SimulationConfig::default());
@@ -793,6 +795,8 @@ mod tests {
         let terminal =
             terminal.expect("terminal PreflightApplyResult never arrived on the progress channel");
         assert!(!terminal.success);
-        assert!(terminal.error.unwrap().contains("SYS_HITL"));
+        // Fails before any write, because no restore point could be tied to
+        // this board.
+        assert!(terminal.error.unwrap().contains("identifying serial"));
     }
 }
