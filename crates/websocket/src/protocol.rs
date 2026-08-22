@@ -72,6 +72,10 @@ pub const MSG_TYPE_APPLY_PREFLIGHT_PARAMS: u8 = 0x15;
 pub const MSG_TYPE_SNAPSHOT_CAPTURED: u8 = 0x0C;
 /// Browser -> daemon: the snapshot is durably stored, writes may proceed.
 pub const MSG_TYPE_SNAPSHOT_STORED: u8 = 0x16;
+/// Browser -> daemon: write this snapshot back to the board.
+pub const MSG_TYPE_RESTORE_SNAPSHOT: u8 = 0x17;
+/// Daemon -> browser: progress and outcome of a restore.
+pub const MSG_TYPE_RESTORE_RESULT: u8 = 0x0D;
 
 // State update size (current wire format)
 pub const STATE_UPDATE_SIZE: usize = 87;
@@ -664,6 +668,81 @@ impl SnapshotStored {
     }
 }
 
+/// Browser's request to write a stored snapshot back to the flight
+/// controller.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RestoreSnapshot {
+    /// The board the snapshot was captured from. Refused when it does not
+    /// match the connected board: restoring one board's tuning onto another
+    /// is the failure the whole snapshot mechanism exists to prevent.
+    pub board_identity: String,
+    pub params: Vec<SnapshotParam>,
+}
+
+impl RestoreSnapshot {
+    pub fn from_bytes(data: &[u8]) -> Result<Self, ProtocolError> {
+        if data.len() < 2 {
+            return Err(ProtocolError::MessageTooShort {
+                expected: 2,
+                actual: data.len(),
+            });
+        }
+        if data[0] != MSG_TYPE_RESTORE_SNAPSHOT {
+            return Err(ProtocolError::UnknownMessageType(data[0]));
+        }
+        serde_json::from_slice(&data[1..]).map_err(|e| ProtocolError::InvalidPayload {
+            command_type: CommandType::Arm,
+            reason: format!("RestoreSnapshot: {e}"),
+        })
+    }
+}
+
+/// Lifecycle stage of a restore.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreState {
+    Writing,
+    Rebooting,
+    Reconnecting,
+    Verifying,
+    Done,
+    Error,
+}
+
+/// One parameter that did not read back as its snapshotted value.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RestoreMismatch {
+    pub name: String,
+    pub expected: f32,
+    pub actual: f32,
+}
+
+/// ## Binary format (0x0D)
+/// - `[0]`: 0x0D message type
+/// - `[1-N]`: JSON body
+#[derive(Debug, Clone, Serialize)]
+pub struct RestoreResult {
+    pub state: RestoreState,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Populated when verification found differences. The board is NOT
+    /// reported as restored in that case — the user needs to know exactly
+    /// which values differ and what they now hold.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub mismatches: Vec<RestoreMismatch>,
+}
+
+impl RestoreResult {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let json = serde_json::to_vec(self).expect("RestoreResult serialization cannot fail");
+        let mut buf = Vec::with_capacity(1 + json.len());
+        buf.push(MSG_TYPE_RESTORE_RESULT);
+        buf.extend_from_slice(&json);
+        buf
+    }
+}
+
 /// Lifecycle stage of an `ApplyPreflightParams` request. Mirrors
 /// `ConfigState`'s two-stage shape: the same message type carries both
 /// interim progress (`success: true`, non-terminal `state`) and the final
@@ -1026,6 +1105,7 @@ pub enum OutgoingMessage {
     ConfigResult(ConfigResult),
     TerrainOrigin(TerrainOrigin),
     SnapshotCaptured(SnapshotCaptured),
+    RestoreResult(RestoreResult),
     PreflightStatus(PreflightStatus),
     PreflightApplyResult(PreflightApplyResult),
 }
@@ -1042,6 +1122,7 @@ impl OutgoingMessage {
             OutgoingMessage::ConfigResult(r) => r.to_bytes(),
             OutgoingMessage::TerrainOrigin(t) => t.to_bytes(),
             OutgoingMessage::SnapshotCaptured(s) => s.to_bytes(),
+            OutgoingMessage::RestoreResult(r) => r.to_bytes(),
             OutgoingMessage::PreflightStatus(p) => p.to_bytes(),
             OutgoingMessage::PreflightApplyResult(p) => p.to_bytes(),
         }
@@ -1059,6 +1140,7 @@ pub enum IncomingMessage {
     RequestPreflightCheck,
     ApplyPreflightParams,
     SnapshotStored(SnapshotStored),
+    RestoreSnapshot(RestoreSnapshot),
 }
 
 impl IncomingMessage {
@@ -1083,6 +1165,9 @@ impl IncomingMessage {
             MSG_TYPE_APPLY_PREFLIGHT_PARAMS => Ok(IncomingMessage::ApplyPreflightParams),
             MSG_TYPE_SNAPSHOT_STORED => Ok(IncomingMessage::SnapshotStored(
                 SnapshotStored::from_bytes(data)?,
+            )),
+            MSG_TYPE_RESTORE_SNAPSHOT => Ok(IncomingMessage::RestoreSnapshot(
+                RestoreSnapshot::from_bytes(data)?,
             )),
             other => Err(ProtocolError::UnknownMessageType(other)),
         }

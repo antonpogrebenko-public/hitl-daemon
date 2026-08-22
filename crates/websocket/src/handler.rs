@@ -6,7 +6,7 @@
 use crate::build_config::BuildConfigHandler;
 use crate::preflight::PreflightHandler;
 use crate::protocol::{
-    PreflightReadiness, SnapshotStored,
+    PreflightReadiness, RestoreResult, RestoreState, SnapshotStored,
     Command, CommandAck, CommandType, ConfigResult, ConfigState, HandshakeAck, IncomingMessage,
     NshCommand, NshResponse, OutgoingMessage, PreflightApplyResult, PreflightApplyState,
     PreflightStatus, StateUpdate,
@@ -265,6 +265,35 @@ impl ConnectionHandler {
                 }
                 Ok(None)
             }
+            IncomingMessage::RestoreSnapshot(request) => {
+                debug!(
+                    client_id,
+                    board_identity = %request.board_identity,
+                    params = request.params.len(),
+                    "Received restore request"
+                );
+                let handler = match &self.preflight {
+                    Some(h) => h.clone(),
+                    None => {
+                        return Ok(Some(OutgoingMessage::RestoreResult(RestoreResult {
+                            state: RestoreState::Error,
+                            success: false,
+                            error: Some("Restore is unavailable in this session".to_string()),
+                            mismatches: Vec::new(),
+                        })));
+                    }
+                };
+                // Detached like ApplyPreflightParams: a restore reboots the
+                // board, so awaiting it inline would block the receive loop
+                // past the pong watchdog and tear the socket down.
+                // Terminal result goes out on the same broadcast as the
+                // progress, so every connected client converges on the outcome
+                // rather than only the tab that asked.
+                tokio::spawn(async move {
+                    handler.restore(request).await;
+                });
+                Ok(None)
+            }
             IncomingMessage::ApplyPreflightParams => {
                 debug!(client_id, "Received apply preflight params request");
                 let handler = match &self.preflight {
@@ -290,12 +319,9 @@ impl ConnectionHandler {
                 // uses — identical 0x0B message type, so the wire format is
                 // unchanged and the frontend still just treats any
                 // done/error PreflightApplyResult as terminal.
-                let progress_tx = progress_tx.clone();
+
                 tokio::spawn(async move {
-                    let result = handler.apply(progress_tx.clone()).await;
-                    let _ = progress_tx
-                        .send(OutgoingMessage::PreflightApplyResult(result))
-                        .await;
+                    handler.apply().await;
                 });
                 Ok(None)
             }
@@ -756,14 +782,13 @@ mod tests {
         let (mav_tx, _mav_rx) = crossbeam_channel::bounded(64);
         let (pv_tx, _pv_rx) = broadcast::channel(64);
         let sim_state = simulation::SimulationState::new(simulation::SimulationConfig::default());
-        handler.set_preflight_handler(Arc::new(PreflightHandler::new(
-            Some(mav_tx),
-            Some(pv_tx),
-            None,
-            sim_state,
-        )));
+        let preflight = Arc::new(PreflightHandler::new(Some(mav_tx), Some(pv_tx), None, sim_state));
+        // Provisioning progress now fans out on the handler's own broadcast so
+        // every client sees it, not just the tab that asked.
+        let mut provisioning_rx = preflight.subscribe_provisioning();
+        handler.set_preflight_handler(preflight);
 
-        let (progress_tx, mut progress_rx) = mpsc::channel(8);
+        let (progress_tx, _progress_rx) = mpsc::channel(8);
         let dispatch_start = Instant::now();
         let response = handler
             .handle_message(1, &[protocol::MSG_TYPE_APPLY_PREFLIGHT_PARAMS], &progress_tx)
@@ -780,10 +805,10 @@ mod tests {
             "dispatch blocked for {dispatch_elapsed:?} — the receive loop must never await apply()"
         );
 
-        // The terminal result still reaches the client, over progress_tx.
+        // The terminal result still reaches clients, over the broadcast.
         let mut terminal = None;
-        while let Ok(Some(msg)) =
-            tokio::time::timeout(Duration::from_secs(10), progress_rx.recv()).await
+        while let Ok(Ok(msg)) =
+            tokio::time::timeout(Duration::from_secs(10), provisioning_rx.recv()).await
         {
             if let OutgoingMessage::PreflightApplyResult(result) = msg {
                 if matches!(result.state, protocol::PreflightApplyState::Error) {
@@ -793,7 +818,7 @@ mod tests {
             }
         }
         let terminal =
-            terminal.expect("terminal PreflightApplyResult never arrived on the progress channel");
+            terminal.expect("terminal PreflightApplyResult never arrived on the broadcast");
         assert!(!terminal.success);
         // Fails before any write, because no restore point could be tied to
         // this board.

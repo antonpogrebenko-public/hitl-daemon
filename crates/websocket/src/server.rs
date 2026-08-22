@@ -66,6 +66,7 @@ struct AppState {
     /// on FC reconnect). Forwarded to all connected clients so the browser can
     /// display the spinner / ready state without requiring a manual re-configure.
     system_config_tx: Option<broadcast::Sender<OutgoingMessage>>,
+    provisioning_tx: Option<broadcast::Sender<OutgoingMessage>>,
 }
 
 /// WebSocket server for browser communication
@@ -239,9 +240,33 @@ impl WebSocketServer {
             } else {
                 None
             };
-        if let Some(preflight_handler) = self.preflight_handler {
-            handler.set_preflight_handler(preflight_handler);
-        }
+        // Provisioning and restore progress reaches every connected client, so
+        // a reloaded page or a second tab converges on the same state instead
+        // of being told an operation is "already in progress" with nothing to
+        // show for it.
+        let provisioning_tx: Option<broadcast::Sender<OutgoingMessage>> =
+            if let Some(preflight_handler) = self.preflight_handler {
+                let rx = preflight_handler.subscribe_provisioning();
+                let (tx, _) = broadcast::channel::<OutgoingMessage>(64);
+                let tx_clone = tx.clone();
+                tokio::spawn(async move {
+                    let mut rx = rx;
+                    loop {
+                        match rx.recv().await {
+                            Ok(msg) => {
+                                let _ = tx_clone.send(msg);
+                            }
+                            Err(broadcast::error::RecvError::Closed) => break,
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        }
+                    }
+                });
+                handler.set_snapshot_ack_sender(preflight_handler.snapshot_ack_sender());
+                handler.set_preflight_handler(preflight_handler);
+                Some(tx)
+            } else {
+                None
+            };
         // Enable recharge callback
         if let Some(recharge_fn) = self.recharge_fn {
             handler.set_recharge_callback(recharge_fn);
@@ -361,6 +386,7 @@ impl WebSocketServer {
             terrain_origin_tx,
             terrain_origin_latest,
             system_config_tx,
+            provisioning_tx,
         });
 
         // Build CORS layer — restrict origins in production, allow localhost for dev
@@ -453,6 +479,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
     // Subscribe to system-initiated config results (reconnect re-push) if available
     let mut system_config_rx = state.system_config_tx.as_ref().map(|tx| tx.subscribe());
+    let mut provisioning_rx = state.provisioning_tx.as_ref().map(|tx| tx.subscribe());
 
     // Channel for sending responses from the receive task to the send task
     let (response_tx, mut response_rx) = mpsc::channel::<OutgoingMessage>(32);
@@ -596,6 +623,28 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         Err(broadcast::error::RecvError::Lagged(_)) => {}
                         Err(broadcast::error::RecvError::Closed) => {
                             terrain_origin_rx = None;
+                        }
+                    }
+                }
+                // Provisioning and restore progress, fanned out to every client.
+                result = async {
+                    match provisioning_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match result {
+                        Ok(msg) => {
+                            let bytes = msg.to_bytes();
+                            if ws_sender.send(Message::Binary(bytes.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            warn!(client_id, lagged = n, "Provisioning receiver lagged");
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            provisioning_rx = None;
                         }
                     }
                 }

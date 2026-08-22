@@ -29,7 +29,7 @@ pub(crate) const PARAM_RETRY_COUNT: u8 = 3;
 /// Float epsilon for matching PX4's `PARAM_VALUE` against the value we sent.
 /// PX4 stores rate-controller gains as `float32`, so any round-trip drift is
 /// well below this bound.
-const PARAM_ACK_EPSILON: f32 = 1.0e-4;
+pub(crate) const PARAM_ACK_EPSILON: f32 = 1.0e-4;
 
 const DEFAULT_API_URL: &str = "https://api.th3seus.net";
 

@@ -43,6 +43,21 @@ impl ParamValue {
         })
     }
 
+    /// The parameter's value as a number a human (or an API) would recognise.
+    ///
+    /// PX4 transports an integer parameter as the raw *bit pattern* of the
+    /// int32 inside the float field, so `value` for `SYS_HITL = 1` is
+    /// 1.4e-45, not 1.0. Anything that stores, displays, or writes the value
+    /// back must go through here; using `value` directly for an integer
+    /// parameter silently corrupts it.
+    pub fn decoded_value(&self) -> f32 {
+        if self.is_integer() {
+            self.value.to_bits() as i32 as f32
+        } else {
+            self.value
+        }
+    }
+
     /// Whether PX4 declared this parameter as an integer type. Restore uses
     /// this to choose between the INT32 and REAL32 `PARAM_SET` encodings.
     pub fn is_integer(&self) -> bool {

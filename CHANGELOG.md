@@ -5,6 +5,16 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] - 2026-08-22
+
+### Added
+- **Bounded automatic re-apply** — a provisioning cycle whose post-reboot verification fails is repeated once before the user sees an error. PX4 can report the old flags on its first HEARTBEAT after a reboot, and a parameter save that did not land is recoverable by pushing again. Bounded at 2 attempts: every cycle commits parameters to flash, so retrying a board that will never verify would wear it out. Only a verification failure retries — an unacked `PARAM_SET` or a board that never came back are not fixed by pushing the same values again.
+- **Restore** — writes a stored snapshot back, saves, reboots, and reads every value back to confirm it took. Refuses a snapshot whose board identity does not match the connected board, a board with no identity, an empty snapshot, and sim-only mode. A value that does not read back is reported per-parameter with expected and actual, and the board is explicitly **not** reported as restored.
+- **Provisioning progress is broadcast to every connected client** — a reloaded page or a second tab converges on the same state instead of being told an operation is "already in progress" with nothing to show. One fan-out path rather than a per-connection channel, so the tab that started the operation does not receive every frame twice.
+
+### Fixed
+- **Integer parameters were captured and restored as their raw bit pattern.** PX4 transports an INT32 parameter as the bits of the int32 reinterpreted inside `PARAM_VALUE`'s float field, so `SYS_HITL = 1` arrives as 1.4e-45. Capture stored that pattern verbatim and restore cast it back as a number, which would have written garbage to every integer parameter on the board — 18 of the 21 provisioning touches. `ParamValue::decoded_value()` now normalises on the way in, restore re-encodes per the recorded type, and acks for integer parameters are compared as bits rather than within a float epsilon. Caught by a restore test asserting the board holds what was asked for.
+
 ## [0.12.0] - 2026-08-22
 
 ### Added

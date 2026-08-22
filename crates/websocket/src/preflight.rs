@@ -93,6 +93,7 @@ mod tests {
 }
 
 use crate::build_config::{
+    PARAM_ACK_EPSILON,
     make_param_save, make_param_set, wait_for_param_ack, PARAM_ACK_TIMEOUT, PARAM_RETRY_COUNT,
     PX4_TARGET_COMPONENT, PX4_TARGET_SYSTEM,
 };
@@ -103,7 +104,8 @@ use crate::snapshot::{SessionSnapshot, StoredSnapshot};
 use std::sync::Arc;
 use crate::protocol::{
     OutgoingMessage, PreflightApplyResult, PreflightApplyState, PreflightReadiness,
-    PreflightStatus, SnapshotCaptured, SnapshotParam, SnapshotStored,
+    PreflightStatus, RestoreMismatch, RestoreResult, RestoreSnapshot, RestoreState,
+    SnapshotCaptured, SnapshotParam, SnapshotStored,
 };
 use crossbeam_channel::Sender;
 use mavlink::ardupilotmega::{MavMessage, MavParamType, PARAM_SET_DATA};
@@ -279,6 +281,36 @@ async fn await_snapshot_ack(
     }
 }
 
+/// How many write-save-reboot-verify cycles to run before giving up.
+///
+/// Bounded deliberately: each cycle commits parameters to flash, so an
+/// unbounded retry on a board that will never verify would wear it out.
+const PROVISION_ATTEMPTS: u8 = 2;
+
+/// Why one provisioning cycle failed, and whether repeating it could help.
+struct ApplyFailure {
+    message: String,
+    /// True only for a verification failure. An unacked PARAM_SET or a board
+    /// that never came back are not fixed by pushing the same values again.
+    retryable: bool,
+}
+
+impl ApplyFailure {
+    fn fatal(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    fn retryable(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: true,
+        }
+    }
+}
+
 pub struct PreflightHandler {
     mav_tx: Option<Sender<MavMessage>>,
     param_value_tx: Option<broadcast::Sender<ParamValue>>,
@@ -316,6 +348,13 @@ pub struct PreflightHandler {
     read_policy: ParamReadPolicy,
     /// How long to wait for the browser's persistence acknowledgement.
     ack_timeout: Duration,
+    /// Provisioning lifecycle, fanned out to every connected client.
+    ///
+    /// One path rather than a per-connection channel: a reloaded page, a
+    /// second tab, and the tab that started the operation all need the same
+    /// stream, and mirroring into both would deliver every frame twice to
+    /// whoever asked.
+    provisioning_tx: broadcast::Sender<OutgoingMessage>,
 }
 
 impl PreflightHandler {
@@ -353,7 +392,16 @@ impl PreflightHandler {
             session_snapshot: Arc::new(SessionSnapshot::new()),
             read_policy: ParamReadPolicy::default(),
             ack_timeout: SNAPSHOT_ACK_TIMEOUT,
+            provisioning_tx: {
+                let (tx, _) = broadcast::channel(64);
+                tx
+            },
         }
+    }
+
+    /// Subscribe to provisioning and restore progress.
+    pub fn subscribe_provisioning(&self) -> broadcast::Receiver<OutgoingMessage> {
+        self.provisioning_tx.subscribe()
     }
 
     /// Shorten the capture budgets. Test-only.
@@ -397,10 +445,7 @@ impl PreflightHandler {
     /// modified and nothing can put it back, which is the exact state the
     /// snapshot exists to prevent. Every failure path here therefore aborts
     /// before a single PARAM_SET is sent.
-    async fn capture_and_confirm_snapshot(
-        &self,
-        progress_tx: &mpsc::Sender<OutgoingMessage>,
-    ) -> Result<(), String> {
+    async fn capture_and_confirm_snapshot(&self) -> Result<(), String> {
         let (Some(mav_tx), Some(param_value_tx)) =
             (self.mav_tx.as_ref(), self.param_value_tx.as_ref())
         else {
@@ -436,7 +481,7 @@ impl PreflightHandler {
             .iter()
             .map(|v| SnapshotParam {
                 name: v.name.clone(),
-                value: v.value,
+                value: v.decoded_value(),
                 param_type: if v.is_integer() { "int32" } else { "real32" }.to_string(),
             })
             .collect();
@@ -451,16 +496,16 @@ impl PreflightHandler {
             params: params.clone(),
         });
 
-        if progress_tx
+        if self
+            .provisioning_tx
             .send(OutgoingMessage::SnapshotCaptured(SnapshotCaptured {
                 board_identity: identity.as_str().to_string(),
                 params,
             }))
-            .await
             .is_err()
         {
-            return Err("Lost the browser connection before the restore point could be \
-                        saved. Nothing was changed."
+            return Err("No browser is connected to save the restore point. Nothing was \
+                        changed."
                 .to_string());
         }
 
@@ -509,7 +554,17 @@ impl PreflightHandler {
     /// receive loop can't afford to block for the 20-60s reboot window), the
     /// blocking-await serialization that used to make this a non-issue is
     /// gone — this guard replaces it.
-    pub async fn apply(&self, progress_tx: mpsc::Sender<OutgoingMessage>) -> PreflightApplyResult {
+    pub async fn apply(&self) -> PreflightApplyResult {
+        let result = self.apply_inner().await;
+        // Terminal outcome reaches every client, not just whoever asked: a
+        // reloaded page or a second tab needs to learn how this ended.
+        let _ = self
+            .provisioning_tx
+            .send(OutgoingMessage::PreflightApplyResult(result.clone()));
+        result
+    }
+
+    async fn apply_inner(&self) -> PreflightApplyResult {
         if self
             .applying
             .swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -536,8 +591,8 @@ impl PreflightHandler {
 
         // Snapshot first. No PARAM_SET is sent until the browser confirms a
         // restore point exists.
-        send_progress(&progress_tx, PreflightApplyState::Capturing).await;
-        if let Err(error) = self.capture_and_confirm_snapshot(&progress_tx).await {
+        self.broadcast_progress(PreflightApplyState::Capturing);
+        if let Err(error) = self.capture_and_confirm_snapshot().await {
             return PreflightApplyResult {
                 state: PreflightApplyState::Error,
                 success: false,
@@ -545,7 +600,251 @@ impl PreflightHandler {
             };
         }
 
-        send_progress(&progress_tx, PreflightApplyState::Applying).await;
+        // Provisioning proper. Retried on a verification failure: PX4 can
+        // report the old flags on the first HEARTBEAT after a reboot, and a
+        // parameter save that did not land is recoverable by pushing again.
+        // Bounded, because retrying forever would keep writing flash.
+        let mut last_error = String::new();
+        for attempt in 1..=PROVISION_ATTEMPTS {
+            match self.apply_once(mav_tx, param_value_tx).await {
+                Ok(()) => {
+                    return PreflightApplyResult {
+                        state: PreflightApplyState::Done,
+                        success: true,
+                        error: None,
+                    }
+                }
+                Err(failure) if failure.retryable && attempt < PROVISION_ATTEMPTS => {
+                    warn!(
+                        attempt,
+                        error = %failure.message,
+                        "Provisioning did not verify — re-applying"
+                    );
+                    last_error = failure.message;
+                }
+                Err(failure) => {
+                    return PreflightApplyResult {
+                        state: PreflightApplyState::Error,
+                        success: false,
+                        error: Some(failure.message),
+                    }
+                }
+            }
+        }
+
+        PreflightApplyResult {
+            state: PreflightApplyState::Error,
+            success: false,
+            error: Some(format!(
+                "{last_error} (after {PROVISION_ATTEMPTS} attempts)"
+            )),
+        }
+    }
+
+    /// Write a snapshot back to the board, save, reboot, and confirm every
+    /// value actually took.
+    ///
+    /// Refuses when the snapshot belongs to a different board than the one
+    /// connected. That check is the whole reason board identity exists:
+    /// writing one aircraft's tuning onto another produces a vehicle that
+    /// looks configured and flies wrong.
+    pub async fn restore(&self, request: RestoreSnapshot) -> RestoreResult {
+        let result = self.restore_inner(request).await;
+        let _ = self
+            .provisioning_tx
+            .send(OutgoingMessage::RestoreResult(result.clone()));
+        result
+    }
+
+    async fn restore_inner(&self, request: RestoreSnapshot) -> RestoreResult {
+        if self
+            .applying
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return restore_error("Another flight-controller operation is already in progress");
+        }
+        let _guard = ApplyGuard(&self.applying);
+
+        let (Some(mav_tx), Some(param_value_tx)) =
+            (self.mav_tx.as_ref(), self.param_value_tx.as_ref())
+        else {
+            return restore_error("No flight controller connected (sim-only mode)");
+        };
+
+        match self.board_identity.read().await.clone() {
+            Some(connected) if connected.as_str() == request.board_identity => {}
+            Some(connected) => {
+                return restore_error(format!(
+                    "That snapshot was taken from a different flight controller ({}), not the \
+                     one connected ({}). Nothing was changed.",
+                    request.board_identity,
+                    connected.as_str()
+                ));
+            }
+            None => {
+                return restore_error(
+                    "The connected flight controller reports no identifying serial, so this \
+                     snapshot cannot be confirmed to belong to it. Nothing was changed.",
+                );
+            }
+        }
+
+        if request.params.is_empty() {
+            return restore_error("That snapshot contains no parameters to restore.");
+        }
+
+        self.broadcast_restore(RestoreState::Writing);
+        for param in &request.params {
+            // Written with the type the snapshot recorded: PX4 silently drops
+            // a PARAM_SET whose type does not match, so guessing from the
+            // value would leave parameters quietly unrestored.
+            let is_int = param.param_type == "int32";
+            let message = if is_int {
+                make_param_set_i32(&param.name, param.value as i32)
+            } else {
+                make_param_set(&param.name, param.value)
+            };
+
+            let mut acked = false;
+            for attempt in 1..=PARAM_RETRY_COUNT {
+                let mut rx = param_value_tx.subscribe();
+                if mav_tx.try_send(message.clone()).is_err() {
+                    return restore_error(format!(
+                        "Lost the link to the flight controller while restoring {}",
+                        param.name
+                    ));
+                }
+                // An integer ack comes back as the value's bit pattern, so it
+                // has to be compared as bits rather than within a float epsilon.
+                let matched = if is_int {
+                    wait_for_int_param_ack(&mut rx, &param.name, param.value as i32).await
+                } else {
+                    wait_for_param_ack(&mut rx, &param.name, param.value)
+                        .await
+                        .is_some()
+                };
+                if matched {
+                    acked = true;
+                    break;
+                }
+                warn!(param = %param.name, attempt, "Restore ack timed out — retrying");
+            }
+            if !acked {
+                return restore_error(format!(
+                    "The flight controller did not confirm {}. Restore is incomplete.",
+                    param.name
+                ));
+            }
+        }
+
+        let _ = mav_tx.try_send(make_param_save());
+        tokio::time::sleep(PARAM_SAVE_SETTLE_DELAY).await;
+
+        let baseline_count = self.sim_state.heartbeat_status().0;
+        self.broadcast_restore(RestoreState::Rebooting);
+        if let Err(e) = self.send_reboot_via_nsh().await {
+            return restore_error(format!("Failed to send reboot command: {e}"));
+        }
+
+        self.broadcast_restore(RestoreState::Reconnecting);
+        if !self
+            .wait_for_reconnect(
+                baseline_count,
+                PREFLIGHT_RECONNECT_TIMEOUT,
+                PREFLIGHT_RECONNECT_POLL_INTERVAL,
+                PREFLIGHT_QUIET_PERIOD,
+            )
+            .await
+        {
+            return restore_error(
+                "The flight controller did not come back after the restore reboot. The \
+                 parameters were written, but could not be confirmed.",
+            );
+        }
+
+        self.broadcast_restore(RestoreState::Verifying);
+        let names: Vec<&str> = request.params.iter().map(|p| p.name.as_str()).collect();
+        let (values, failed) =
+            read_params_with(mav_tx, param_value_tx, &names, self.read_policy).await;
+
+        if !failed.is_empty() {
+            return restore_error(format!(
+                "Could not read back {} parameters after the restore ({}).",
+                failed.len(),
+                failed.join(", ")
+            ));
+        }
+
+        let mut mismatches = Vec::new();
+        for expected in &request.params {
+            if let Some(actual) = values.iter().find(|v| v.name == expected.name) {
+                let actual_value = actual.decoded_value();
+                if (actual_value - expected.value).abs() > PARAM_ACK_EPSILON {
+                    mismatches.push(RestoreMismatch {
+                        name: expected.name.clone(),
+                        expected: expected.value,
+                        actual: actual_value,
+                    });
+                }
+            }
+        }
+
+        if !mismatches.is_empty() {
+            // Deliberately not reported as restored: the user needs to know
+            // exactly which values differ before trusting the aircraft.
+            return RestoreResult {
+                state: RestoreState::Error,
+                success: false,
+                error: Some(format!(
+                    "{} parameter(s) did not read back as expected. The flight controller is \
+                     not fully restored.",
+                    mismatches.len()
+                )),
+                mismatches,
+            };
+        }
+
+        RestoreResult {
+            state: RestoreState::Done,
+            success: true,
+            error: None,
+            mismatches: Vec::new(),
+        }
+    }
+
+    fn broadcast_progress(&self, state: PreflightApplyState) {
+        let _ = self
+            .provisioning_tx
+            .send(OutgoingMessage::PreflightApplyResult(PreflightApplyResult {
+                state,
+                success: true,
+                error: None,
+            }));
+    }
+
+    fn broadcast_restore(&self, state: RestoreState) {
+        let _ = self
+            .provisioning_tx
+            .send(OutgoingMessage::RestoreResult(RestoreResult {
+                state,
+                success: true,
+                error: None,
+                mismatches: Vec::new(),
+            }));
+    }
+
+    /// One write-save-reboot-verify cycle.
+    ///
+    /// Split out of `apply()` so a verification failure can be retried without
+    /// re-capturing the snapshot: the restore point is already confirmed, and
+    /// re-reading the board after it has been provisioned would capture the
+    /// modified values.
+    async fn apply_once(
+        &self,
+        mav_tx: &Sender<MavMessage>,
+        param_value_tx: &broadcast::Sender<ParamValue>,
+    ) -> Result<(), ApplyFailure> {
+        self.broadcast_progress(PreflightApplyState::Applying);
 
         for (name, value) in [("SYS_HITL", 1i32), ("SYS_AUTOSTART", QUADROTOR_AUTOSTART_ID)]
             .into_iter()
@@ -562,11 +861,7 @@ impl PreflightHandler {
                         continue;
                     }
                     Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-                        return PreflightApplyResult {
-                            state: PreflightApplyState::Error,
-                            success: false,
-                            error: Some(format!("MAVLink tx disconnected while sending {name}")),
-                        };
+                        return Err(ApplyFailure::fatal(format!("MAVLink tx disconnected while sending {name}")));
                     }
                 }
 
@@ -578,13 +873,9 @@ impl PreflightHandler {
             }
 
             if !acked {
-                return PreflightApplyResult {
-                    state: PreflightApplyState::Error,
-                    success: false,
-                    error: Some(format!(
+                return Err(ApplyFailure::fatal(format!(
                         "Failed to verify {name} after {PARAM_RETRY_COUNT} retries"
-                    )),
-                };
+                    )));
             }
         }
 
@@ -600,11 +891,7 @@ impl PreflightHandler {
                         continue;
                     }
                     Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-                        return PreflightApplyResult {
-                            state: PreflightApplyState::Error,
-                            success: false,
-                            error: Some(format!("MAVLink tx disconnected while sending {name}")),
-                        };
+                        return Err(ApplyFailure::fatal(format!("MAVLink tx disconnected while sending {name}")));
                     }
                 }
 
@@ -616,13 +903,9 @@ impl PreflightHandler {
             }
 
             if !acked {
-                return PreflightApplyResult {
-                    state: PreflightApplyState::Error,
-                    success: false,
-                    error: Some(format!(
+                return Err(ApplyFailure::fatal(format!(
                         "Failed to verify {name} after {PARAM_RETRY_COUNT} retries"
-                    )),
-                };
+                    )));
             }
         }
 
@@ -643,16 +926,12 @@ impl PreflightHandler {
         // and silently skips.
         let baseline_count = self.sim_state.heartbeat_status().0;
 
-        send_progress(&progress_tx, PreflightApplyState::Rebooting).await;
+        self.broadcast_progress(PreflightApplyState::Rebooting);
         if let Err(e) = self.send_reboot_via_nsh().await {
-            return PreflightApplyResult {
-                state: PreflightApplyState::Error,
-                success: false,
-                error: Some(format!("Failed to send reboot command: {e}")),
-            };
+            return Err(ApplyFailure::fatal(format!("Failed to send reboot command: {e}")));
         }
 
-        send_progress(&progress_tx, PreflightApplyState::Reconnecting).await;
+        self.broadcast_progress(PreflightApplyState::Reconnecting);
         if !self
             .wait_for_reconnect(
                 baseline_count,
@@ -662,11 +941,7 @@ impl PreflightHandler {
             )
             .await
         {
-            return PreflightApplyResult {
-                state: PreflightApplyState::Error,
-                success: false,
-                error: Some("FC did not reconnect after reboot".to_string()),
-            };
+            return Err(ApplyFailure::fatal("FC did not reconnect after reboot".to_string()));
         }
 
         // Re-read the flags a few times instead of trusting the single
@@ -674,7 +949,7 @@ impl PreflightHandler {
         // HEARTBEAT can plausibly precede its own internal state
         // publication, and a lone false reading here is otherwise a hard
         // failure with no automatic recovery.
-        send_progress(&progress_tx, PreflightApplyState::Verifying).await;
+        self.broadcast_progress(PreflightApplyState::Verifying);
         let (mut hitl_enabled, mut is_quadrotor) = (false, false);
         for attempt in 0..VERIFY_SETTLE_ATTEMPTS {
             let (_, h, q) = self.sim_state.heartbeat_status();
@@ -688,18 +963,12 @@ impl PreflightHandler {
             }
         }
         if !hitl_enabled || !is_quadrotor {
-            return PreflightApplyResult {
-                state: PreflightApplyState::Error,
-                success: false,
-                error: Some("Settings did not take effect after reboot".to_string()),
-            };
+            return Err(ApplyFailure::retryable(
+                "Settings did not take effect after reboot",
+            ));
         }
 
-        PreflightApplyResult {
-            state: PreflightApplyState::Done,
-            success: true,
-            error: None,
-        }
+        Ok(())
     }
 
     /// Trigger a reboot via PX4's own NSH `reboot` command rather than
@@ -788,14 +1057,13 @@ impl Drop for ApplyGuard<'_> {
     }
 }
 
-async fn send_progress(progress_tx: &mpsc::Sender<OutgoingMessage>, state: PreflightApplyState) {
-    let _ = progress_tx
-        .send(OutgoingMessage::PreflightApplyResult(PreflightApplyResult {
-            state,
-            success: true,
-            error: None,
-        }))
-        .await;
+fn restore_error(message: impl Into<String>) -> RestoreResult {
+    RestoreResult {
+        state: RestoreState::Error,
+        success: false,
+        error: Some(message.into()),
+        mismatches: Vec::new(),
+    }
 }
 
 /// Build a `PARAM_SET` for a genuinely INT32 PX4 parameter (`SYS_HITL`,
@@ -894,13 +1162,11 @@ mod apply_tests {
     /// Drain progress and acknowledge the snapshot, standing in for a browser
     /// that persisted it. Tests exercising the write path need this: without
     /// an acknowledgement provisioning correctly refuses to write at all.
-    fn auto_ack_snapshots(
-        handler: &PreflightHandler,
-        mut progress_rx: mpsc::Receiver<OutgoingMessage>,
-    ) -> tokio::task::JoinHandle<()> {
+    fn auto_ack_snapshots(handler: &PreflightHandler) -> tokio::task::JoinHandle<()> {
         let ack_tx = handler.snapshot_ack_sender();
+        let mut progress_rx = handler.subscribe_provisioning();
         tokio::spawn(async move {
-            while let Some(msg) = progress_rx.recv().await {
+            while let Ok(msg) = progress_rx.recv().await {
                 if let OutgoingMessage::SnapshotCaptured(captured) = msg {
                     let _ = ack_tx.send(SnapshotStored {
                         board_identity: captured.board_identity,
@@ -1000,8 +1266,7 @@ mod apply_tests {
     async fn sim_only_mode_returns_error_immediately() {
         let sim_state = SimulationState::new(SimulationConfig::default());
         let handler = make_handler(None, None, sim_state);
-        let (progress_tx, _progress_rx) = mpsc::channel(8);
-        let result = handler.apply(progress_tx).await;
+        let result = handler.apply().await;
         assert!(!result.success);
         assert!(matches!(result.state, PreflightApplyState::Error));
         assert!(result.error.unwrap().contains("sim-only"));
@@ -1057,12 +1322,12 @@ mod apply_tests {
         )
         .with_fast_capture();
         let ack_tx = handler.snapshot_ack_sender();
-        let (progress_tx, mut progress_rx) = mpsc::channel(8);
-        let apply_task = tokio::spawn(async move { handler.apply(progress_tx).await });
+        let mut progress_rx = handler.subscribe_provisioning();
+        let apply_task = tokio::spawn(async move { handler.apply().await });
 
         let mut stages = Vec::new();
         loop {
-            let Some(msg) = progress_rx.recv().await else {
+            let Ok(msg) = progress_rx.recv().await else {
                 break;
             };
             match msg {
@@ -1163,10 +1428,9 @@ mod apply_tests {
         let _px4 = spawn_read_only_px4(mav_rx, pv_tx.clone());
         let sim_state = SimulationState::new(SimulationConfig::default());
         let handler = make_handler(Some(mav_tx), Some(pv_tx), sim_state);
-        let (progress_tx, progress_rx) = mpsc::channel(8);
-        let _acker = auto_ack_snapshots(&handler, progress_rx);
+        let _acker = auto_ack_snapshots(&handler);
 
-        let result = handler.apply(progress_tx).await;
+        let result = handler.apply().await;
         assert!(!result.success);
         assert!(matches!(result.state, PreflightApplyState::Error));
         assert!(result.error.unwrap().contains("SYS_HITL"));
@@ -1245,17 +1509,16 @@ mod apply_tests {
         let handler =
             std::sync::Arc::new(make_handler(Some(mav_tx), Some(pv_tx), sim_state.clone()));
         let apply_handler = handler.clone();
-        let (progress_tx, mut progress_rx) = mpsc::channel(8);
-        let apply_task = tokio::spawn(async move { apply_handler.apply(progress_tx).await });
-
+        let mut progress_rx = handler.subscribe_provisioning();
         let ack_tx = handler.snapshot_ack_sender();
+        let apply_task = tokio::spawn(async move { apply_handler.apply().await });
         // Wait until apply() has actually entered the reconnect wait,
         // acknowledging the snapshot on the way so the write path is reachable.
         loop {
             let msg = progress_rx
                 .recv()
                 .await
-                .expect("progress channel closed before Reconnecting");
+                .expect("progress broadcast closed before Reconnecting");
             if let OutgoingMessage::SnapshotCaptured(captured) = &msg {
                 let _ = ack_tx.send(SnapshotStored {
                     board_identity: captured.board_identity.clone(),
@@ -1314,12 +1577,11 @@ mod apply_tests {
         });
 
         let apply_handler = handler.clone();
-        let (progress_tx, mut progress_rx) = mpsc::channel(8);
-        let apply_task = tokio::spawn(async move { apply_handler.apply(progress_tx).await });
+        let apply_task = tokio::spawn(async move { apply_handler.apply().await });
         // Drain progress so a full channel can never stall the apply task, and
         // acknowledge the snapshot: without it the apply correctly refuses to
         // write anything at all.
-        let _acker = auto_ack_snapshots(&handler, progress_rx);
+        let _acker = auto_ack_snapshots(&handler);
 
         let result = apply_task.await.unwrap();
         assert!(result.success, "apply() failed: {:?}", result.error);
@@ -1345,14 +1607,11 @@ mod apply_tests {
         let handler = std::sync::Arc::new(make_handler(Some(mav_tx), Some(pv_tx), sim_state));
 
         let first_handler = handler.clone();
-        let (first_tx, _first_rx) = mpsc::channel(8);
-        let first = tokio::spawn(async move { first_handler.apply(first_tx).await });
+        let first = tokio::spawn(async move { first_handler.apply().await });
 
         // Give the first call a moment to acquire the guard.
         tokio::time::sleep(Duration::from_millis(20)).await;
-
-        let (second_tx, _second_rx) = mpsc::channel(8);
-        let second = handler.apply(second_tx).await;
+        let second = handler.apply().await;
         assert!(!second.success);
         assert!(matches!(second.state, PreflightApplyState::Error));
         assert!(second
@@ -1366,8 +1625,7 @@ mod apply_tests {
 
         // The guard must release once the first call finishes, so a
         // subsequent apply() is not permanently locked out.
-        let (third_tx, _third_rx) = mpsc::channel(8);
-        let third = handler.apply(third_tx).await;
+        let third = handler.apply().await;
         assert!(
             !third
                 .error
@@ -1515,8 +1773,7 @@ mod snapshot_gate_tests {
         let writes = spawn_counting_px4(mav_rx, pv_tx.clone(), false);
 
         let h = handler(mav_tx, pv_tx, Some("uid:aaaa"));
-        let (progress_tx, _progress_rx) = mpsc::channel(64);
-        let result = h.apply(progress_tx).await;
+        let result = h.apply().await;
 
         assert!(!result.success);
         assert_eq!(
@@ -1533,11 +1790,14 @@ mod snapshot_gate_tests {
         let writes = spawn_counting_px4(mav_rx, pv_tx.clone(), true);
 
         let h = handler(mav_tx, pv_tx, Some("uid:aaaa"));
-        // Hold the receiver so the send succeeds, but never acknowledge.
-        let (progress_tx, _progress_rx) = mpsc::channel(64);
+        // A browser is listening — so the snapshot is delivered — but it never
+        // confirms it stored anything.
+        let mut listening = h.subscribe_provisioning();
+        tokio::spawn(async move { while listening.recv().await.is_ok() {} });
 
-        let result =
-            tokio::time::timeout(Duration::from_secs(40), h.apply(progress_tx)).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(40), h.apply())
+            .await
+            .unwrap();
 
         assert!(!result.success);
         assert!(result.error.unwrap().contains("did not confirm"));
@@ -1552,10 +1812,10 @@ mod snapshot_gate_tests {
 
         let h = Arc::new(handler(mav_tx, pv_tx, Some("uid:aaaa")));
         let ack_tx = h.snapshot_ack_sender();
-        let (progress_tx, mut progress_rx) = mpsc::channel(64);
 
+        let mut progress_rx = h.subscribe_provisioning();
         let responder = tokio::spawn(async move {
-            while let Some(msg) = progress_rx.recv().await {
+            while let Ok(msg) = progress_rx.recv().await {
                 if let OutgoingMessage::SnapshotCaptured(captured) = msg {
                     let _ = ack_tx.send(SnapshotStored {
                         board_identity: captured.board_identity,
@@ -1567,7 +1827,7 @@ mod snapshot_gate_tests {
             }
         });
 
-        let result = h.apply(progress_tx).await;
+        let result = h.apply().await;
         let _ = responder.await;
 
         assert!(!result.success);
@@ -1586,11 +1846,9 @@ mod snapshot_gate_tests {
         let writes = spawn_counting_px4(mav_rx, pv_tx.clone(), true);
 
         let h = handler(mav_tx, pv_tx, Some("uid:aaaa"));
-        let (progress_tx, progress_rx) = mpsc::channel(64);
-        // The tab goes away before the snapshot can be delivered.
-        drop(progress_rx);
-
-        let result = h.apply(progress_tx).await;
+        // No browser is subscribed, standing in for the tab going away before
+        // the snapshot can be delivered.
+        let result = h.apply().await;
         assert!(!result.success);
         assert_eq!(*writes.lock().unwrap(), 0);
     }
@@ -1604,8 +1862,7 @@ mod snapshot_gate_tests {
         // A board with no distinguishing serial: a snapshot could not be tied
         // back to it, so provisioning must not start.
         let h = handler(mav_tx, pv_tx, None);
-        let (progress_tx, _progress_rx) = mpsc::channel(64);
-        let result = h.apply(progress_tx).await;
+        let result = h.apply().await;
 
         assert!(!result.success);
         assert!(result.error.unwrap().contains("identifying serial"));
@@ -1625,5 +1882,422 @@ mod snapshot_gate_tests {
         for (name, _) in HITL_SUPPORT_PARAMS_F32 {
             assert!(names.contains(name), "{name} is written but not captured");
         }
+    }
+}
+
+#[cfg(test)]
+mod reapply_tests {
+    use super::*;
+    use crossbeam_channel::bounded;
+    use simulation::{SimulationConfig, SimulationState};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Answers reads and acks writes. Counts reboots so a test can make the
+    /// board "fail to take" the first time and succeed the second.
+    fn spawn_px4(
+        mav_rx: crossbeam_channel::Receiver<MavMessage>,
+        param_value_tx: broadcast::Sender<ParamValue>,
+    ) -> Arc<AtomicUsize> {
+        let writes = Arc::new(AtomicUsize::new(0));
+        let writes_clone = writes.clone();
+        tokio::task::spawn_blocking(move || {
+            while let Ok(msg) = mav_rx.recv() {
+                match msg {
+                    MavMessage::PARAM_SET(p) => {
+                        writes_clone.fetch_add(1, Ordering::SeqCst);
+                        let name = crate::param_io::decode_param_id(&p.param_id);
+                        let _ = param_value_tx.send(ParamValue {
+                            name,
+                            value: p.param_value,
+                            param_type: p.param_type,
+                            index: 0,
+                        });
+                    }
+                    MavMessage::PARAM_REQUEST_READ(req) => {
+                        let name = crate::param_io::decode_param_id(&req.param_id);
+                        if !name.is_empty() {
+                            let _ = param_value_tx.send(ParamValue {
+                                name,
+                                value: 0.0,
+                                param_type: MavParamType::MAV_PARAM_TYPE_INT32,
+                                index: 0,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+        writes
+    }
+
+    fn fast_handler(sim_state: SimulationState) -> (PreflightHandler, Arc<AtomicUsize>) {
+        let (mav_tx, mav_rx) = bounded::<MavMessage>(512);
+        let (pv_tx, _) = broadcast::channel::<ParamValue>(512);
+        let writes = spawn_px4(mav_rx, pv_tx.clone());
+        let (nsh_tx, mut nsh_rx) = mpsc::channel::<ValidatedNshCommand>(8);
+        tokio::spawn(async move { while nsh_rx.recv().await.is_some() {} });
+
+        let handler = PreflightHandler::with_identity(
+            Some(mav_tx),
+            Some(pv_tx),
+            Some(nsh_tx),
+            sim_state,
+            Arc::new(tokio::sync::RwLock::new(Some(BoardIdentity::from_raw_for_test(
+                "uid:testboard",
+            )))),
+        )
+        .with_fast_capture();
+        (handler, writes)
+    }
+
+    #[test]
+    fn only_a_verification_failure_is_retryable() {
+        // Pushing the same values again cannot fix an unacked PARAM_SET or a
+        // board that never came back, and retrying would just write flash.
+        assert!(ApplyFailure::retryable("did not take effect").retryable);
+        assert!(!ApplyFailure::fatal("FC did not reconnect after reboot").retryable);
+    }
+
+    #[test]
+    fn the_retry_budget_is_bounded() {
+        // Each cycle commits parameters to flash; an unbounded retry on a board
+        // that will never verify would wear it out.
+        assert!(PROVISION_ATTEMPTS >= 2, "one attempt would defeat the point");
+        assert!(PROVISION_ATTEMPTS <= 3, "flash wear grows with every cycle");
+    }
+
+    #[tokio::test]
+    async fn a_failed_verification_is_re_applied_and_can_then_succeed() {
+        let sim_state = SimulationState::new(SimulationConfig::default());
+        let (handler, writes) = fast_handler(sim_state.clone());
+        let handler = Arc::new(handler);
+        let ack_tx = handler.snapshot_ack_sender();
+        let sim_for_reboots = sim_state.clone();
+
+        // Models a board that comes back wrong the first time and correct the
+        // second. Each Reconnecting stage bumps the heartbeat counter so the
+        // reconnect wait completes.
+        let mut progress_rx = handler.subscribe_provisioning();
+        let driver = tokio::spawn(async move {
+            let mut reconnects = 0;
+            while let Ok(msg) = progress_rx.recv().await {
+                match msg {
+                    OutgoingMessage::SnapshotCaptured(captured) => {
+                        let _ = ack_tx.send(SnapshotStored {
+                            board_identity: captured.board_identity,
+                            stored: true,
+                            error: None,
+                        });
+                    }
+                    OutgoingMessage::PreflightApplyResult(r)
+                        if matches!(r.state, PreflightApplyState::Reconnecting) =>
+                    {
+                        reconnects += 1;
+                        let took_effect = reconnects >= 2;
+                        let sim = sim_for_reboots.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(4200)).await;
+                            sim.set_heartbeat_status(took_effect, took_effect);
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            reconnects
+        });
+
+        let result = handler.apply().await;
+        drop(handler);
+        let reconnects = driver.await.unwrap();
+
+        assert!(result.success, "re-apply should have succeeded: {:?}", result.error);
+        assert_eq!(reconnects, 2, "the board should have been provisioned twice");
+        // Two full parameter pushes, not one: the second cycle re-wrote them.
+        assert!(
+            writes.load(Ordering::SeqCst) > PreflightHandler::provisioned_param_names().len(),
+            "the second attempt must actually re-push the parameters"
+        );
+    }
+}
+
+#[cfg(test)]
+mod restore_tests {
+    use super::*;
+    use crossbeam_channel::bounded;
+    use simulation::{SimulationConfig, SimulationState};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    /// A board that remembers what was written to it, so a restore can be
+    /// checked against what it actually now holds.
+    fn spawn_stateful_px4(
+        mav_rx: crossbeam_channel::Receiver<MavMessage>,
+        param_value_tx: broadcast::Sender<ParamValue>,
+        // Parameters this board refuses to actually change, modelling a value
+        // that does not survive the write.
+        stuck: Vec<&'static str>,
+    ) -> Arc<Mutex<HashMap<String, f32>>> {
+        let state = Arc::new(Mutex::new(HashMap::<String, f32>::new()));
+        let state_clone = state.clone();
+        tokio::task::spawn_blocking(move || {
+            while let Ok(msg) = mav_rx.recv() {
+                match msg {
+                    MavMessage::PARAM_SET(p) => {
+                        let name = crate::param_io::decode_param_id(&p.param_id);
+                        if !stuck.contains(&name.as_str()) {
+                            state_clone.lock().unwrap().insert(name.clone(), p.param_value);
+                        }
+                        // PX4 acks with the value it was asked to set, even
+                        // when the stored value ends up different.
+                        let _ = param_value_tx.send(ParamValue {
+                            name,
+                            value: p.param_value,
+                            param_type: p.param_type,
+                            index: 0,
+                        });
+                    }
+                    MavMessage::PARAM_REQUEST_READ(req) => {
+                        let name = crate::param_io::decode_param_id(&req.param_id);
+                        if name.is_empty() {
+                            continue;
+                        }
+                        let value = *state_clone.lock().unwrap().get(&name).unwrap_or(&0.0);
+                        let _ = param_value_tx.send(ParamValue {
+                            name,
+                            value,
+                            param_type: MavParamType::MAV_PARAM_TYPE_INT32,
+                            index: 0,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        });
+        state
+    }
+
+    fn handler_for(
+        identity: Option<&str>,
+        stuck: Vec<&'static str>,
+        sim_state: SimulationState,
+    ) -> (Arc<PreflightHandler>, Arc<Mutex<HashMap<String, f32>>>) {
+        let (mav_tx, mav_rx) = bounded::<MavMessage>(512);
+        let (pv_tx, _) = broadcast::channel::<ParamValue>(512);
+        let board = spawn_stateful_px4(mav_rx, pv_tx.clone(), stuck);
+        let (nsh_tx, mut nsh_rx) = mpsc::channel::<ValidatedNshCommand>(8);
+        tokio::spawn(async move { while nsh_rx.recv().await.is_some() {} });
+
+        let handler = PreflightHandler::with_identity(
+            Some(mav_tx),
+            Some(pv_tx),
+            Some(nsh_tx),
+            sim_state,
+            Arc::new(tokio::sync::RwLock::new(
+                identity.map(BoardIdentity::from_raw_for_test),
+            )),
+        )
+        .with_fast_capture();
+        (Arc::new(handler), board)
+    }
+
+    fn request(board: &str) -> RestoreSnapshot {
+        RestoreSnapshot {
+            board_identity: board.to_string(),
+            params: vec![
+                SnapshotParam {
+                    name: "SYS_HITL".to_string(),
+                    value: 0.0,
+                    param_type: "int32".to_string(),
+                },
+                SnapshotParam {
+                    name: "COM_ARM_SDCARD".to_string(),
+                    value: 1.0,
+                    param_type: "int32".to_string(),
+                },
+            ],
+        }
+    }
+
+    /// Advance the fake board through the reboot so the reconnect wait ends.
+    fn drive_reconnect(sim_state: SimulationState, mut rx: broadcast::Receiver<OutgoingMessage>) {
+        tokio::spawn(async move {
+            while let Ok(msg) = rx.recv().await {
+                if let OutgoingMessage::RestoreResult(r) = msg {
+                    if matches!(r.state, RestoreState::Reconnecting) {
+                        let sim = sim_state.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(4200)).await;
+                            sim.set_heartbeat_status(false, true);
+                        });
+                    }
+                }
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn restore_writes_every_parameter_and_confirms_it() {
+        let sim_state = SimulationState::new(SimulationConfig::default());
+        let (handler, board) = handler_for(Some("uid:aaaa"), vec![], sim_state.clone());
+        drive_reconnect(sim_state, handler.subscribe_provisioning());
+
+        let result = handler.restore(request("uid:aaaa")).await;
+
+        assert!(result.success, "restore failed: {:?}", result.error);
+        assert!(matches!(result.state, RestoreState::Done));
+        assert!(result.mismatches.is_empty());
+        // The board stores what arrived on the wire, and PX4 carries an
+        // integer as the bit pattern of the int32 inside the float field.
+        let decode = |v: f32| v.to_bits() as i32;
+        let held = board.lock().unwrap();
+        assert_eq!(held.get("SYS_HITL").copied().map(decode), Some(0));
+        assert_eq!(held.get("COM_ARM_SDCARD").copied().map(decode), Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_parameter_that_did_not_take_is_reported_and_the_board_is_not_called_restored() {
+        let sim_state = SimulationState::new(SimulationConfig::default());
+        // COM_ARM_SDCARD acks but never actually changes.
+        let (handler, _board) =
+            handler_for(Some("uid:aaaa"), vec!["COM_ARM_SDCARD"], sim_state.clone());
+        drive_reconnect(sim_state, handler.subscribe_provisioning());
+
+        let result = handler.restore(request("uid:aaaa")).await;
+
+        assert!(!result.success, "a board with a stuck parameter is not restored");
+        assert_eq!(result.mismatches.len(), 1);
+        let mismatch = &result.mismatches[0];
+        assert_eq!(mismatch.name, "COM_ARM_SDCARD");
+        assert_eq!(mismatch.expected, 1.0);
+        assert_eq!(mismatch.actual, 0.0);
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_from_another_board_is_refused_without_writing() {
+        let sim_state = SimulationState::new(SimulationConfig::default());
+        let (handler, board) = handler_for(Some("uid:aaaa"), vec![], sim_state);
+
+        let result = handler.restore(request("uid:bbbb")).await;
+
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("different flight controller"));
+        assert!(
+            board.lock().unwrap().is_empty(),
+            "nothing may be written when the snapshot belongs to another board"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_is_refused_when_the_board_has_no_identity() {
+        let sim_state = SimulationState::new(SimulationConfig::default());
+        let (handler, board) = handler_for(None, vec![], sim_state);
+
+        let result = handler.restore(request("uid:aaaa")).await;
+
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("no identifying serial"));
+        assert!(board.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn restore_is_refused_in_sim_only_mode() {
+        let handler = PreflightHandler::new(
+            None,
+            None,
+            None,
+            SimulationState::new(SimulationConfig::default()),
+        );
+        let result = handler.restore(request("uid:aaaa")).await;
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("sim-only"));
+    }
+
+    #[tokio::test]
+    async fn an_empty_snapshot_is_refused() {
+        let sim_state = SimulationState::new(SimulationConfig::default());
+        let (handler, board) = handler_for(Some("uid:aaaa"), vec![], sim_state);
+
+        let result = handler
+            .restore(RestoreSnapshot {
+                board_identity: "uid:aaaa".to_string(),
+                params: vec![],
+            })
+            .await;
+
+        assert!(!result.success);
+        assert!(board.lock().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod broadcast_tests {
+    use super::*;
+    use crossbeam_channel::bounded;
+    use simulation::{SimulationConfig, SimulationState};
+
+    #[tokio::test]
+    async fn every_subscribed_client_sees_the_same_progress() {
+        // A second tab, or a page reloaded mid-provisioning, has to converge on
+        // the same state. Previously progress went only to the connection that
+        // asked, so anyone else saw nothing at all.
+        let (mav_tx, _mav_rx) = bounded::<MavMessage>(64);
+        let (pv_tx, _) = broadcast::channel::<ParamValue>(64);
+        let handler = PreflightHandler::with_identity(
+            Some(mav_tx),
+            Some(pv_tx),
+            None,
+            SimulationState::new(SimulationConfig::default()),
+            // No identity: apply fails immediately, which is enough to prove
+            // both subscribers receive the same terminal frame.
+            Arc::new(tokio::sync::RwLock::new(None)),
+        )
+        .with_fast_capture();
+
+        let mut first = handler.subscribe_provisioning();
+        let mut second = handler.subscribe_provisioning();
+
+        let result = handler.apply().await;
+        assert!(!result.success);
+
+        let first_msg = first.recv().await.expect("first client receives");
+        let second_msg = second.recv().await.expect("second client receives");
+
+        let describe = |msg: &OutgoingMessage| match msg {
+            OutgoingMessage::PreflightApplyResult(r) => format!("{:?}", r.state),
+            other => format!("{other:?}"),
+        };
+        assert_eq!(describe(&first_msg), describe(&second_msg));
+    }
+
+    #[tokio::test]
+    async fn a_client_that_subscribes_late_still_receives_the_terminal_result() {
+        let (mav_tx, _mav_rx) = bounded::<MavMessage>(64);
+        let (pv_tx, _) = broadcast::channel::<ParamValue>(64);
+        let handler = Arc::new(
+            PreflightHandler::with_identity(
+                Some(mav_tx),
+                Some(pv_tx),
+                None,
+                SimulationState::new(SimulationConfig::default()),
+                Arc::new(tokio::sync::RwLock::new(None)),
+            )
+            .with_fast_capture(),
+        );
+
+        // Subscribes before the terminal frame but after the run began.
+        let mut late = handler.subscribe_provisioning();
+        let result = handler.apply().await;
+        assert!(!result.success);
+
+        let mut saw_terminal = false;
+        while let Ok(msg) = late.try_recv() {
+            if let OutgoingMessage::PreflightApplyResult(r) = msg {
+                if matches!(r.state, PreflightApplyState::Error) {
+                    saw_terminal = true;
+                }
+            }
+        }
+        assert!(saw_terminal, "a late subscriber must still learn how it ended");
     }
 }
