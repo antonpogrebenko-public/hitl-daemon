@@ -801,7 +801,17 @@ impl PreflightHandler {
             }
         }
 
-        let _ = mav_tx.try_send(make_param_save());
+        // Never reboot without knowing the save was at least handed to the
+        // writer. A dropped PARAM_SAVE means the values live only in PX4's RAM,
+        // so the reboot below would silently discard everything just written —
+        // and rebooting while the flash state is uncertain is how a board ends
+        // up stuck in its bootloader.
+        if let Err(e) = send_with_backpressure(mav_tx, make_param_save(), "PARAM_SAVE").await {
+            return restore_error(format!(
+                "{e} The values were written but not saved, and the flight controller was \
+                 not rebooted."
+            ));
+        }
         tokio::time::sleep(PARAM_SAVE_SETTLE_DELAY).await;
 
         let baseline_count = self.sim_state.heartbeat_status().0;
@@ -998,9 +1008,16 @@ impl PreflightHandler {
             }
         }
 
-        match mav_tx.try_send(make_param_save()) {
-            Ok(()) => {}
-            Err(e) => warn!(error = ?e, "Failed to send PARAM_SAVE before preflight reboot"),
+        // A warning here used to be the whole response, and the reboot went
+        // ahead regardless. That reboots a board whose flash state is unknown,
+        // which is exactly the condition that leaves one stuck in its
+        // bootloader — and at best silently discards the parameters just
+        // pushed, since PARAM_SET only writes RAM.
+        if let Err(e) = send_with_backpressure(mav_tx, make_param_save(), "PARAM_SAVE").await {
+            return Err(ApplyFailure::fatal(format!(
+                "{e} The parameters were written but not saved, and the flight controller \
+                 was not rebooted."
+            )));
         }
 
         // Let PX4's async flash commit finish before the reboot resets the
@@ -2573,5 +2590,65 @@ mod cooldown_tests {
         // PARAM_SAVE_SETTLE_DELAY (2s) + PX4's 3-5s bootloader dwell, with
         // margin. Shorter would reopen the window this exists to close.
         assert!(CYCLE_COOLDOWN >= Duration::from_secs(10));
+    }
+}
+
+#[cfg(test)]
+mod param_save_tests {
+    use super::*;
+    use crossbeam_channel::bounded;
+
+    #[tokio::test]
+    async fn a_permanently_full_queue_is_reported_rather_than_dropped() {
+        // The condition that matters: nothing is draining, so the message can
+        // never go out. Previously PARAM_SAVE was fire-and-forget here, and the
+        // reboot went ahead regardless - rebooting a board whose flash state is
+        // unknown, having silently discarded the parameters just pushed, since
+        // PARAM_SET only writes RAM.
+        let (mav_tx, mav_rx) = bounded::<MavMessage>(1);
+        mav_tx.try_send(make_param_save()).expect("fills the queue");
+        // Held, never read: the queue stays full for the whole attempt.
+        let _held = mav_rx;
+
+        let started = tokio::time::Instant::now();
+        let result = send_with_backpressure(&mav_tx, make_param_save(), "PARAM_SAVE").await;
+
+        assert!(result.is_err(), "a queue that never drains must be reported");
+        assert!(result.unwrap_err().contains("not accepting writes"));
+        // Bounded: it gives up rather than blocking provisioning forever.
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn a_queue_that_drains_lets_the_message_through() {
+        let (mav_tx, mav_rx) = bounded::<MavMessage>(1);
+        mav_tx.try_send(make_param_save()).expect("fills the queue");
+
+        // A consumer appears shortly after, as the real writer does.
+        tokio::task::spawn_blocking(move || {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            while mav_rx.recv().is_ok() {}
+        });
+
+        assert!(send_with_backpressure(&mav_tx, make_param_save(), "PARAM_SAVE")
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_disconnected_writer_is_reported_as_a_lost_link_not_backpressure() {
+        let (mav_tx, mav_rx) = bounded::<MavMessage>(1);
+        drop(mav_rx);
+        let err = send_with_backpressure(&mav_tx, make_param_save(), "SYS_HITL")
+            .await
+            .unwrap_err();
+        assert!(err.contains("Lost the link"), "{err}");
+    }
+
+    #[test]
+    fn the_save_settle_delay_covers_a_multi_parameter_commit() {
+        // PX4 commits each dirty parameter as its own flash write, and
+        // provisioning dirties ~21. Sized for that, not for a single write.
+        assert!(PARAM_SAVE_SETTLE_DELAY >= Duration::from_millis(1500));
     }
 }
