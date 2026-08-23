@@ -5,6 +5,23 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.1] - 2026-08-23
+
+### Fixed
+
+- **Restoring a flight controller's original settings could not work at all.**
+  The WebSocket server capped incoming messages at 1 KB, and a restore carries
+  the whole parameter snapshot — 21 entries of name, value and type, about
+  1.2 KB. The daemon rejected a message it had asked the browser to send, at
+  the WebSocket layer, before any handler could log it, and closed the
+  connection. The interface sat on "Writing your original settings" forever,
+  over a board nothing had written to.
+
+  The limit is now 64 KB: room for a snapshot several times larger than any
+  board's parameter set, still bounded against a local client making the daemon
+  buffer without limit. A test builds the real payload and fails if it no
+  longer fits.
+
 ## [0.18.0] - 2026-08-23
 
 ### Added

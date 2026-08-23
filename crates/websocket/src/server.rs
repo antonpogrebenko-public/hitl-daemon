@@ -468,8 +468,19 @@ async fn health_handler() -> impl IntoResponse {
     "OK"
 }
 
-/// Maximum allowed incoming WebSocket message size (1 KB)
-const MAX_INCOMING_MESSAGE_SIZE: usize = 1024;
+/// Maximum allowed incoming WebSocket message size.
+///
+/// 1 KB was too small for the largest message this protocol defines. A restore
+/// carries the board's whole parameter snapshot — 21 entries of name, value and
+/// type serialise to roughly 1.2 KB — so the daemon rejected a message it had
+/// asked the browser to send, at the WebSocket layer, before any handler could
+/// log it. The connection was closed and the interface waited forever on a
+/// restore that never started.
+///
+/// 64 KB leaves room for a snapshot several times larger than any board's
+/// current parameter set while still bounding what an unauthenticated local
+/// client can make the daemon buffer.
+const MAX_INCOMING_MESSAGE_SIZE: usize = 64 * 1024;
 
 /// How often the server sends a WebSocket Ping frame to each client
 const PING_INTERVAL: Duration = Duration::from_secs(5);
@@ -826,5 +837,64 @@ mod tests {
         let server = WebSocketServer::new(config);
         assert_eq!(server.config.port, 8080);
         assert_eq!(server.config.update_rate_hz, 60);
+    }
+}
+
+#[cfg(test)]
+mod message_size_tests {
+    use super::MAX_INCOMING_MESSAGE_SIZE;
+
+    /// A realistic restore payload: every parameter provisioning writes, with
+    /// names and types, as the browser actually sends it.
+    fn restore_frame_size(param_count: usize) -> usize {
+        let params: Vec<serde_json::Value> = (0..param_count)
+            .map(|i| {
+                serde_json::json!({
+                    // Names dominate the payload. PX4 caps them at 16
+                    // characters, so a full-length name is the honest worst case.
+                    "name": format!("PARAM_NAME_{i:05}"),
+                    "value": 1.2345,
+                    "param_type": "real32",
+                })
+            })
+            .collect();
+        // Built as the browser builds it, rather than by serialising the
+        // incoming type — which is deserialize-only, and whose field order the
+        // browser does not have to match anyway.
+        let body = serde_json::json!({
+            "board_identity": "uid:3034510f33323831",
+            "params": params,
+        });
+        // 1 type byte + JSON body, matching the browser's framing.
+        1 + serde_json::to_vec(&body)
+            .expect("restore request serialises")
+            .len()
+    }
+
+    #[test]
+    fn a_full_restore_fits_within_the_incoming_message_limit() {
+        // The limit was 1 KB and a 21-parameter restore is ~1.2 KB, so the
+        // daemon rejected a message it had asked the browser to send — at the
+        // WebSocket layer, before any handler could log it. The connection was
+        // closed and the interface waited forever on a restore that never
+        // started.
+        let size = restore_frame_size(21);
+        assert!(
+            size > 1024,
+            "the payload that broke this must still exceed the old 1 KB limit, \
+             or this test no longer guards anything (was {size} bytes)"
+        );
+        assert!(
+            size < MAX_INCOMING_MESSAGE_SIZE,
+            "a 21-parameter restore ({size} bytes) must fit in \
+             MAX_INCOMING_MESSAGE_SIZE ({MAX_INCOMING_MESSAGE_SIZE})"
+        );
+    }
+
+    #[test]
+    fn the_limit_leaves_room_for_a_far_larger_snapshot() {
+        // Provisioning writes ~21 parameters today. A future one that writes
+        // ten times as many must not silently hit the same wall.
+        assert!(restore_frame_size(210) < MAX_INCOMING_MESSAGE_SIZE);
     }
 }
