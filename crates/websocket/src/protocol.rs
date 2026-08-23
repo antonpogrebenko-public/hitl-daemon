@@ -603,7 +603,8 @@ pub struct AppliedConfig {
 ///
 /// ## Binary format (0x0A)
 /// - `[0]`: 0x0A message type
-/// - `[1-N]`: JSON body `{ "connected": bool, "hitl_enabled": bool, "is_quadrotor": bool }`
+/// - `[1-N]`: JSON body `{ "connected": bool, "hitl_enabled": bool,
+///   "is_quadrotor": bool, "readiness": string, "board_identity"?: string }`
 #[derive(Debug, Clone, Serialize)]
 pub struct PreflightStatus {
     /// Whether any HEARTBEAT has ever been received (false in --sim-only or
@@ -618,6 +619,15 @@ pub struct PreflightStatus {
     /// yet". Collapsing those let the browser fall straight through the gate
     /// while a board was still booting — the most common first-run state.
     pub readiness: PreflightReadiness,
+    /// Which board this is, once it has reported enough to say.
+    ///
+    /// Sent here rather than only with the snapshot, because the browser needs
+    /// to know *which* board it is asking the user about before any write
+    /// happens. Carrying it only in the snapshot made identity available only
+    /// during provisioning — after the point where consent for that
+    /// provisioning is sought, which left approval unable to name its subject.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub board_identity: Option<String>,
 }
 
 /// Whether the connected flight controller is ready for HITL.
@@ -1447,6 +1457,7 @@ mod tests {
             hitl_enabled: false,
             is_quadrotor: true,
             readiness: PreflightReadiness::NotReady,
+            board_identity: Some("uid:0011223344556677".to_string()),
         };
         let bytes = status.to_bytes();
         assert_eq!(bytes[0], MSG_TYPE_PREFLIGHT_STATUS);
@@ -1458,8 +1469,15 @@ mod tests {
         // readiness is the field the browser gates on; connected alone is
         // ambiguous between "no FC expected" and "FC has not reported yet".
         assert_eq!(body["readiness"], serde_json::json!("not_ready"));
-        // Exactly those four keys — no stray or renamed fields.
-        assert_eq!(body.as_object().unwrap().len(), 4);
+        // The browser must know which board it is asking the user about
+        // before any write, so identity travels with status rather than only
+        // with the snapshot - which is captured after consent is sought.
+        assert_eq!(
+            body["board_identity"],
+            serde_json::json!("uid:0011223344556677")
+        );
+        // Exactly those five keys — no stray or renamed fields.
+        assert_eq!(body.as_object().unwrap().len(), 5);
     }
 
     /// Pins the snake_case rendering of `PreflightApplyState` (the frontend's
@@ -1791,5 +1809,26 @@ mod capabilities_tests {
                 "{feature} is not a stable snake_case identifier"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod preflight_identity_tests {
+    use super::*;
+
+    #[test]
+    fn a_board_that_has_not_identified_itself_omits_the_field() {
+        // Absent rather than an empty string: the browser distinguishes "no
+        // identity yet" from a real one, and an empty string would be treated
+        // as a board that could be approved.
+        let status = PreflightStatus {
+            connected: false,
+            hitl_enabled: false,
+            is_quadrotor: false,
+            readiness: PreflightReadiness::Unknown,
+            board_identity: None,
+        };
+        let body: serde_json::Value = serde_json::from_slice(&status.to_bytes()[1..]).unwrap();
+        assert!(body.get("board_identity").is_none());
     }
 }

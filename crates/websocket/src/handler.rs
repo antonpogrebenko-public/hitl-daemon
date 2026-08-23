@@ -252,6 +252,7 @@ impl ConnectionHandler {
                         // No preflight handler configured at all, so there is
                         // no board this session could gate on.
                         readiness: PreflightReadiness::NotApplicable,
+                        board_identity: None,
                     },
                 };
                 Ok(Some(OutgoingMessage::PreflightStatus(status)))

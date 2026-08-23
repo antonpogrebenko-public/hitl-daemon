@@ -565,6 +565,15 @@ impl PreflightHandler {
             hitl_enabled,
             is_quadrotor,
             readiness,
+            // Read here rather than derived: identity comes from
+            // AUTOPILOT_VERSION as soon as the board reports, independently of
+            // whether it has ever been provisioned.
+            board_identity: self
+                .board_identity
+                .read()
+                .await
+                .as_ref()
+                .map(|id| id.as_str().to_string()),
         }
     }
 

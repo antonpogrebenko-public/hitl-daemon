@@ -5,6 +5,18 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.0] - 2026-08-23
+
+### Added
+
+- `PreflightStatus` now carries `board_identity` once the board has reported
+  it. Identity previously reached the browser only with the parameter
+  snapshot, which is captured *during* provisioning — after the point where
+  approval for that provisioning is sought. Anything scoped to a board, such
+  as asking the user to approve changing it, therefore could not name its
+  subject and could not proceed. The field is optional, so an older client
+  ignores it.
+
 ## [0.17.0] - 2026-08-23
 
 ### Added
