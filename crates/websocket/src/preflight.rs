@@ -287,6 +287,15 @@ async fn await_snapshot_ack(
 /// unbounded retry on a board that will never verify would wear it out.
 const PROVISION_ATTEMPTS: u8 = 2;
 
+/// How long the flight controller is left alone after a write-and-reboot cycle.
+///
+/// Covers PX4's flash commit (`PARAM_SAVE_SETTLE_DELAY`, 2s) plus its 3-5s
+/// bootloader dwell, with margin. Starting a second cycle inside this window
+/// can interrupt the commit and leave the parameter store corrupted — the
+/// board then reports `PX4 BL FMU` indefinitely and needs a physical power
+/// cycle, which no amount of retrying from here can undo.
+const CYCLE_COOLDOWN: Duration = Duration::from_secs(15);
+
 /// Why one provisioning cycle failed, and whether repeating it could help.
 struct ApplyFailure {
     message: String,
@@ -348,6 +357,16 @@ pub struct PreflightHandler {
     read_policy: ParamReadPolicy,
     /// How long to wait for the browser's persistence acknowledgement.
     ack_timeout: Duration,
+    /// When the last write-and-reboot cycle finished.
+    ///
+    /// PX4 commits parameters to flash and then reboots; a second cycle
+    /// starting on the heels of the first can interrupt that commit and leave
+    /// the parameter store corrupted, with the board stuck in its bootloader
+    /// until it is physically power-cycled. Observed on real hardware.
+    last_cycle_finished: std::sync::Mutex<Option<std::time::Instant>>,
+    /// How long to leave the board alone after a write cycle. Shortened in
+    /// tests; production always uses `CYCLE_COOLDOWN`.
+    cycle_cooldown: Duration,
     /// Provisioning lifecycle, fanned out to every connected client.
     ///
     /// One path rather than a per-connection channel: a reloaded page, a
@@ -392,6 +411,8 @@ impl PreflightHandler {
             session_snapshot: Arc::new(SessionSnapshot::new()),
             read_policy: ParamReadPolicy::default(),
             ack_timeout: SNAPSHOT_ACK_TIMEOUT,
+            last_cycle_finished: std::sync::Mutex::new(None),
+            cycle_cooldown: CYCLE_COOLDOWN,
             provisioning_tx: {
                 let (tx, _) = broadcast::channel(64);
                 tx
@@ -412,6 +433,13 @@ impl PreflightHandler {
             retries: 1,
         };
         self.ack_timeout = Duration::from_millis(200);
+        self
+    }
+
+    /// Shorten the post-cycle cooldown. Test-only.
+    #[cfg(test)]
+    pub fn with_cooldown(mut self, cooldown: Duration) -> Self {
+        self.cycle_cooldown = cooldown;
         self
     }
 
@@ -555,7 +583,26 @@ impl PreflightHandler {
     /// blocking-await serialization that used to make this a non-issue is
     /// gone — this guard replaces it.
     pub async fn apply(&self) -> PreflightApplyResult {
+        if let Some(remaining) = self.cooldown_remaining() {
+            let result = PreflightApplyResult {
+                state: PreflightApplyState::Error,
+                success: false,
+                error: Some(format!(
+                    "The flight controller is still restarting from the previous change. \
+                     Wait {}s and try again — writing now risks corrupting its settings.",
+                    remaining.as_secs() + 1
+                )),
+            };
+            let _ = self
+                .provisioning_tx
+                .send(OutgoingMessage::PreflightApplyResult(result.clone()));
+            return result;
+        }
+
         let result = self.apply_inner().await;
+        // Any cycle that got as far as writing leaves the board settling,
+        // whether it succeeded or not.
+        self.mark_cycle_finished();
         // Terminal outcome reaches every client, not just whoever asked: a
         // reloaded page or a second tab needs to learn how this ended.
         let _ = self
@@ -649,7 +696,20 @@ impl PreflightHandler {
     /// writing one aircraft's tuning onto another produces a vehicle that
     /// looks configured and flies wrong.
     pub async fn restore(&self, request: RestoreSnapshot) -> RestoreResult {
+        if let Some(remaining) = self.cooldown_remaining() {
+            let result = restore_error(format!(
+                "The flight controller is still restarting from the previous change. \
+                 Wait {}s and try again — writing now risks corrupting its settings.",
+                remaining.as_secs() + 1
+            ));
+            let _ = self
+                .provisioning_tx
+                .send(OutgoingMessage::RestoreResult(result.clone()));
+            return result;
+        }
+
         let result = self.restore_inner(request).await;
+        self.mark_cycle_finished();
         let _ = self
             .provisioning_tx
             .send(OutgoingMessage::RestoreResult(result.clone()));
@@ -814,6 +874,31 @@ impl PreflightHandler {
             error: None,
             mismatches: Vec::new(),
         }
+    }
+
+    /// Whether the board is still settling from the previous write cycle.
+    ///
+    /// Returns the remaining wait, or `None` when it is safe to proceed.
+    fn cooldown_remaining(&self) -> Option<Duration> {
+        let guard = self
+            .last_cycle_finished
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let finished = (*guard)?;
+        let elapsed = finished.elapsed();
+        if elapsed >= self.cycle_cooldown {
+            None
+        } else {
+            Some(self.cycle_cooldown - elapsed)
+        }
+    }
+
+    /// Stamp the end of a write cycle, opening the cooldown window.
+    fn mark_cycle_finished(&self) {
+        *self
+            .last_cycle_finished
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
     }
 
     fn broadcast_progress(&self, state: PreflightApplyState) {
@@ -2386,5 +2471,107 @@ mod broadcast_tests {
             }
         }
         assert!(saw_terminal, "a late subscriber must still learn how it ended");
+    }
+}
+
+#[cfg(test)]
+mod cooldown_tests {
+    use super::*;
+    use crossbeam_channel::bounded;
+    use simulation::{SimulationConfig, SimulationState};
+
+    /// A handler with no identity: apply and restore both refuse quickly, so
+    /// these tests exercise the cooldown gate rather than a full write cycle.
+    fn handler(cooldown: Duration) -> PreflightHandler {
+        let (mav_tx, _rx) = bounded::<MavMessage>(8);
+        let (pv_tx, _) = broadcast::channel::<ParamValue>(8);
+        let (nsh_tx, _nsh_rx) = mpsc::channel(8);
+        PreflightHandler::with_identity(
+            Some(mav_tx),
+            Some(pv_tx),
+            Some(nsh_tx),
+            SimulationState::new(SimulationConfig::default()),
+            Arc::new(tokio::sync::RwLock::new(None)),
+        )
+        .with_fast_capture()
+        .with_cooldown(cooldown)
+    }
+
+    fn restore_request() -> RestoreSnapshot {
+        RestoreSnapshot {
+            board_identity: "uid:aaaa".to_string(),
+            params: vec![SnapshotParam {
+                name: "SYS_HITL".to_string(),
+                value: 0.0,
+                param_type: "int32".to_string(),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_apply_is_refused_while_the_board_is_settling() {
+        // The hardware failure this prevents: two write-and-reboot cycles in
+        // quick succession interrupted a flash commit and left the board in
+        // its bootloader, recoverable only by a physical power cycle.
+        let h = handler(Duration::from_secs(30));
+        let _first = h.apply().await;
+
+        let second = h.apply().await;
+        assert!(!second.success);
+        let error = second.error.unwrap();
+        assert!(error.contains("still restarting"), "{error}");
+        // Tells the user how long to wait rather than just refusing.
+        assert!(error.contains('s'), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_restore_is_refused_inside_the_window_an_apply_opened() {
+        // Both operations write and reboot, so the window is shared: a restore
+        // landing on a settling board is just as damaging as a second apply.
+        let h = handler(Duration::from_secs(30));
+        let _ = h.apply().await;
+
+        let restore = h.restore(restore_request()).await;
+        assert!(!restore.success);
+        assert!(restore.error.unwrap().contains("still restarting"));
+    }
+
+    #[tokio::test]
+    async fn an_apply_is_refused_inside_the_window_a_restore_opened() {
+        let h = handler(Duration::from_secs(30));
+        let _ = h.restore(restore_request()).await;
+
+        let apply = h.apply().await;
+        assert!(!apply.success);
+        assert!(apply.error.unwrap().contains("still restarting"));
+    }
+
+    #[tokio::test]
+    async fn both_are_allowed_again_once_the_window_has_elapsed() {
+        let h = handler(Duration::from_millis(50));
+        let _ = h.apply().await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        // Still fails for want of a board identity, but no longer for the
+        // cooldown — which is what this asserts.
+        let second = h.apply().await;
+        let error = second.error.unwrap();
+        assert!(!error.contains("still restarting"), "{error}");
+        assert!(error.contains("identifying serial"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn the_first_operation_is_never_blocked() {
+        let h = handler(Duration::from_secs(30));
+        let first = h.apply().await;
+        // Fails on identity, not on a cooldown that nothing has opened yet.
+        assert!(!first.error.unwrap().contains("still restarting"));
+    }
+
+    #[test]
+    fn the_cooldown_covers_flash_commit_plus_boot() {
+        // PARAM_SAVE_SETTLE_DELAY (2s) + PX4's 3-5s bootloader dwell, with
+        // margin. Shorter would reopen the window this exists to close.
+        assert!(CYCLE_COOLDOWN >= Duration::from_secs(10));
     }
 }

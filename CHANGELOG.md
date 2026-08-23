@@ -5,6 +5,11 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.0] - 2026-08-23
+
+### Added
+- **Flash-settle cooldown between write cycles.** A second write-and-reboot cycle starting on the heels of the first can interrupt PX4's flash commit and leave the parameter store corrupted — the board then reports `PX4 BL FMU` indefinitely and needs a physical power cycle, which nothing in software can undo. Provisioning and restore now share a 15s window after any cycle that reached the writing stage, covering `PARAM_SAVE_SETTLE_DELAY` plus PX4's 3-5s bootloader dwell with margin. The refusal names the remaining wait rather than just declining. The pre-existing single-flight guard only covered *concurrent* operations; this covers sequential ones. Observed on real hardware.
+
 ## [0.15.1] - 2026-08-23
 
 ### Fixed
