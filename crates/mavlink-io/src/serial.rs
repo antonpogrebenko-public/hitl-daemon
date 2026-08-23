@@ -78,49 +78,120 @@ fn is_pixhawk_vid(vid: u16) -> bool {
     matches!(vid, VID_3DR | VID_NXP | VID_HOLYBRO_1 | VID_HOLYBRO_2)
 }
 
+/// Whether a USB product string belongs to a board sitting in its bootloader.
+///
+/// PX4 bootloaders announce themselves as `PX4 BL <board>`; the application
+/// firmware drops the `BL` and is routinely renamed by the vendor, so the
+/// bootloader half of the pair is the reliable one to match on. The vendor ID
+/// is identical in both states and cannot separate them.
+///
+/// This distinction is not cosmetic. The bootloader's CDC-ACM endpoint does
+/// not accept a connection, and an `open()` against it does not fail — it
+/// blocks indefinitely, taking the caller with it.
+fn is_bootloader_product(product: Option<&str>) -> bool {
+    let Some(product) = product else {
+        return false;
+    };
+    let upper = product.to_ascii_uppercase();
+    upper.contains("PX4 BL") || upper.contains("BOOTLOADER")
+}
+
+/// One enumerated USB serial port, reduced to what detection needs.
+///
+/// Exists so classification can be tested without hardware attached.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsbPortInfo {
+    pub name: String,
+    pub vid: u16,
+    pub product: Option<String>,
+}
+
+/// Boards matching a known vendor ID, split by whether they can be opened.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PixhawkScan {
+    /// Running application firmware. Safe to open.
+    pub ready: Vec<String>,
+    /// Sitting in the bootloader. Must never be opened — see
+    /// [`is_bootloader_product`].
+    pub bootloader: Vec<String>,
+}
+
+/// Split enumerated ports into boards that are ready and boards still booting.
+pub fn classify_ports(ports: &[UsbPortInfo]) -> PixhawkScan {
+    let mut scan = PixhawkScan::default();
+
+    for port in ports {
+        if !is_pixhawk_vid(port.vid) {
+            continue;
+        }
+
+        // On macOS, prefer /dev/tty.* over /dev/cu.* — the cu variant
+        // doesn't deliver data until DTR is asserted, which tokio-serial
+        // doesn't do by default. The tty variant works immediately.
+        let port_name = maybe_prefer_tty(&port.name);
+
+        if is_bootloader_product(port.product.as_deref()) {
+            if !scan.bootloader.contains(&port_name) {
+                info!(
+                    port = %port_name,
+                    product = port.product.as_deref().unwrap_or("Unknown"),
+                    "Board is in its bootloader — not opening it"
+                );
+                scan.bootloader.push(port_name);
+            }
+            continue;
+        }
+
+        if !scan.ready.contains(&port_name) {
+            scan.ready.push(port_name);
+        }
+    }
+
+    scan
+}
+
 /// Find all serial ports that appear to be PX4-compatible flight controllers
 ///
 /// Detects by USB vendor ID:
 /// - 0x26AC: 3DR
 /// - 0x1FC9: NXP
 /// - 0x2DAE, 0x3162: Holybro
-pub fn find_pixhawk_ports() -> Vec<String> {
+///
+/// A board in its bootloader shares the vendor ID with the same board running
+/// firmware, so the two are reported separately rather than merged.
+pub fn find_pixhawk_ports() -> PixhawkScan {
     let ports = match serialport::available_ports() {
         Ok(p) => p,
         Err(e) => {
             warn!(error = %e, "Failed to enumerate serial ports");
-            return Vec::new();
+            return PixhawkScan::default();
         }
     };
 
-    let mut pixhawk_ports = Vec::new();
-
+    let mut candidates = Vec::new();
     for port in ports {
         debug!(port = %port.port_name, "Checking serial port");
 
         if let SerialPortType::UsbPort(usb_info) = &port.port_type {
             if is_pixhawk_vid(usb_info.vid) {
-                // On macOS, prefer /dev/tty.* over /dev/cu.* — the cu variant
-                // doesn't deliver data until DTR is asserted, which tokio-serial
-                // doesn't do by default. The tty variant works immediately.
-                let port_name = maybe_prefer_tty(&port.port_name);
-
                 info!(
-                    port = %port_name,
+                    port = %port.port_name,
                     vid = format!("0x{:04X}", usb_info.vid),
                     pid = format!("0x{:04X}", usb_info.pid),
                     manufacturer = usb_info.manufacturer.as_deref().unwrap_or("Unknown"),
                     product = usb_info.product.as_deref().unwrap_or("Unknown"),
                     "Found PX4 board"
                 );
-                if !pixhawk_ports.contains(&port_name) {
-                    pixhawk_ports.push(port_name);
-                }
             }
+            candidates.push(UsbPortInfo {
+                name: port.port_name.clone(),
+                vid: usb_info.vid,
+                product: usb_info.product.clone(),
+            });
         }
     }
 
-    pixhawk_ports
+    classify_ports(&candidates)
 }
 
 /// Per-port budget for a heartbeat probe.
@@ -141,20 +212,41 @@ pub struct DetectionOutcome {
     pub examined: Vec<String>,
     /// True when the port was adopted by probing rather than by vendor ID.
     pub adopted_by_probe: bool,
+    /// Ports holding a recognised board that is still in its bootloader.
+    ///
+    /// Reported separately from `found` because the board *is* there — the
+    /// caller should say "still starting up" and wait, not "no board found".
+    /// It must not be opened; see [`is_bootloader_product`].
+    pub bootloader: Vec<String>,
 }
 
 /// Locate a flight controller, falling back to probing when no vendor ID matches.
 ///
 /// The allowlist runs first so recognised hardware never pays for probing.
 pub fn detect_flight_controller() -> DetectionOutcome {
-    let known = find_pixhawk_ports();
-    let mut examined = known.clone();
+    let scan = find_pixhawk_ports();
+    let mut examined = scan.ready.clone();
+    examined.extend(scan.bootloader.iter().cloned());
 
-    if !known.is_empty() {
+    if !scan.ready.is_empty() {
         return DetectionOutcome {
-            found: known,
+            found: scan.ready,
             examined,
             adopted_by_probe: false,
+            bootloader: scan.bootloader,
+        };
+    }
+
+    // A board in its bootloader is a board. Probing the remaining ports would
+    // find nothing and cost 1.5s each, and the one port that matters must not
+    // be opened at all — so report it and let the caller wait for the board to
+    // finish starting.
+    if !scan.bootloader.is_empty() {
+        return DetectionOutcome {
+            found: Vec::new(),
+            examined,
+            adopted_by_probe: false,
+            bootloader: scan.bootloader,
         };
     }
 
@@ -164,6 +256,7 @@ pub fn detect_flight_controller() -> DetectionOutcome {
             found: Vec::new(),
             examined,
             adopted_by_probe: false,
+            bootloader: Vec::new(),
         };
     }
 
@@ -188,6 +281,7 @@ pub fn detect_flight_controller() -> DetectionOutcome {
                         found: vec![port],
                         examined,
                         adopted_by_probe: true,
+                        bootloader: Vec::new(),
                     };
                 }
                 debug!(port = %port, "No heartbeat within the probe window");
@@ -202,6 +296,7 @@ pub fn detect_flight_controller() -> DetectionOutcome {
         found: Vec::new(),
         examined,
         adopted_by_probe: false,
+        bootloader: Vec::new(),
     }
 }
 
@@ -230,6 +325,12 @@ pub fn candidate_probe_ports() -> Vec<String> {
         };
         if is_pixhawk_vid(usb_info.vid) {
             continue; // already found by the allowlist
+        }
+        if is_bootloader_product(usb_info.product.as_deref()) {
+            // Opening it would block forever, which is worse than any outcome
+            // probing could produce.
+            debug!(port = %port.port_name, "Skipping a board that is in its bootloader");
+            continue;
         }
         if is_excluded_port(&port.port_name) {
             debug!(port = %port.port_name, "Skipping port excluded from probing");
@@ -346,6 +447,96 @@ pub fn open_serial(port: &str, config: &SerialConfig) -> Result<Box<dyn SerialPo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn usb(name: &str, vid: u16, product: &str) -> UsbPortInfo {
+        UsbPortInfo {
+            name: name.to_string(),
+            vid,
+            product: Some(product.to_string()),
+        }
+    }
+
+    #[test]
+    fn a_board_in_its_bootloader_is_not_offered_as_a_flight_controller() {
+        // The case that wedged the daemon on real hardware: an FMUv4 spends
+        // ~5s in its bootloader on power-up under the same vendor ID, and
+        // opening that port blocks forever rather than failing.
+        let scan = classify_ports(&[usb("/dev/tty.usbmodem01", VID_3DR, "PX4 BL FMU v4.x")]);
+
+        assert!(scan.ready.is_empty(), "a bootloader must never be opened");
+        assert_eq!(scan.bootloader, vec!["/dev/tty.usbmodem01".to_string()]);
+    }
+
+    #[test]
+    fn the_same_board_running_firmware_is_offered() {
+        // Same board, same vendor ID, seconds later. Only the product string
+        // separates the two states.
+        let scan = classify_ports(&[usb("/dev/tty.usbmodem01", VID_3DR, "PX4 FMU v4.x")]);
+
+        assert_eq!(scan.ready, vec!["/dev/tty.usbmodem01".to_string()]);
+        assert!(scan.bootloader.is_empty());
+    }
+
+    #[test]
+    fn a_renamed_board_is_still_offered() {
+        // Vendors rename the application firmware freely - the board this was
+        // found on reports "Th3seus". Matching an expected application name
+        // would reject every customised board, so only the bootloader marker
+        // is matched.
+        let scan = classify_ports(&[usb("/dev/tty.usbmodem01", VID_3DR, "Th3seus")]);
+
+        assert_eq!(scan.ready, vec!["/dev/tty.usbmodem01".to_string()]);
+    }
+
+    #[test]
+    fn a_board_with_no_product_string_is_offered() {
+        // Absent metadata must not be read as "bootloader": refusing to open
+        // it would strand a board that is working.
+        let scan = classify_ports(&[UsbPortInfo {
+            name: "/dev/tty.usbmodem01".to_string(),
+            vid: VID_3DR,
+            product: None,
+        }]);
+
+        assert_eq!(scan.ready, vec!["/dev/tty.usbmodem01".to_string()]);
+    }
+
+    #[test]
+    fn a_ready_board_is_used_even_while_another_sits_in_its_bootloader() {
+        // Two boards attached. The one that can be flown must not be held up
+        // by the one that is still starting.
+        let scan = classify_ports(&[
+            usb("/dev/tty.usbmodem01", VID_3DR, "PX4 BL FMU v4.x"),
+            usb("/dev/tty.usbmodem02", VID_3DR, "PX4 FMU v4.x"),
+        ]);
+
+        assert_eq!(scan.ready, vec!["/dev/tty.usbmodem02".to_string()]);
+        assert_eq!(scan.bootloader, vec!["/dev/tty.usbmodem01".to_string()]);
+    }
+
+    #[test]
+    fn a_port_from_an_unknown_vendor_is_left_to_the_probe() {
+        let scan = classify_ports(&[usb("/dev/tty.usbserial", 0x1234, "Some Board")]);
+
+        assert!(scan.ready.is_empty());
+        assert!(scan.bootloader.is_empty());
+    }
+
+    #[test]
+    fn bootloader_detection_does_not_depend_on_letter_case() {
+        assert!(is_bootloader_product(Some("PX4 BL FMU v4.x")));
+        assert!(is_bootloader_product(Some("px4 bl fmu v4.x")));
+        assert!(is_bootloader_product(Some("Some Bootloader")));
+    }
+
+    #[test]
+    fn an_application_name_containing_bl_is_not_a_bootloader() {
+        // "BL" appears in plenty of product names. Matching it loosely would
+        // refuse to open working boards, which is the more damaging error.
+        assert!(!is_bootloader_product(Some("BLHeli Configurator")));
+        assert!(!is_bootloader_product(Some("Blue Robotics Navigator")));
+        assert!(!is_bootloader_product(None));
+    }
 
     #[test]
     fn test_pixhawk_vid_detection() {

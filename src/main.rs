@@ -196,7 +196,15 @@ fn detect_or_use_port(specified_port: Option<String>) -> Option<String> {
     let outcome = detect_flight_controller();
 
     if outcome.found.is_empty() {
-        if outcome.examined.is_empty() {
+        if !outcome.bootloader.is_empty() {
+            // Not an error and not "no board" — the board is right there,
+            // still starting. Opening it now would block forever, so the only
+            // correct move is to wait for it to finish.
+            info!(
+                port = %outcome.bootloader.join(", "),
+                "Board is in its bootloader — waiting for it to finish starting"
+            );
+        } else if outcome.examined.is_empty() {
             warn!("No serial ports to examine — is the board plugged in?");
         } else {
             // "No FC detected" is not actionable; the list of what was looked
@@ -1218,11 +1226,21 @@ async fn main() {
                 // Try to find a flight controller. Probing runs here too, so a
                 // board that comes back on a different port — or was never
                 // recognised by vendor ID — is still picked up on reconnect.
+                // Tracks whether this scan saw a board mid-boot, so the user is
+                // told "starting up" rather than "not found" — a board that is
+                // visibly present but reported missing reads as a broken cable.
+                let mut board_in_bootloader = false;
                 let port_path = if let Some(ref p) = preferred_port {
                     Some(p.clone())
                 } else {
                     let outcome = detect_flight_controller();
-                    if outcome.found.is_empty() && !outcome.examined.is_empty() {
+                    board_in_bootloader = !outcome.bootloader.is_empty();
+                    if board_in_bootloader {
+                        debug!(
+                            port = %outcome.bootloader.join(", "),
+                            "Board is in its bootloader — not opening it"
+                        );
+                    } else if outcome.found.is_empty() && !outcome.examined.is_empty() {
                         debug!(
                             examined = %outcome.examined.join(", "),
                             "No flight controller among the examined ports"
@@ -1246,8 +1264,10 @@ async fn main() {
                         retry_count,
                         serial_port: String::new(),
                         fc_model: None,
-                        bootloader_suspected: false,
-                        link_state: if has_connected {
+                        bootloader_suspected: board_in_bootloader,
+                        link_state: if board_in_bootloader {
+                            LinkState::SuspectedBootloader
+                        } else if has_connected {
                             LinkState::Reconnecting
                         } else {
                             LinkState::Searching

@@ -25,6 +25,15 @@ const MAVLINK_V2_STX: u8 = 0xFD;
 /// Timeout for serial write operations
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long to wait for a serial `open()` before abandoning the port.
+///
+/// A healthy board opens in well under a millisecond, so this budget is not
+/// for slow hardware — it is for hardware whose `open()` never returns at all.
+/// A PX4 board sitting in its bootloader does exactly that: the call does not
+/// fail, it simply never completes, and without a deadline the connection
+/// manager stops forever with no log line and no recovery short of SIGKILL.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Reconnection timing constants
 const RECONNECT_BASE_DELAY_MS: u64 = 250;
 const RECONNECT_MAX_DELAY_MS: u64 = 1000;
@@ -64,6 +73,9 @@ pub enum AsyncIoError {
 
     #[error("Blocking task join error: {0}")]
     TaskJoin(String),
+
+    #[error("Timed out after {seconds}s opening serial port '{port}' — the device accepted the connection but never completed it")]
+    OpenTimeout { port: String, seconds: u64 },
 }
 
 /// Raw bytes for NSH communication
@@ -185,11 +197,30 @@ impl MavlinkIo {
         // duration — observed on real hardware as WS handshakes timing out
         // while a reconnect attempt was stuck opening the port.
         let port_owned = port.to_string();
-        let serial = tokio::task::spawn_blocking(move || {
+        let open_task = tokio::task::spawn_blocking(move || {
             tokio_serial::new(port_owned, baud_rate).open_native_async()
-        })
-        .await
-        .map_err(|e| AsyncIoError::TaskJoin(e.to_string()))??;
+        });
+
+        // A blocking `open()` cannot be cancelled, so on timeout the thread is
+        // abandoned rather than awaited — it stays parked until the device is
+        // unplugged. That costs one blocking-pool thread per timeout, which is
+        // why callers must also refuse ports already known to hang (see
+        // `is_bootloader_product`) instead of leaning on this deadline. It is
+        // the backstop for the unknown case, not the primary defence.
+        let serial = match tokio::time::timeout(OPEN_TIMEOUT, open_task).await {
+            Ok(joined) => joined.map_err(|e| AsyncIoError::TaskJoin(e.to_string()))??,
+            Err(_) => {
+                warn!(
+                    port = %port,
+                    seconds = OPEN_TIMEOUT.as_secs(),
+                    "Serial open did not complete — abandoning this port"
+                );
+                return Err(AsyncIoError::OpenTimeout {
+                    port: port.to_string(),
+                    seconds: OPEN_TIMEOUT.as_secs(),
+                });
+            }
+        };
         let (reader, writer) = tokio::io::split(serial);
 
         let shutdown_reader = self.shutdown.clone();

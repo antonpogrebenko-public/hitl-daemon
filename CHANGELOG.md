@@ -5,6 +5,35 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.2] - 2026-08-23
+
+### Fixed
+
+- **Starting the daemon before plugging in the flight controller no longer
+  hangs the daemon permanently.** A PX4 board spends ~5s in its bootloader on
+  power-up under the same USB vendor ID it uses for application firmware, so
+  detection — which matched on vendor ID alone — adopted a board that was still
+  booting. The bootloader's CDC endpoint does not refuse the connection; the
+  `open()` simply never returns, so the connection manager stopped for good:
+  no retry, no log line, and unkillable by SIGTERM. Because the daemon scans
+  once a second, it landed inside that window nearly every time, which is why
+  the failure depended on plug order.
+
+  Detection now separates a board in its bootloader from a board running
+  firmware (`PX4 BL <board>` product string; the vendor ID is identical in both
+  states) and refuses to open the former, reporting `SuspectedBootloader` so
+  the interface can say the board is starting rather than missing.
+
+  This also made the existing bootloader handling reachable for the first time.
+  The 5s heartbeat watchdog and 10s port-release backoff sat downstream of that
+  `open()` and had never once executed.
+
+- Serial `open()` now has a 5s deadline. A device that accepts a connection and
+  never completes it can no longer wedge the connection manager. This is a
+  backstop, not the primary defence — an abandoned blocking open leaks its
+  thread until the device is unplugged, so known-bad ports are still refused up
+  front rather than relied on timing out.
+
 ## [0.16.1] - 2026-08-23
 
 ### Fixed
