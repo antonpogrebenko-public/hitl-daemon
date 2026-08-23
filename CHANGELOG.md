@@ -5,6 +5,12 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.1] - 2026-08-23
+
+### Fixed
+- **Provisioning refused every board on real hardware.** `main.rs` built `PreflightHandler` with `new()`, which creates its own empty board-identity cell, while the MAVLink receiver task populated a different one. The handler's identity was therefore permanently `None` and provisioning aborted with "reports no identifying serial" for every board. Every unit test passed because they all construct the handler with `with_identity` directly. Found by running against a real flight controller; regression tests now pin both the unwired default and the shared-cell behaviour.
+- **Restore was unusable on a provisioned board.** Restore treated any `try_send` failure as a lost link, including a full queue. A board already in HITL mode is being streamed HIL sensors at 400Hz, so the MAVLink tx queue is saturated continuously — which is exactly when a restore is wanted. Backpressure now has its own retry budget, separate from the ack-retry budget it was previously exhausting, and only a genuinely disconnected writer is fatal.
+
 ## [0.15.0] - 2026-08-22
 
 ### Added

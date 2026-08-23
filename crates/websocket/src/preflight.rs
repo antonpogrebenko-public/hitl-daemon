@@ -708,11 +708,15 @@ impl PreflightHandler {
             let mut acked = false;
             for attempt in 1..=PARAM_RETRY_COUNT {
                 let mut rx = param_value_tx.subscribe();
-                if mav_tx.try_send(message.clone()).is_err() {
-                    return restore_error(format!(
-                        "Lost the link to the flight controller while restoring {}",
-                        param.name
-                    ));
+                // A full channel is backpressure, not a lost link, and it has
+                // its own budget. A board that is already provisioned is being
+                // streamed HIL sensors at 400Hz, so the tx queue is saturated
+                // continuously — and that is exactly when a restore is wanted.
+                // Sharing the ack-retry budget would exhaust it on queue
+                // pressure before a single write ever went out.
+                match send_with_backpressure(mav_tx, message.clone(), &param.name).await {
+                    Ok(()) => {}
+                    Err(e) => return restore_error(e),
                 }
                 // An integer ack comes back as the value's bit pattern, so it
                 // has to be compared as bits rather than within a float epsilon.
@@ -1055,6 +1059,41 @@ impl Drop for ApplyGuard<'_> {
     fn drop(&mut self) {
         self.0.store(false, std::sync::atomic::Ordering::SeqCst);
     }
+}
+
+/// Attempts before giving up on a saturated MAVLink tx queue.
+///
+/// Generous because the queue drains continuously: the daemon is writing HIL
+/// sensors at 400Hz, so a slot appears within milliseconds. The cap exists to
+/// bound a genuinely wedged writer, not to ration normal contention.
+const RESTORE_SEND_ATTEMPTS: u8 = 40;
+const RESTORE_SEND_BACKOFF: Duration = Duration::from_millis(25);
+
+/// Push one message onto the MAVLink queue, waiting out backpressure.
+async fn send_with_backpressure(
+    mav_tx: &Sender<MavMessage>,
+    message: MavMessage,
+    param_name: &str,
+) -> Result<(), String> {
+    for attempt in 1..=RESTORE_SEND_ATTEMPTS {
+        match mav_tx.try_send(message.clone()) {
+            Ok(()) => return Ok(()),
+            Err(crossbeam_channel::TrySendError::Full(_)) => {
+                if attempt % 10 == 0 {
+                    warn!(param = param_name, attempt, "MAVLink tx still full during restore");
+                }
+                tokio::time::sleep(RESTORE_SEND_BACKOFF).await;
+            }
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                return Err(format!(
+                    "Lost the link to the flight controller while restoring {param_name}"
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "The flight controller is not accepting writes ({param_name}). Restore is incomplete."
+    ))
 }
 
 fn restore_error(message: impl Into<String>) -> RestoreResult {
@@ -1851,6 +1890,54 @@ mod snapshot_gate_tests {
         let result = h.apply().await;
         assert!(!result.success);
         assert_eq!(*writes.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_default_constructor_leaves_identity_unwired() {
+        // Regression: main.rs built the handler with `new`, which creates its
+        // own empty identity cell, while the receiver task populated a
+        // different one. Provisioning therefore refused every board on real
+        // hardware for want of an identity it was never told about — and every
+        // unit test passed, because they all call `with_identity` directly.
+        let (mav_tx, _rx) = bounded::<MavMessage>(8);
+        let (pv_tx, _) = broadcast::channel::<ParamValue>(8);
+        let (nsh_tx, _nsh_rx) = mpsc::channel(8);
+        let handler = PreflightHandler::new(
+            Some(mav_tx),
+            Some(pv_tx),
+            Some(nsh_tx),
+            SimulationState::new(SimulationConfig::default()),
+        );
+        // `new` is only safe where nothing needs identity. Anything that
+        // provisions must use `with_identity` and share main.rs's cell.
+        assert!(
+            handler.board_identity.read().await.is_none(),
+            "new() must not fabricate an identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shared_identity_cell_reaches_the_handler() {
+        // The property the production wiring depends on: whatever the receiver
+        // task writes into the shared cell is what provisioning reads.
+        let cell = Arc::new(tokio::sync::RwLock::new(None));
+        let (mav_tx, _rx) = bounded::<MavMessage>(8);
+        let (pv_tx, _) = broadcast::channel::<ParamValue>(8);
+        let (nsh_tx, _nsh_rx) = mpsc::channel(8);
+        let handler = PreflightHandler::with_identity(
+            Some(mav_tx),
+            Some(pv_tx),
+            Some(nsh_tx),
+            SimulationState::new(SimulationConfig::default()),
+            cell.clone(),
+        );
+
+        *cell.write().await = Some(BoardIdentity::from_raw_for_test("uid:3034510f33323831"));
+
+        assert_eq!(
+            handler.board_identity.read().await.as_ref().map(|b| b.as_str().to_string()),
+            Some("uid:3034510f33323831".to_string())
+        );
     }
 
     #[tokio::test]

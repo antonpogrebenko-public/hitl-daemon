@@ -666,11 +666,23 @@ async fn main() {
     } else {
         Some(param_value_tx.clone())
     };
-    let preflight_handler = std::sync::Arc::new(websocket::PreflightHandler::new(
+    // Stable per-board key for the parameter snapshot. Derived from
+    // AUTOPILOT_VERSION rather than the serial port (which changes on replug)
+    // or fc_model (which every PX4 quad shares).
+    //
+    // Declared here, before the handler, and shared with it: the receiver task
+    // populates this same cell. Giving the handler its own would leave it
+    // permanently empty, and provisioning would refuse every board for want of
+    // an identity it was never told about.
+    let board_identity: Arc<tokio::sync::RwLock<Option<websocket::BoardIdentity>>> =
+        Arc::new(tokio::sync::RwLock::new(None));
+
+    let preflight_handler = std::sync::Arc::new(websocket::PreflightHandler::with_identity(
         build_config_mav_tx.clone(),
         build_config_param_value_tx.clone(),
         nsh_tx_for_config.clone(),
         sim_state.clone(),
+        board_identity.clone(),
     ));
     let build_config_handler = std::sync::Arc::new(websocket::BuildConfigHandler::new(
         build_config_tx,
@@ -777,12 +789,6 @@ async fn main() {
     });
 
     // Shared FC model (set once when HEARTBEAT identifies the FC)
-    // Stable per-board key for the parameter snapshot. Derived from
-    // AUTOPILOT_VERSION rather than the serial port (which changes on replug)
-    // or fc_model (which every PX4 quad shares).
-    let board_identity: Arc<tokio::sync::RwLock<Option<websocket::BoardIdentity>>> =
-        Arc::new(tokio::sync::RwLock::new(None));
-
     let fc_model: Arc<tokio::sync::RwLock<Option<String>>> =
         Arc::new(tokio::sync::RwLock::new(None));
 
