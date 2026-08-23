@@ -1,7 +1,8 @@
 use crate::handler::ValidatedNshCommand;
 use crate::param_io::ParamValue;
 use crate::protocol::{
-    AppliedConfig, ConfigResult, ConfigState, ConfigureBuild, OutgoingMessage, Px4PidsView,
+    AppliedConfig, ConfigResult, ConfigStage, ConfigState, ConfigureBuild, OutgoingMessage,
+    Px4PidsView,
 };
 use crossbeam_channel::Sender;
 use hitl_physics::px4_pids::{compute_pids, fingerprint as pid_fingerprint, Px4Pids};
@@ -159,13 +160,35 @@ impl BuildConfigHandler {
         self.system_config_tx.subscribe()
     }
 
+    /// Announce the stage about to start.
+    ///
+    /// Interim frames keep `state: Configuring` — only the terminal result
+    /// moves to `Ready` or `Error` — so a client that ignores `stage` sees
+    /// exactly what it saw before this existed.
+    async fn report_stage(progress_tx: &mpsc::Sender<OutgoingMessage>, stage: ConfigStage) {
+        if progress_tx
+            .send(OutgoingMessage::ConfigResult(ConfigResult {
+                state: ConfigState::Configuring,
+                success: true,
+                error: None,
+                config: None,
+                stage: Some(stage),
+            }))
+            .await
+            .is_err()
+        {
+            debug!(?stage, "client disconnected before stage update delivered");
+        }
+    }
+
     /// Process a `ConfigureBuild` request through the two-stage lifecycle:
     ///
     /// 1. Early validation (fetch component specs from API). Failure here
     ///    returns a single `state: Error` ConfigResult and aborts.
     /// 2. Compute physics + PIDs, emit `state: Configuring` via `progress_tx`
-    ///    so the UI can show a spinner. The simulation has NOT been
-    ///    reconfigured at this point.
+    ///    so the UI can show progress. Each stage is named as it starts (see
+    ///    `report_stage`), so a slow step is distinguishable from a stuck one.
+    ///    The simulation has NOT been reconfigured at this point.
     /// 3. Push PARAM_SET to PX4 and `await` matching PARAM_VALUE acks (per-
     ///    param timeout + retry). Failure → `state: Error`, do NOT touch sim.
     /// 4. On full ack success: deliver new physics to sim loop, restart EKF2,
@@ -175,6 +198,8 @@ impl BuildConfigHandler {
         request: ConfigureBuild,
         progress_tx: mpsc::Sender<OutgoingMessage>,
     ) -> ConfigResult {
+        Self::report_stage(&progress_tx, ConfigStage::FetchingSpecs).await;
+
         // Load terrain if URL provided (non-blocking for config flow)
         if let Err(e) = self.load_terrain_if_provided(&request).await {
             warn!("Terrain load failed: {}", e);
@@ -189,6 +214,7 @@ impl BuildConfigHandler {
                     success: false,
                     error: Some(format!("Failed to fetch motor: {e}")),
                     config: None,
+                    stage: None,
                 };
             }
         };
@@ -201,6 +227,7 @@ impl BuildConfigHandler {
                     success: false,
                     error: Some("Motor missing KV rating in specs".to_string()),
                     config: None,
+                    stage: None,
                 };
             }
         };
@@ -461,6 +488,8 @@ impl BuildConfigHandler {
         // controller unable to take off after landing (sess113).
         let hover_cmd = physics.hover_throttle_percent().clamp(0.1, 0.8) as f32;
 
+        Self::report_stage(&progress_tx, ConfigStage::Computing).await;
+
         // Phase 6: derive per-build rate-controller PIDs. Scales by inertia AND
         // by hover authority — high-TWR builds get attenuated gains to prevent
         // motor-saturation limit cycles.
@@ -505,6 +534,7 @@ impl BuildConfigHandler {
                 success: true,
                 error: None,
                 config: Some(configuring_view.clone()),
+                stage: Some(ConfigStage::PushingParams),
             }))
             .await
             .is_err()
@@ -525,6 +555,7 @@ impl BuildConfigHandler {
                         success: false,
                         error: Some(format!("PID verification failed: {e}")),
                         config: None,
+                        stage: None,
                     };
                 }
             };
@@ -539,6 +570,7 @@ impl BuildConfigHandler {
                 success: false,
                 error: Some("Simulation thread unavailable".to_string()),
                 config: None,
+                stage: None,
             };
         }
 
@@ -550,6 +582,8 @@ impl BuildConfigHandler {
             "Build configured + PIDs verified"
         );
 
+        Self::report_stage(&progress_tx, ConfigStage::RestartingEkf).await;
+
         if let Err(e) = self.restart_ekf2_with_retry(3).await {
             error!(error = %e, "EKF2 restart failed — PIDs are applied, EKF will converge on stale state");
         }
@@ -558,6 +592,7 @@ impl BuildConfigHandler {
             state: ConfigState::Ready,
             success: true,
             error: None,
+            stage: None,
             config: Some(AppliedConfig {
                 applied_pids,
                 verified_params,
@@ -895,6 +930,7 @@ impl BuildConfigHandler {
                 success: true,
                 error: None,
                 config: None,
+                stage: None,
             }));
 
         // Clear the fingerprint cache so push_pids_and_verify doesn't skip
@@ -917,6 +953,7 @@ impl BuildConfigHandler {
                         success: true,
                         error: None,
                         config: None,
+                        stage: None,
                     }));
                 Ok(())
             }
@@ -929,6 +966,7 @@ impl BuildConfigHandler {
                         success: false,
                         error: Some(format!("PID re-push after reconnect failed: {e}")),
                         config: None,
+                        stage: None,
                     }));
                 Err(e)
             }
@@ -1305,11 +1343,11 @@ mod tests {
                             .expect("capture mutex poisoned")
                             .push(CapturedMsg::ParamSet(name.clone(), p.param_value));
                         let _ = param_value_tx.send(ParamValue {
-                        name,
-                        value: p.param_value,
-                        param_type: p.param_type,
-                        index: 0,
-                    });
+                            name,
+                            value: p.param_value,
+                            param_type: p.param_type,
+                            index: 0,
+                        });
                     }
                     MavMessage::COMMAND_LONG(c) => {
                         captured_clone
@@ -1583,6 +1621,9 @@ mod reconnect_repush_tests {
         let mut client = handler.subscribe_system_config();
 
         assert!(handler.repush_if_configured().await.is_ok());
-        assert!(client.try_recv().is_err(), "no config result should be emitted");
+        assert!(
+            client.try_recv().is_err(),
+            "no config result should be emitted"
+        );
     }
 }

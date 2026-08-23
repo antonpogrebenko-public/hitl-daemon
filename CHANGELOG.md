@@ -5,6 +5,20 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0] - 2026-08-23
+
+### Added
+
+- `ConfigResult` now carries the stage of the build apply that is running:
+  `fetching_specs`, `computing`, `pushing_params`, `restarting_ekf`. Interim
+  frames keep `state: configuring` and terminal results carry no stage, so a
+  client that ignores the field behaves exactly as before.
+
+  Applying a build takes several seconds of PX4 parameter acks plus an EKF2
+  restart, and previously reported only "still working" for the whole of it —
+  a slow step and a stuck one looked identical. Every stage is emitted when
+  that work actually begins.
+
 ## [0.16.2] - 2026-08-23
 
 ### Fixed

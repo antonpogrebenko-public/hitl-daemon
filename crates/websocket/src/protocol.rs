@@ -518,6 +518,30 @@ pub enum ConfigState {
     Error,
 }
 
+/// Which part of applying a build is currently running.
+///
+/// `ConfigState` says only "still working" or "done", which left the interface
+/// showing one unchanging line for the whole apply — several seconds of PX4
+/// parameter acks and an EKF2 restart, with nothing to distinguish a slow step
+/// from a stuck one.
+///
+/// Every variant corresponds to work the daemon actually performs, and is
+/// emitted when that work begins. An earlier interface animated this sequence
+/// on fixed timers, which meant the reported stage and the real one could
+/// disagree — and added five seconds of delay purely to display it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigStage {
+    /// Fetching component specifications from the API.
+    FetchingSpecs,
+    /// Computing physics and per-build PID gains.
+    Computing,
+    /// Writing PID parameters to PX4 and awaiting a `PARAM_VALUE` ack for each.
+    PushingParams,
+    /// Restarting EKF2 so the estimator drops state from the previous build.
+    RestartingEkf,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfigResult {
     pub state: ConfigState,
@@ -526,6 +550,11 @@ pub struct ConfigResult {
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config: Option<AppliedConfig>,
+    /// The stage in progress. Absent on terminal results, and on any daemon
+    /// older than this field — the interface must treat absence as "no detail
+    /// available" rather than as an error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<ConfigStage>,
 }
 
 impl ConfigResult {
@@ -1758,9 +1787,7 @@ mod capabilities_tests {
         // feature for every client that has shipped.
         for feature in DAEMON_FEATURES {
             assert!(
-                feature
-                    .chars()
-                    .all(|c| c.is_ascii_lowercase() || c == '_'),
+                feature.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
                 "{feature} is not a stable snake_case identifier"
             );
         }

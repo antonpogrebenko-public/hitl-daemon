@@ -6,10 +6,9 @@
 use crate::build_config::BuildConfigHandler;
 use crate::preflight::PreflightHandler;
 use crate::protocol::{
-    PreflightReadiness, RestoreResult, RestoreState, SnapshotStored,
     Command, CommandAck, CommandType, ConfigResult, ConfigState, HandshakeAck, IncomingMessage,
     NshCommand, NshResponse, OutgoingMessage, PreflightApplyResult, PreflightApplyState,
-    PreflightStatus, StateUpdate,
+    PreflightReadiness, PreflightStatus, RestoreResult, RestoreState, SnapshotStored, StateUpdate,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -229,6 +228,7 @@ impl ConnectionHandler {
                             success: false,
                             error: Some("Build configuration not available".to_string()),
                             config: None,
+                            stage: None,
                         };
                         return Ok(Some(OutgoingMessage::ConfigResult(result)));
                     }
@@ -749,7 +749,11 @@ mod tests {
         let (handler, _) = create_test_handler().await;
         let (progress_tx, _rx) = mpsc::channel(8);
         let response = handler
-            .handle_message(1, &[protocol::MSG_TYPE_REQUEST_PREFLIGHT_CHECK], &progress_tx)
+            .handle_message(
+                1,
+                &[protocol::MSG_TYPE_REQUEST_PREFLIGHT_CHECK],
+                &progress_tx,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -768,7 +772,11 @@ mod tests {
         let (handler, _) = create_test_handler().await;
         let (progress_tx, _rx) = mpsc::channel(8);
         let response = handler
-            .handle_message(1, &[protocol::MSG_TYPE_APPLY_PREFLIGHT_PARAMS], &progress_tx)
+            .handle_message(
+                1,
+                &[protocol::MSG_TYPE_APPLY_PREFLIGHT_PARAMS],
+                &progress_tx,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -794,7 +802,12 @@ mod tests {
         let (mav_tx, _mav_rx) = crossbeam_channel::bounded(64);
         let (pv_tx, _pv_rx) = broadcast::channel(64);
         let sim_state = simulation::SimulationState::new(simulation::SimulationConfig::default());
-        let preflight = Arc::new(PreflightHandler::new(Some(mav_tx), Some(pv_tx), None, sim_state));
+        let preflight = Arc::new(PreflightHandler::new(
+            Some(mav_tx),
+            Some(pv_tx),
+            None,
+            sim_state,
+        ));
         // Provisioning progress now fans out on the handler's own broadcast so
         // every client sees it, not just the tab that asked.
         let mut provisioning_rx = preflight.subscribe_provisioning();
@@ -803,7 +816,11 @@ mod tests {
         let (progress_tx, _progress_rx) = mpsc::channel(8);
         let dispatch_start = Instant::now();
         let response = handler
-            .handle_message(1, &[protocol::MSG_TYPE_APPLY_PREFLIGHT_PARAMS], &progress_tx)
+            .handle_message(
+                1,
+                &[protocol::MSG_TYPE_APPLY_PREFLIGHT_PARAMS],
+                &progress_tx,
+            )
             .await
             .unwrap();
         let dispatch_elapsed = dispatch_start.elapsed();
