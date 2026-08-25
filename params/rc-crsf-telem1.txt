@@ -1,0 +1,60 @@
+# RC receiver configuration and stick calibration
+#
+# Board:    uid:3034510f33323831 (PX4 Quadrotor)
+# Read on:  2026-08-25, from the live board via `param show -c`
+# Receiver: ExpressLRS / CRSF on TELEM1
+#
+# Why this file exists: wiping parameters throws away the receiver binding and
+# the stick calibration along with everything else, and neither can be
+# reconstructed from documentation — the calibration numbers are specific to
+# this transmitter and these gimbals. Re-flying after a wipe otherwise means
+# recalibrating by hand.
+#
+# Apply with:  ./params/apply-params.sh params/rc-crsf-telem1.txt
+# (the daemon must be running; it applies over the daemon's NSH bridge)
+#
+# This file covers the receiver only. It deliberately does NOT contain sensor
+# calibration: at the time of capture CAL_ACC0_ID and CAL_MAG0_ID were both 0,
+# meaning the accelerometer and compass were uncalibrated on the board and
+# there was nothing to record. Those must be redone in QGroundControl.
+
+# === CRSF receiver ===
+RC_CRSF_PRT_CFG 101        # CRSF on TELEM1 (Serial 1). Was 104/TELEM4 before 2026-08.
+RC_CRSF_TEL_EN 1           # CRSF telemetry back to the handset
+RC_CHAN_CNT 16             # 16 channels
+
+# === Stick mapping ===
+RC_MAP_ROLL 1              # Roll     = channel 1
+RC_MAP_PITCH 2             # Pitch    = channel 2
+RC_MAP_THROTTLE 3          # Throttle = channel 3
+RC_MAP_YAW 4               # Yaw      = channel 4
+
+# === Stick calibration ===
+# Endpoints and centres as measured for this transmitter. MAX values that sit
+# at the PX4 default (2000) are written explicitly rather than omitted, so a
+# restore produces the whole calibration instead of leaning on a default that
+# could change between firmware versions.
+RC1_MIN 1026.0000
+RC1_TRIM 1504.0000
+RC1_MAX 2000.0000
+
+RC2_MIN 1012.0000
+RC2_TRIM 1507.0000
+RC2_MAX 1993.0000
+
+RC3_MIN 1001.0000
+RC3_TRIM 1001.0000         # Throttle centre sits at its minimum, as expected
+RC3_MAX 2000.0000
+
+RC4_MIN 1054.0000
+RC4_TRIM 1478.0000
+RC4_MAX 1962.0000
+
+# === Switch mapping — NOT currently on the board ===
+# params-th3seus-hitl.txt (written 2026-05, when the receiver was on TELEM4)
+# recorded these two. Both read 0 on the board on 2026-08-25, so a wipe appears
+# to have taken them. They are left commented rather than applied silently:
+# uncomment only after confirming these are still the channels your handset
+# sends, because arming on the wrong channel is worth getting right by hand.
+# RC_MAP_ARM_SW 5          # Arm switch       = channel 5
+# RC_MAP_FLTMODE 8         # Flight mode dial = channel 8
