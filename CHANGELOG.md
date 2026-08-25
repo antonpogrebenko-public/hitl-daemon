@@ -5,6 +5,27 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.1] - 2026-08-25
+
+### Fixed
+
+- **The vehicle would not arm with a GPS module selected.** PX4 reported
+  "ekf2 missing data", "horizontal velocity unstable" and "height estimate not
+  stable"; `sensor_gps` was publishing at 0 Hz while every other sensor ran
+  normally.
+
+  The cause was in `hitl-sensors`, not in this crate: the GPS delay buffer
+  trimmed away every sample at or below its output target and then asked
+  whether the remaining front was at or below that target, which after such a
+  trim it could not be. A reading only escaped when the buffer happened to hold
+  exactly one sample — true while the configured delay is shorter than one
+  update period, so the built-in 10 Hz/80 ms shape worked and hid it. A
+  component-database profile at 18 Hz/120 ms spans more than two periods, the
+  buffer never drops below three, and GPS went silent for the rest of the
+  session.
+
+  Requires hitl-sensors 0.1.2.
+
 ## [0.19.0] - 2026-08-25
 
 ### Changed
