@@ -1,0 +1,87 @@
+# Fly the drone in HITL simulation: arm and control it from the handset.
+#
+# Apply:   ./params/apply-params.sh params/hitl-sim.txt
+# Revert:  ./params/apply-params.sh params/real-flight.txt
+#
+# The forward half of a pair. This puts the board into simulation mode; the
+# revert file puts it back for real flight. Nothing here is destructive — every
+# parameter it sets is one the revert file returns to its firmware default or
+# to the value recorded in rc-crsf-telem1.txt.
+#
+# DO NOT FLY A REAL AIRCRAFT WITH THESE APPLIED. SYS_HITL=1 makes the board
+# ignore its own sensors and take attitude and position from the simulator. On
+# a real airframe it will not know which way up it is.
+#
+# Sourced from the set that worked in May (params-th3seus-hitl.txt) with two
+# corrections against the live board: the receiver is on TELEM1 now, not
+# TELEM4, and the stick calibration is included rather than commented out.
+
+# === HITL mode ===
+SYS_HITL 1                 # Take sensors from the simulator, not the board
+SYS_HAS_BARO 0             # Simulated baro supplies height; the onboard one would fight it
+GPS_1_CONFIG 0             # Simulated GPS supplies position; disable the hardware port
+SYS_AUTOSTART 4001         # Generic Quadcopter X
+
+# === HIL actuator outputs ===
+# Without these the daemon receives no motor commands and the drone sits inert.
+HIL_ACT_FUNC1 101          # Motor 1
+HIL_ACT_FUNC2 102          # Motor 2
+HIL_ACT_FUNC3 103          # Motor 3
+HIL_ACT_FUNC4 104          # Motor 4
+
+# === Arming checks the simulator cannot satisfy ===
+# There is no power module, no SD card and no real magnetic field in a
+# simulation, so these gates would refuse to arm on hardware that is working.
+CBRK_SUPPLY_CHK 894281     # Bypass power module check
+COM_ARM_HFLT_CHK 0         # Skip health/fault preflight check
+COM_ARM_MAG_ANG 180        # Accept any mag/GPS heading difference
+COM_ARM_MAG_STR 0          # Disable mag field strength check
+COM_ARM_SDCARD 0           # Do not require an SD card
+
+# === EKF2 gates ===
+EKF2_GPS_CHECK 0           # Simulated GPS does not carry real quality metrics
+EKF2_MAG_CHECK 0           # Simulated mag is not consistency-checked against the world
+
+# === CRSF receiver ===
+RC_CRSF_PRT_CFG 101        # CRSF on TELEM1 (Serial 1) — was 104/TELEM4 before 2026-08
+RC_CRSF_TEL_EN 1           # Telemetry back to the handset
+RC_CHAN_CNT 16             # 16 channels
+
+# === Sticks ===
+RC_MAP_ROLL 1              # Roll     = channel 1
+RC_MAP_PITCH 2             # Pitch    = channel 2
+RC_MAP_THROTTLE 3          # Throttle = channel 3
+RC_MAP_YAW 4               # Yaw      = channel 4
+
+# === Switches ===
+# Both of these read 0 on the board on 2026-08-25 — a parameter wipe took them,
+# which is why arming from the handset stopped working. The channels are the
+# ones recorded in May; if your handset has been re-bound since, check them.
+RC_MAP_ARM_SW 5            # Arm switch       = channel 5
+RC_MAP_FLTMODE 8           # Flight mode dial = channel 8
+
+# === Flight modes on the 3-position dial ===
+# PX4 mode numbering, not the labels: 0 = Manual, 8 = Stabilized, 4 = Hold.
+# Hold needs a position estimate, which the simulated GPS provides.
+COM_FLTMODE1 0             # Position 1: Manual
+COM_FLTMODE2 8             # Position 2: Stabilized
+COM_FLTMODE3 4             # Position 3: Hold
+
+# === Stick calibration ===
+# Measured for this transmitter. Kept alongside the mode config so one file
+# gets you from a wiped board to a flyable simulation.
+RC1_MIN 1026.0000
+RC1_TRIM 1504.0000
+RC1_MAX 2000.0000
+
+RC2_MIN 1012.0000
+RC2_TRIM 1507.0000
+RC2_MAX 1993.0000
+
+RC3_MIN 1001.0000
+RC3_TRIM 1001.0000         # Throttle centre sits at its minimum, as expected
+RC3_MAX 2000.0000
+
+RC4_MIN 1054.0000
+RC4_TRIM 1478.0000
+RC4_MAX 1962.0000

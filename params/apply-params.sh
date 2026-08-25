@@ -47,7 +47,15 @@ while IFS= read -r line || [ -n "$line" ]; do
     [ -n "$value" ] || die $EXIT_USAGE "no value for parameter $name in $FILE"
 
     printf '  %-18s %s\n' "$name" "$value"
-    "$NSH" --ws --cmd "param set $name $value" >/dev/null
+    # DEFAULT resets to the firmware's own value rather than to a number
+    # written down here. A revert file that hardcodes defaults is a second
+    # place for them to live, and it goes stale the first time a PX4 release
+    # changes one.
+    if [ "$value" = "DEFAULT" ]; then
+        "$NSH" --ws --cmd "param reset $name" >/dev/null
+    else
+        "$NSH" --ws --cmd "param set $name $value" >/dev/null
+    fi
     applied=$((applied + 1))
 done < "$FILE"
 

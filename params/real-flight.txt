@@ -1,0 +1,74 @@
+# Take the board out of simulation and back to real flight.
+#
+# Apply:  ./params/apply-params.sh params/real-flight.txt
+#
+# The reverse half of the pair with hitl-sim.txt. Every parameter that file
+# sets for the simulator's benefit is undone here; the receiver configuration
+# and stick calibration are kept, because those are yours either way.
+#
+# DEFAULT means "reset to the firmware's default" rather than to a number
+# written down here. Hardcoding defaults creates a second place for them to
+# live, and it goes stale the first time a PX4 release changes one.
+#
+# THIS IS NOT ENOUGH TO FLY. At the time of writing, CAL_ACC0_ID and
+# CAL_MAG0_ID both read 0 on this board: the accelerometer and compass have no
+# calibration, and preflight will refuse to arm until they do. That has to be
+# done in QGroundControl — it needs the airframe physically rotated, so no
+# parameter file can stand in for it.
+
+# === Leave simulation mode ===
+SYS_HITL 0                 # Use the board's own sensors again
+SYS_HAS_BARO DEFAULT       # Re-enable the onboard barometer
+GPS_1_CONFIG DEFAULT       # Re-enable the GPS port
+
+# === Drop the HIL actuator outputs ===
+# Left set, these route motor outputs to the simulator rather than the ESCs.
+HIL_ACT_FUNC1 0
+HIL_ACT_FUNC2 0
+HIL_ACT_FUNC3 0
+HIL_ACT_FUNC4 0
+
+# === Restore the arming checks ===
+# These exist to stop a real aircraft arming with a problem. They were only
+# relaxed because a simulation has no power module, SD card or magnetic field.
+CBRK_SUPPLY_CHK DEFAULT    # Power module check back on
+COM_ARM_HFLT_CHK DEFAULT   # Health/fault preflight check back on
+COM_ARM_MAG_ANG DEFAULT    # Mag/GPS heading agreement enforced again
+COM_ARM_MAG_STR DEFAULT    # Mag field strength check back on
+COM_ARM_SDCARD DEFAULT     # SD card requirement back
+
+# === Restore the EKF2 gates ===
+EKF2_GPS_CHECK DEFAULT     # GPS quality gates back on
+EKF2_MAG_CHECK DEFAULT     # Mag consistency check back on
+
+# === Kept, not reverted ===
+# The receiver and its calibration are the same in both directions, so they are
+# reasserted here rather than left to chance — applying this file to a wiped
+# board should leave the handset working.
+RC_CRSF_PRT_CFG 101        # CRSF on TELEM1 (Serial 1)
+RC_CRSF_TEL_EN 1
+RC_CHAN_CNT 16
+
+RC_MAP_ROLL 1
+RC_MAP_PITCH 2
+RC_MAP_THROTTLE 3
+RC_MAP_YAW 4
+
+RC_MAP_ARM_SW 5            # Arm switch       = channel 5
+RC_MAP_FLTMODE 8           # Flight mode dial = channel 8
+
+RC1_MIN 1026.0000
+RC1_TRIM 1504.0000
+RC1_MAX 2000.0000
+
+RC2_MIN 1012.0000
+RC2_TRIM 1507.0000
+RC2_MAX 1993.0000
+
+RC3_MIN 1001.0000
+RC3_TRIM 1001.0000
+RC3_MAX 2000.0000
+
+RC4_MIN 1054.0000
+RC4_TRIM 1478.0000
+RC4_MAX 1962.0000
