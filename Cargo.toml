@@ -1,6 +1,6 @@
 [package]
 name = "hitl-daemon"
-version = "0.18.1"
+version = "0.19.0"
 edition = "2021"
 description = "Hardware-in-the-loop simulator daemon for UAV testing"
 license = "MIT"
@@ -9,6 +9,7 @@ license = "MIT"
 mavlink-io = { path = "crates/mavlink-io" }
 protocol = { path = "crates/protocol" }
 simulation = { path = "crates/simulation" }
+terrain = { path = "crates/terrain" }
 websocket = { path = "crates/websocket" }
 hitl-physics = { path = "../hitl-physics" }
 hitl-sensors = { path = "../hitl-sensors" }

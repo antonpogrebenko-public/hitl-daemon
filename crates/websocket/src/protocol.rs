@@ -78,6 +78,10 @@ pub const MSG_TYPE_RESTORE_SNAPSHOT: u8 = 0x17;
 pub const MSG_TYPE_RESTORE_RESULT: u8 = 0x0D;
 /// Daemon -> browser: what this daemon can do, sent unprompted on connect.
 pub const MSG_TYPE_CAPABILITIES: u8 = 0x0E;
+/// Daemon -> browser: tile coordinates the physics needs and does not hold.
+pub const MSG_TYPE_TERRAIN_NEED: u8 = 0x0F;
+/// Browser -> daemon: decoded elevation tiles for the physics to collide against.
+pub const MSG_TYPE_TERRAIN_TILES: u8 = 0x18;
 
 // State update size (current wire format)
 pub const STATE_UPDATE_SIZE: usize = 87;
@@ -358,6 +362,49 @@ impl VehicleMessage {
     }
 }
 
+/// Geographic origin of a simulated flight.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+pub struct FlightLocation {
+    pub lat: f64,
+    pub lon: f64,
+}
+
+impl FlightLocation {
+    /// Applied when a browser sends no location. Matches the daemon's own CLI
+    /// defaults so the two paths agree on where "nowhere specified" is.
+    pub const DEFAULT: Self = Self {
+        lat: 40.015,
+        lon: -105.2705,
+    };
+
+    /// Reject anything that is not a real point on Earth.
+    ///
+    /// Non-finite values are checked explicitly: NaN fails every comparison, so
+    /// a range test alone would let it through and it would then poison every
+    /// tile coordinate and sensor reading derived from the origin.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.lat.is_finite() {
+            return Err("flight_location.lat must be a finite number".to_string());
+        }
+        if !self.lon.is_finite() {
+            return Err("flight_location.lon must be a finite number".to_string());
+        }
+        if !(-90.0..=90.0).contains(&self.lat) {
+            return Err(format!(
+                "flight_location.lat {} out of range (-90..=90)",
+                self.lat
+            ));
+        }
+        if !(-180.0..=180.0).contains(&self.lon) {
+            return Err(format!(
+                "flight_location.lon {} out of range (-180..=180)",
+                self.lon
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ConfigureBuild {
     pub motor_slug: String,
@@ -383,9 +430,26 @@ pub struct ConfigureBuild {
     /// 1 = 4-in-1 ESC (weighs once), 4 = individual ESCs (weight × 4).
     #[serde(default = "default_esc_count")]
     pub esc_count: u8,
-    /// Terrain tiles URL (S3 bucket). Must be from whitelisted buckets.
+    /// Where in the world this flight takes place.
+    ///
+    /// Absent means a browser that predates location selection; the daemon
+    /// applies [`FlightLocation::DEFAULT`] rather than failing, so a stale tab
+    /// degrades instead of breaking.
     #[serde(default)]
-    pub terrain_url: Option<String>,
+    pub flight_location: Option<FlightLocation>,
+
+    /// Terrain MSL elevation the browser sampled at `flight_location`, in metres.
+    ///
+    /// This is the vertical datum for the whole flight: ground contact, the
+    /// barometer and the altitude reported to the flight controller all adopt
+    /// it together. `None` means no elevation data covered the origin, in which
+    /// case all three fall back to the configured altitude together.
+    ///
+    /// Carried in on configuration rather than derived when tiles arrive, so
+    /// there is never a window where the datum has changed for some consumers
+    /// and not others.
+    #[serde(default)]
+    pub origin_elevation_msl: Option<f64>,
 
     // Sensor noise parameters (from API sensor profiles, optional with defaults)
     /// Gyro noise density in rad/s/sqrt(Hz)
@@ -416,47 +480,21 @@ pub struct ConfigureBuild {
     pub sensor_match_type: Option<String>,
 }
 
-/// Allowed S3 bucket hostnames for terrain tiles
-const ALLOWED_TERRAIN_HOSTS: &[&str] = &[
-    "th3seus-terrain-playground.s3.amazonaws.com",
-    "th3seus-terrain.s3.amazonaws.com",
-];
-
 impl ConfigureBuild {
-    /// Validate terrain_url is from an allowed S3 bucket.
-    /// Strict validation: must be https, exact host match, no userinfo.
-    pub fn validate_terrain_url(&self) -> Result<Option<String>, String> {
-        let url_str = match &self.terrain_url {
-            Some(u) if !u.is_empty() => u,
-            _ => return Ok(None),
-        };
-
-        let parsed = url::Url::parse(url_str).map_err(|e| format!("Invalid terrain URL: {}", e))?;
-
-        if parsed.scheme() != "https" {
-            return Err("Terrain URL must use https".to_string());
-        }
-
-        if parsed.username() != "" || parsed.password().is_some() {
-            return Err("Terrain URL must not contain credentials".to_string());
-        }
-
-        let host = parsed
-            .host_str()
-            .ok_or("Terrain URL missing host")?
-            .to_ascii_lowercase();
-        let host_normalized = host.trim_end_matches('.');
-
-        for allowed in ALLOWED_TERRAIN_HOSTS {
-            if host_normalized == *allowed {
-                return Ok(Some(url_str.clone()));
+    /// The location this flight runs at.
+    ///
+    /// A present-but-invalid location is an error and fails configuration — the
+    /// caller asked for a specific place and we must not silently fly somewhere
+    /// else. An *absent* location is not an error: it means a browser that
+    /// predates location selection, and gets the documented default.
+    pub fn resolve_flight_location(&self) -> Result<FlightLocation, String> {
+        match self.flight_location {
+            Some(loc) => {
+                loc.validate()?;
+                Ok(loc)
             }
+            None => Ok(FlightLocation::DEFAULT),
         }
-
-        Err(format!(
-            "Terrain URL host '{}' not in allowlist. Allowed: {:?}",
-            host_normalized, ALLOWED_TERRAIN_HOSTS
-        ))
     }
 }
 
@@ -1211,6 +1249,184 @@ impl TerrainOrigin {
     }
 }
 
+/// A slippy/XYZ tile coordinate, as carried on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct WireTileCoord {
+    pub x: u32,
+    pub y: u32,
+    pub z: u32,
+}
+
+/// Daemon -> browser: tiles the physics needs around the vehicle but does not hold.
+///
+/// Reconciliation, not RPC. The daemon is the only party that knows what it is
+/// missing, so it is the one that asks; unmet needs are simply re-sent, which
+/// makes the exchange self-healing across dropped frames, tab reloads and
+/// daemon restarts without any acknowledgement bookkeeping. The steady state is
+/// an empty list, which is not sent at all.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TerrainNeed {
+    pub coords: Vec<WireTileCoord>,
+}
+
+impl TerrainNeed {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = vec![MSG_TYPE_TERRAIN_NEED];
+        // Serialising a Vec of small structs cannot fail; an empty list on
+        // failure would read as "nothing needed" and stall the exchange.
+        buf.extend_from_slice(
+            serde_json::to_vec(self)
+                .expect("TerrainNeed serialises")
+                .as_slice(),
+        );
+        buf
+    }
+}
+
+/// Header of a `TerrainTiles` frame, describing the payloads that follow it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TerrainTilesHeader {
+    /// Origin these tiles are anchored to. A frame anchored to a stale origin
+    /// is dropped rather than mixed with the current one.
+    pub origin: FlightLocation,
+    /// Samples per tile edge. Checked against the payload length so a mismatch
+    /// is caught at the boundary rather than read as garbage heights.
+    pub tile_size: u32,
+    pub coords: Vec<WireTileCoord>,
+    /// Whether each tile came from a non-authoritative source, positionally
+    /// matched to `coords`.
+    #[serde(default)]
+    pub approximate: Vec<bool>,
+}
+
+/// Browser -> daemon: decoded elevation tiles.
+///
+/// Frame layout, following the one-tag-byte convention:
+///   `[0]`      `MSG_TYPE_TERRAIN_TILES`
+///   `[1..5]`   header length, u32 LE
+///   `[5..5+n]` `TerrainTilesHeader` as JSON
+///   `[5+n..]`  concatenated tile payloads, each `tile_size^2` f32 LE,
+///              row-major from the tile's north-west corner
+///
+/// The payload is byte-identical to the `.bin` tile format the store serves and
+/// the viewer decodes, so there is one elevation representation end to end and
+/// no second encoding to keep in step with the file format.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TerrainTiles {
+    pub header: TerrainTilesHeader,
+    /// One entry per coord, each `tile_size^2` MSL metres.
+    pub tiles: Vec<Vec<f32>>,
+}
+
+impl TerrainTiles {
+    /// Largest frame accepted, as a backstop against a malicious or runaway
+    /// sender. 64 tiles at 256^2 f32 is 16 MiB; the daemon's resident bound is
+    /// far below that, so anything approaching it is already wrong.
+    pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self, ProtocolError> {
+        let invalid = |reason: String| ProtocolError::InvalidPayload {
+            command_type: CommandType::Arm,
+            reason,
+        };
+
+        if data.len() > Self::MAX_FRAME_BYTES {
+            return Err(invalid(format!(
+                "TerrainTiles: frame of {} bytes exceeds the {} byte limit",
+                data.len(),
+                Self::MAX_FRAME_BYTES
+            )));
+        }
+        if data.len() < 5 {
+            return Err(ProtocolError::MessageTooShort {
+                expected: 5,
+                actual: data.len(),
+            });
+        }
+        if data[0] != MSG_TYPE_TERRAIN_TILES {
+            return Err(ProtocolError::UnknownMessageType(data[0]));
+        }
+
+        let header_len = u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
+        let header_end = 5usize
+            .checked_add(header_len)
+            .ok_or_else(|| invalid("TerrainTiles: header length overflows".to_string()))?;
+        if data.len() < header_end {
+            return Err(ProtocolError::MessageTooShort {
+                expected: header_end,
+                actual: data.len(),
+            });
+        }
+
+        let header: TerrainTilesHeader = serde_json::from_slice(&data[5..header_end])
+            .map_err(|e| invalid(format!("TerrainTiles: header {e}")))?;
+
+        let tile_size = header.tile_size as usize;
+        if tile_size == 0 {
+            return Err(invalid(
+                "TerrainTiles: tile_size must be non-zero".to_string(),
+            ));
+        }
+        let samples = tile_size
+            .checked_mul(tile_size)
+            .ok_or_else(|| invalid("TerrainTiles: tile_size overflows".to_string()))?;
+        let bytes_per_tile = samples
+            .checked_mul(4)
+            .ok_or_else(|| invalid("TerrainTiles: tile_size overflows".to_string()))?;
+
+        if !header.approximate.is_empty() && header.approximate.len() != header.coords.len() {
+            return Err(invalid(format!(
+                "TerrainTiles: {} approximate flags for {} coords",
+                header.approximate.len(),
+                header.coords.len()
+            )));
+        }
+
+        let body = &data[header_end..];
+        let expected = header
+            .coords
+            .len()
+            .checked_mul(bytes_per_tile)
+            .ok_or_else(|| invalid("TerrainTiles: payload size overflows".to_string()))?;
+        if body.len() != expected {
+            return Err(invalid(format!(
+                "TerrainTiles: {} payload bytes for {} tiles of {}x{} (expected {})",
+                body.len(),
+                header.coords.len(),
+                tile_size,
+                tile_size,
+                expected
+            )));
+        }
+
+        let tiles = body
+            .chunks_exact(bytes_per_tile)
+            .map(|chunk| {
+                chunk
+                    .chunks_exact(4)
+                    .map(|f| f32::from_le_bytes([f[0], f[1], f[2], f[3]]))
+                    .collect()
+            })
+            .collect();
+
+        Ok(Self { header, tiles })
+    }
+
+    /// Encode a frame. Used by tests and by any non-browser producer.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let header = serde_json::to_vec(&self.header).expect("TerrainTilesHeader serialises");
+        let mut buf = vec![MSG_TYPE_TERRAIN_TILES];
+        buf.extend_from_slice(&(header.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&header);
+        for tile in &self.tiles {
+            for h in tile {
+                buf.extend_from_slice(&h.to_le_bytes());
+            }
+        }
+        buf
+    }
+}
+
 /// All possible outgoing messages
 #[derive(Debug, Clone)]
 pub enum OutgoingMessage {
@@ -1222,6 +1438,7 @@ pub enum OutgoingMessage {
     VehicleMessage(VehicleMessage),
     ConfigResult(ConfigResult),
     TerrainOrigin(TerrainOrigin),
+    TerrainNeed(TerrainNeed),
     SnapshotCaptured(SnapshotCaptured),
     RestoreResult(RestoreResult),
     Capabilities(Capabilities),
@@ -1240,6 +1457,7 @@ impl OutgoingMessage {
             OutgoingMessage::VehicleMessage(v) => v.to_bytes(),
             OutgoingMessage::ConfigResult(r) => r.to_bytes(),
             OutgoingMessage::TerrainOrigin(t) => t.to_bytes(),
+            OutgoingMessage::TerrainNeed(t) => t.to_bytes(),
             OutgoingMessage::SnapshotCaptured(s) => s.to_bytes(),
             OutgoingMessage::RestoreResult(r) => r.to_bytes(),
             OutgoingMessage::Capabilities(c) => c.to_bytes(),
@@ -1261,6 +1479,7 @@ pub enum IncomingMessage {
     ApplyPreflightParams,
     SnapshotStored(SnapshotStored),
     RestoreSnapshot(RestoreSnapshot),
+    TerrainTiles(TerrainTiles),
 }
 
 impl IncomingMessage {
@@ -1280,6 +1499,9 @@ impl IncomingMessage {
             MSG_TYPE_CONFIGURE_BUILD => Ok(IncomingMessage::ConfigureBuild(
                 ConfigureBuild::from_bytes(data)?,
             )),
+            MSG_TYPE_TERRAIN_TILES => Ok(IncomingMessage::TerrainTiles(TerrainTiles::from_bytes(
+                data,
+            )?)),
             MSG_TYPE_SHUTDOWN => Ok(IncomingMessage::Shutdown),
             MSG_TYPE_REQUEST_PREFLIGHT_CHECK => Ok(IncomingMessage::RequestPreflightCheck),
             MSG_TYPE_APPLY_PREFLIGHT_PARAMS => Ok(IncomingMessage::ApplyPreflightParams),
@@ -1830,5 +2052,308 @@ mod preflight_identity_tests {
         };
         let body: serde_json::Value = serde_json::from_slice(&status.to_bytes()[1..]).unwrap();
         assert!(body.get("board_identity").is_none());
+    }
+}
+
+#[cfg(test)]
+mod flight_location_tests {
+    use super::*;
+
+    /// Minimal valid ConfigureBuild JSON, with `extra` spliced in.
+    fn configure_build_json(extra: &str) -> Vec<u8> {
+        let json = format!(
+            r#"{{"motor_slug":"m","prop_diameter_inches":5.0,"frame_weight_g":250.0{extra}}}"#
+        );
+        let mut bytes = vec![MSG_TYPE_CONFIGURE_BUILD];
+        bytes.extend_from_slice(json.as_bytes());
+        bytes
+    }
+
+    fn parse(extra: &str) -> ConfigureBuild {
+        ConfigureBuild::from_bytes(&configure_build_json(extra)).expect("parses")
+    }
+
+    #[test]
+    fn a_chosen_location_is_the_one_used() {
+        let cfg = parse(r#","flight_location":{"lat":51.5,"lon":-0.12}"#);
+        let loc = cfg.resolve_flight_location().expect("valid");
+        assert_eq!(loc.lat, 51.5);
+        assert_eq!(loc.lon, -0.12);
+    }
+
+    #[test]
+    fn an_absent_location_falls_back_to_the_default_rather_than_failing() {
+        // A browser that predates location selection must degrade, not break.
+        let cfg = parse("");
+        assert!(cfg.flight_location.is_none());
+        assert_eq!(
+            cfg.resolve_flight_location().expect("defaults"),
+            FlightLocation::DEFAULT
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_latitude_fails_and_names_the_field() {
+        let cfg = parse(r#","flight_location":{"lat":91.0,"lon":0.0}"#);
+        let err = cfg.resolve_flight_location().expect_err("rejected");
+        assert!(err.contains("lat"), "error should name the field: {err}");
+    }
+
+    #[test]
+    fn an_out_of_range_longitude_fails_and_names_the_field() {
+        let cfg = parse(r#","flight_location":{"lat":0.0,"lon":-180.5}"#);
+        let err = cfg.resolve_flight_location().expect_err("rejected");
+        assert!(err.contains("lon"), "error should name the field: {err}");
+    }
+
+    #[test]
+    fn the_range_boundaries_are_inclusive() {
+        for (lat, lon) in [(90.0, 180.0), (-90.0, -180.0)] {
+            let cfg = parse(&format!(
+                r#","flight_location":{{"lat":{lat},"lon":{lon}}}"#
+            ));
+            assert!(
+                cfg.resolve_flight_location().is_ok(),
+                "({lat}, {lon}) is a real point on Earth"
+            );
+        }
+    }
+
+    #[test]
+    fn non_finite_coordinates_are_rejected() {
+        // NaN fails every comparison, so a range check alone would admit it and
+        // it would then poison every tile coord and sensor reading downstream.
+        // JSON has no NaN literal, so this is constructed directly.
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                FlightLocation { lat: bad, lon: 0.0 }.validate().is_err(),
+                "lat {bad} must be rejected"
+            );
+            assert!(
+                FlightLocation { lat: 0.0, lon: bad }.validate().is_err(),
+                "lon {bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn origin_elevation_is_optional_and_distinguishes_unknown_from_zero() {
+        // Sea level is a real datum; "no data covered the origin" is not the
+        // same answer and must not collapse into it.
+        assert_eq!(parse("").origin_elevation_msl, None);
+        assert_eq!(
+            parse(r#","origin_elevation_msl":0.0"#).origin_elevation_msl,
+            Some(0.0)
+        );
+        assert_eq!(
+            parse(r#","origin_elevation_msl":1655.0"#).origin_elevation_msl,
+            Some(1655.0)
+        );
+    }
+}
+
+#[cfg(test)]
+mod terrain_transport_tests {
+    use super::*;
+    /// The exact bytes of a known frame, shared verbatim with the browser
+    /// client's test (`apps/web/lib/hitl/__tests__/terrain-transport.test.ts`).
+    ///
+    /// Both encoders are pinned to this one literal, so a change on either side
+    /// that the other does not match fails here rather than in a live session,
+    /// where the symptom would be a drone colliding with terrain nobody can see.
+    const SHARED_WIRE_FIXTURE_HEX: &str = "186e0000007b226f726967696e223a7b226c6174223a34302e302c226c6f6e223a2d3130352e32377d2c2274696c655f73697a65223a322c22636f6f726473223a5b7b2278223a333430312c2279223a363230322c227a223a31347d5d2c22617070726f78696d617465223a5b747275655d7d0000c03f000010c00000964300000000";
+
+    fn shared_fixture() -> TerrainTiles {
+        TerrainTiles {
+            header: TerrainTilesHeader {
+                origin: FlightLocation {
+                    lat: 40.0,
+                    lon: -105.27,
+                },
+                tile_size: 2,
+                coords: vec![WireTileCoord {
+                    x: 3401,
+                    y: 6202,
+                    z: 14,
+                }],
+                approximate: vec![true],
+            },
+            tiles: vec![vec![1.5f32, -2.25, 300.0, 0.0]],
+        }
+    }
+
+    fn fixture_bytes() -> Vec<u8> {
+        (0..SHARED_WIRE_FIXTURE_HEX.len() / 2)
+            .map(|i| u8::from_str_radix(&SHARED_WIRE_FIXTURE_HEX[i * 2..i * 2 + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn the_wire_format_matches_the_shared_fixture() {
+        let hex: String = shared_fixture()
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(hex, SHARED_WIRE_FIXTURE_HEX);
+    }
+
+    #[test]
+    fn the_shared_fixture_decodes_back_to_its_values() {
+        let decoded = TerrainTiles::from_bytes(&fixture_bytes()).expect("decodes");
+        assert_eq!(decoded, shared_fixture());
+    }
+
+    const T: usize = 4; // tiny tile edge; the format does not care about 256
+
+    fn coord(x: u32, y: u32) -> WireTileCoord {
+        WireTileCoord { x, y, z: 14 }
+    }
+
+    fn frame(coords: Vec<WireTileCoord>) -> TerrainTiles {
+        let tiles = coords
+            .iter()
+            .enumerate()
+            .map(|(i, _)| (0..T * T).map(|s| (i * 100 + s) as f32).collect())
+            .collect();
+        TerrainTiles {
+            header: TerrainTilesHeader {
+                origin: FlightLocation::DEFAULT,
+                tile_size: T as u32,
+                approximate: vec![false; coords.len()],
+                coords,
+            },
+            tiles,
+        }
+    }
+
+    #[test]
+    fn the_new_message_bytes_collide_with_nothing() {
+        let used = [
+            MSG_TYPE_STATE_UPDATE,
+            MSG_TYPE_HANDSHAKE_ACK,
+            MSG_TYPE_COMMAND_ACK,
+            MSG_TYPE_NSH_RESPONSE,
+            MSG_TYPE_CONNECTION_STATUS,
+            MSG_TYPE_VEHICLE_MESSAGE,
+            MSG_TYPE_SHUTDOWN,
+            MSG_TYPE_CONFIG_RESULT,
+            MSG_TYPE_TERRAIN_ORIGIN,
+            MSG_TYPE_PREFLIGHT_STATUS,
+            MSG_TYPE_PREFLIGHT_APPLY_RESULT,
+            MSG_TYPE_SNAPSHOT_CAPTURED,
+            MSG_TYPE_RESTORE_RESULT,
+            MSG_TYPE_CAPABILITIES,
+            MSG_TYPE_COMMAND,
+            MSG_TYPE_HANDSHAKE,
+            MSG_TYPE_NSH_COMMAND,
+            MSG_TYPE_CONFIGURE_BUILD,
+            MSG_TYPE_REQUEST_PREFLIGHT_CHECK,
+            MSG_TYPE_APPLY_PREFLIGHT_PARAMS,
+            MSG_TYPE_SNAPSHOT_STORED,
+            MSG_TYPE_RESTORE_SNAPSHOT,
+        ];
+        for existing in used {
+            assert_ne!(MSG_TYPE_TERRAIN_NEED, existing, "0x0F already taken");
+            assert_ne!(MSG_TYPE_TERRAIN_TILES, existing, "0x18 already taken");
+        }
+        assert_ne!(MSG_TYPE_TERRAIN_NEED, MSG_TYPE_TERRAIN_TILES);
+    }
+
+    #[test]
+    fn terrain_need_round_trips_through_its_tag() {
+        let need = TerrainNeed {
+            coords: vec![coord(3401, 6202), coord(3402, 6202)],
+        };
+        let bytes = need.to_bytes();
+        assert_eq!(bytes[0], MSG_TYPE_TERRAIN_NEED);
+        let decoded: TerrainNeed = serde_json::from_slice(&bytes[1..]).unwrap();
+        assert_eq!(decoded.coords, need.coords);
+    }
+
+    #[test]
+    fn an_empty_need_is_representable() {
+        // The steady state. It is not normally sent, but must not be malformed.
+        let bytes = TerrainNeed { coords: vec![] }.to_bytes();
+        let decoded: TerrainNeed = serde_json::from_slice(&bytes[1..]).unwrap();
+        assert!(decoded.coords.is_empty());
+    }
+
+    #[test]
+    fn terrain_tiles_round_trip_exactly() {
+        let original = frame(vec![coord(3401, 6202), coord(3402, 6202)]);
+        let decoded = TerrainTiles::from_bytes(&original.to_bytes()).expect("round-trips");
+        assert_eq!(decoded.header, original.header);
+        assert_eq!(decoded.tiles, original.tiles);
+        // Heights survive bit-exact: these are the numbers the physics collides
+        // against and the viewer draws, so any lossy step here is a divergence.
+        assert_eq!(decoded.tiles[1][5], 105.0);
+    }
+
+    #[test]
+    fn terrain_tiles_dispatches_from_incoming_message() {
+        let bytes = frame(vec![coord(1, 2)]).to_bytes();
+        match IncomingMessage::from_bytes(&bytes).expect("dispatches") {
+            IncomingMessage::TerrainTiles(t) => {
+                assert_eq!(t.header.coords, vec![coord(1, 2)]);
+                assert_eq!(t.tiles.len(), 1);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_payload_that_does_not_match_the_declared_tile_size_is_rejected() {
+        let mut bytes = frame(vec![coord(1, 2)]).to_bytes();
+        bytes.truncate(bytes.len() - 4); // drop one sample
+        let err = TerrainTiles::from_bytes(&bytes).expect_err("rejected");
+        assert!(
+            format!("{err}").contains("payload bytes"),
+            "should name the mismatch: {err}"
+        );
+    }
+
+    #[test]
+    fn a_truncated_header_is_rejected_rather_than_read_as_heights() {
+        let bytes = frame(vec![coord(1, 2)]).to_bytes();
+        for cut in [1usize, 4, 6] {
+            assert!(
+                TerrainTiles::from_bytes(&bytes[..cut]).is_err(),
+                "a {cut}-byte frame must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_tile_size_is_rejected_before_it_divides_anything() {
+        let mut f = frame(vec![coord(1, 2)]);
+        f.header.tile_size = 0;
+        f.tiles = vec![vec![]];
+        let err = TerrainTiles::from_bytes(&f.to_bytes()).expect_err("rejected");
+        assert!(format!("{err}").contains("tile_size"), "{err}");
+    }
+
+    #[test]
+    fn mismatched_approximate_flags_are_rejected() {
+        // A positional array that does not line up would mislabel provenance,
+        // and provenance drives the "approximate terrain" warning.
+        let mut f = frame(vec![coord(1, 2), coord(2, 2)]);
+        f.header.approximate = vec![true];
+        let err = TerrainTiles::from_bytes(&f.to_bytes()).expect_err("rejected");
+        assert!(format!("{err}").contains("approximate"), "{err}");
+    }
+
+    #[test]
+    fn an_oversized_frame_is_refused_without_allocating_it() {
+        let bytes = vec![MSG_TYPE_TERRAIN_TILES; TerrainTiles::MAX_FRAME_BYTES + 1];
+        let err = TerrainTiles::from_bytes(&bytes).expect_err("rejected");
+        assert!(format!("{err}").contains("exceeds"), "{err}");
+    }
+
+    #[test]
+    fn a_wrong_tag_byte_is_refused() {
+        let mut bytes = frame(vec![coord(1, 2)]).to_bytes();
+        bytes[0] = MSG_TYPE_COMMAND;
+        assert!(TerrainTiles::from_bytes(&bytes).is_err());
     }
 }

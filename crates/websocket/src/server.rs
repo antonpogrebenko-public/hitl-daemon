@@ -24,7 +24,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::interval;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// WebSocket server configuration
 #[derive(Debug, Clone)]
@@ -62,6 +62,9 @@ struct AppState {
     terrain_origin_tx: Option<broadcast::Sender<crate::protocol::TerrainOrigin>>,
     /// Cached latest terrain origin (sent to late-joining clients)
     terrain_origin_latest: Arc<tokio::sync::RwLock<Option<crate::protocol::TerrainOrigin>>>,
+    /// Terrain the physics collides against, so the server can ask the browser
+    /// for what it is missing around the vehicle.
+    terrain: Option<Arc<terrain::TerrainCache>>,
     /// System-initiated `ConfigResult` messages (e.g. from `repush_if_configured`
     /// on FC reconnect). Forwarded to all connected clients so the browser can
     /// display the spinner / ready state without requiring a manual re-configure.
@@ -88,6 +91,9 @@ pub struct WebSocketServer {
     vehicle_msg_rx: Option<broadcast::Receiver<VehicleMessage>>,
     /// Channel to receive terrain origin for broadcasting to clients
     terrain_origin_rx: Option<broadcast::Receiver<crate::protocol::TerrainOrigin>>,
+    /// Terrain the physics collides against, so the server can ask browsers for
+    /// what is missing around the vehicle.
+    terrain: Option<Arc<terrain::TerrainCache>>,
     /// Shutdown signal that browser can trigger
     shutdown_signal: Arc<AtomicBool>,
     /// Build configuration handler
@@ -114,6 +120,7 @@ impl WebSocketServer {
             conn_status_rx: None,
             vehicle_msg_rx: None,
             terrain_origin_rx: None,
+            terrain: None,
             shutdown_signal: Arc::new(AtomicBool::new(false)),
             build_config_handler: None,
             preflight_handler: None,
@@ -161,6 +168,12 @@ impl WebSocketServer {
         terrain_origin_rx: broadcast::Receiver<crate::protocol::TerrainOrigin>,
     ) {
         self.terrain_origin_rx = Some(terrain_origin_rx);
+    }
+
+    /// Give the server the terrain cache, so it can ask connected browsers for
+    /// the tiles the physics is missing around the vehicle.
+    pub fn set_terrain_cache(&mut self, terrain: Arc<terrain::TerrainCache>) {
+        self.terrain = Some(terrain);
     }
 
     /// Set the build configuration handler
@@ -377,6 +390,10 @@ impl WebSocketServer {
             tx
         });
 
+        if let Some(terrain) = &self.terrain {
+            handler.set_terrain_cache(terrain.clone());
+        }
+
         let app_state = Arc::new(AppState {
             handler,
             update_interval,
@@ -385,6 +402,7 @@ impl WebSocketServer {
             vehicle_msg_tx,
             terrain_origin_tx,
             terrain_origin_latest,
+            terrain: self.terrain.clone(),
             system_config_tx,
             provisioning_tx,
         });
@@ -485,6 +503,20 @@ const MAX_INCOMING_MESSAGE_SIZE: usize = 64 * 1024;
 /// How often the server sends a WebSocket Ping frame to each client
 const PING_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How often the daemon re-states the terrain it is missing.
+///
+/// The vehicle needs at least a tile of margin ahead of it, and a z14 tile is
+/// ~1.9 km, so half a second is many times faster than a multirotor can outrun
+/// its own coverage.
+const TERRAIN_NEED_INTERVAL: Duration = Duration::from_millis(500);
+/// Slower cadence once requests are going unanswered, so a browser that cannot
+/// supply a tile is not asked at full rate for the rest of the session.
+const TERRAIN_NEED_IDLE_INTERVAL: Duration = Duration::from_secs(5);
+/// Consecutive identical unanswered requests before backing off.
+const TERRAIN_NEED_BACKOFF_AFTER: u32 = 6;
+/// Tile ring the physics keeps around the vehicle.
+const TERRAIN_NEED_RADIUS: u32 = 1;
+
 /// Maximum time allowed between any received message before the connection
 /// is considered a zombie and closed (3 missed pings)
 const PONG_TIMEOUT: Duration = Duration::from_secs(15);
@@ -516,17 +548,19 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     // Subscribe to terrain origin if available
     let mut terrain_origin_rx = state.terrain_origin_tx.as_ref().map(|tx| tx.subscribe());
 
+    // The cache this client is asked to fill.
+    let terrain_state = state.terrain.clone();
+
     // Capabilities go out first, before any state update, so a client never
     // has to interpret a frame before it knows what this daemon speaks.
     {
-        let capabilities = OutgoingMessage::Capabilities(crate::protocol::Capabilities::current(
-            format!(
+        let capabilities =
+            OutgoingMessage::Capabilities(crate::protocol::Capabilities::current(format!(
                 "{}.{}.{}",
                 handler.version_major(),
                 handler.version_minor(),
                 handler.version_patch()
-            ),
-        ));
+            )));
         if ws_sender
             .send(Message::Binary(capabilities.to_bytes().into()))
             .await
@@ -561,12 +595,64 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     // Task to send state updates and responses to client
     let send_task = tokio::spawn(async move {
         let mut ping_ticker = interval(PING_INTERVAL);
+        // Reconciliation, not RPC: the daemon re-states what it still lacks on
+        // a slow tick, so a dropped frame, a tab reload or a daemon restart all
+        // recover with no acknowledgement bookkeeping. Backs off to
+        // TERRAIN_NEED_IDLE_INTERVAL once a request has gone unanswered, so a
+        // browser that cannot supply a tile is not asked at full rate forever.
+        let mut terrain_need_ticker = interval(TERRAIN_NEED_INTERVAL);
+        terrain_need_ticker.tick().await;
+        let mut terrain_need_unanswered: u32 = 0;
+        let mut last_terrain_need: Vec<crate::protocol::WireTileCoord> = Vec::new();
         // The first tick fires immediately; skip it so the first ping goes out after
         // one full interval rather than at connection establishment.
         ping_ticker.tick().await;
 
         loop {
             tokio::select! {
+                // Ask the browser for terrain the physics is missing.
+                _ = terrain_need_ticker.tick() => {
+                    if let Some(cache) = &terrain_state {
+                        let coords: Vec<crate::protocol::WireTileCoord> = cache
+                            .missing_around_vehicle(TERRAIN_NEED_RADIUS)
+                            .into_iter()
+                            .map(|c| crate::protocol::WireTileCoord { x: c.x, y: c.y, z: c.z })
+                            .collect();
+
+                        if coords.is_empty() {
+                            // The steady state. Say nothing and reset the backoff.
+                            terrain_need_unanswered = 0;
+                            last_terrain_need.clear();
+                            terrain_need_ticker = interval(TERRAIN_NEED_INTERVAL);
+                            terrain_need_ticker.tick().await;
+                        } else {
+                            if coords == last_terrain_need {
+                                terrain_need_unanswered =
+                                    terrain_need_unanswered.saturating_add(1);
+                                if terrain_need_unanswered == TERRAIN_NEED_BACKOFF_AFTER {
+                                    debug!(
+                                        tiles = coords.len(),
+                                        "Terrain requests going unanswered; backing off"
+                                    );
+                                    terrain_need_ticker = interval(TERRAIN_NEED_IDLE_INTERVAL);
+                                    terrain_need_ticker.tick().await;
+                                }
+                            } else {
+                                // A different set: progress is being made.
+                                terrain_need_unanswered = 0;
+                                last_terrain_need = coords.clone();
+                            }
+
+                            let msg = OutgoingMessage::TerrainNeed(
+                                crate::protocol::TerrainNeed { coords },
+                            );
+                            if ws_sender.send(Message::Binary(msg.to_bytes().into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+
                 // Handle state updates from broadcast
                 result = state_rx.recv() => {
                     match result {

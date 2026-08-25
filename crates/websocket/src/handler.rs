@@ -67,6 +67,9 @@ pub struct ConnectionHandler {
     nsh_tx: Option<mpsc::Sender<ValidatedNshCommand>>,
     /// Handler for build configuration requests
     build_config: Option<Arc<BuildConfigHandler>>,
+    /// Terrain the physics collides against. The browser is the sole fetcher
+    /// and pushes decoded tiles in here; the daemon never fetches its own.
+    terrain: Option<Arc<terrain::TerrainCache>>,
     /// Handler for the preflight HITL/quadrotor gate
     preflight: Option<Arc<PreflightHandler>>,
     /// Where a browser's snapshot-persistence acknowledgement is delivered.
@@ -105,6 +108,7 @@ impl ConnectionHandler {
             command_tx,
             nsh_tx: None,
             build_config: None,
+            terrain: None,
             preflight: None,
             snapshot_ack_tx: None,
             recharge_fn: None,
@@ -113,6 +117,11 @@ impl ConnectionHandler {
             next_client_id: Arc::new(RwLock::new(1)),
             shutdown_signal,
         }
+    }
+
+    /// Give the handler the terrain cache tiles should be ingested into.
+    pub fn set_terrain_cache(&mut self, terrain: Arc<terrain::TerrainCache>) {
+        self.terrain = Some(terrain);
     }
 
     /// Set the NSH command channel
@@ -235,6 +244,61 @@ impl ConnectionHandler {
                 };
                 let result = handler.handle(build, progress_tx.clone()).await;
                 Ok(Some(OutgoingMessage::ConfigResult(result)))
+            }
+            IncomingMessage::TerrainTiles(frame) => {
+                let Some(cache) = &self.terrain else {
+                    // Never silently discard: dropping terrain leaves the
+                    // physics on flat ground while the viewer draws hills,
+                    // which is the exact divergence this design removes.
+                    return Err("Terrain ingress is not configured on this daemon".to_string());
+                };
+
+                let tile_size = frame.header.tile_size;
+                let approximate = &frame.header.approximate;
+                let tiles: Vec<(terrain::TileCoord, Vec<f32>, bool)> = frame
+                    .header
+                    .coords
+                    .iter()
+                    .zip(frame.tiles.into_iter())
+                    .enumerate()
+                    .map(|(i, (c, heights))| {
+                        (
+                            terrain::TileCoord {
+                                x: c.x,
+                                y: c.y,
+                                z: c.z,
+                            },
+                            heights,
+                            approximate.get(i).copied().unwrap_or(false),
+                        )
+                    })
+                    .collect();
+
+                let report = cache.insert_tiles(tile_size, tiles);
+                debug!(
+                    client_id,
+                    accepted = report.accepted,
+                    rejected = report.rejected.len(),
+                    evicted = report.evicted,
+                    "Terrain tiles ingested"
+                );
+
+                // A frame in which nothing survived validation is reported back
+                // rather than acknowledged, so a browser sending malformed
+                // tiles finds out instead of watching the vehicle fly over
+                // ground that never arrives.
+                if report.accepted == 0 && !report.rejected.is_empty() {
+                    let (coord, reason) = &report.rejected[0];
+                    return Err(format!(
+                        "All {} terrain tiles rejected; first was {}/{}/{}: {}",
+                        report.rejected.len(),
+                        coord.z,
+                        coord.x,
+                        coord.y,
+                        reason
+                    ));
+                }
+                Ok(None)
             }
             IncomingMessage::Shutdown => {
                 info!(client_id, "Shutdown command received from browser");
@@ -602,6 +666,7 @@ impl Clone for ConnectionHandler {
             command_tx: self.command_tx.clone(),
             nsh_tx: self.nsh_tx.clone(),
             build_config: self.build_config.clone(),
+            terrain: self.terrain.clone(),
             preflight: self.preflight.clone(),
             snapshot_ack_tx: self.snapshot_ack_tx.clone(),
             state_rx: self.state_rx.resubscribe(),

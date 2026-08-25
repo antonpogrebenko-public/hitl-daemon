@@ -5,6 +5,58 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.0] - 2026-08-25
+
+### Changed
+
+- **BREAKING: the daemon no longer fetches terrain.** The browser is now the
+  sole fetcher of elevation data: it resolves each tile, decodes it once, and
+  pushes the decoded heights over the WebSocket. That is what makes "the physics
+  collides against what the viewer draws" true by construction, rather than two
+  systems independently resolving the same coordinate and happening to agree.
+  Previously the browser fell back to a global elevation source for any
+  coordinate on Earth while the daemon had no fallback at all, so off the one
+  baked region the user saw hills and flew through them.
+
+  `ConfigureBuild` loses `terrain_url`; the S3 host allowlist is gone; the
+  `terrain` crate no longer depends on `reqwest` (or `serde`, `serde_json` or
+  `tokio` — it is now a pure in-memory cache). `--terrain-url` is replaced by
+  `--terrain-pack <dir>`, which reads `{z}/{x}/{y}.bin` from disk through the
+  same validated ingress for headless and CI runs.
+
+- **BREAKING: `ConfigureBuild` carries the flight location.** New
+  `flight_location { lat, lon }` and `origin_elevation_msl`. A browser that
+  sends neither still works and gets the documented default, so a stale tab
+  degrades rather than breaking.
+
+### Fixed
+
+- **The vertical datum could differ between ground contact and the sensors.**
+  The CLI path adopted the sampled terrain elevation into `reference_alt` while
+  the WebSocket path did not, so ground collision sat on the terrain and the
+  barometer and HIL_GPS sat on `--alt` — a standing altitude error the EKF had
+  to absorb. The datum is now a single shared value set at configuration time
+  and read by all three together. The terrain origin broadcast to the browser
+  had the same fault, sending a datum snapshotted at startup; it now sends the
+  live one.
+
+### Added
+
+- **Terrain follows the vehicle.** The fixed 3x3 ring loaded once at startup is
+  replaced by a resident set bounded by tile count, evicting furthest-from-
+  vehicle first and never the tile underfoot. The daemon asks the browser for
+  what it is missing (`TerrainNeed`, `0x0F`) and the browser supplies it
+  (`TerrainTiles`, `0x18`); unmet requests are simply re-stated, so the exchange
+  recovers from dropped frames, tab reloads and restarts with no acknowledgement
+  bookkeeping, and backs off when they go unanswered.
+
+- **Every tile is validated at the boundary.** The WebSocket is now a data
+  ingress, so submissions are checked for sample count, coordinate range,
+  distance from the origin, and elevations that are finite and within Earth's
+  real range, under a hard resident-memory bound. A rejected tile leaves
+  previously accepted terrain untouched, and validation runs outside the write
+  lock so a flood cannot stall the 400 Hz loop.
+
 ## [0.18.1] - 2026-08-23
 
 ### Fixed

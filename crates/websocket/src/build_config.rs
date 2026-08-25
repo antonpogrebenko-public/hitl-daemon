@@ -65,12 +65,17 @@ pub struct BuildConfigHandler {
     /// those emitted by `repush_if_configured` on FC reconnect). The
     /// WebSocket server subscribes and forwards to all connected clients.
     system_config_tx: broadcast::Sender<OutgoingMessage>,
-    /// Shared terrain cache. When ConfigureBuild includes a terrain_url,
-    /// we validate and load tiles into this cache. The simulation loop
-    /// already holds the same Arc and will pick up the new data.
+    /// Shared terrain cache. The daemon never fetches tiles itself: the browser
+    /// is the sole fetcher and pushes decoded heights in over the WebSocket, so
+    /// the physics collides against exactly what the viewer draws. The
+    /// simulation loop holds the same Arc and picks up whatever lands here.
     terrain_cache: Option<std::sync::Arc<terrain::TerrainCache>>,
-    /// Reference position for terrain loading (lat, lon, alt)
+    /// Origin the terrain cache is anchored to (lat, lon, alt).
     terrain_ref: Mutex<(f64, f64, f64)>,
+    /// The flight's origin and vertical datum, shared with the simulation loop.
+    /// `ConfigureBuild` sets it, so ground contact, the barometer and HIL_GPS
+    /// adopt the browser's chosen location and elevation together.
+    flight_origin: Option<std::sync::Arc<simulation::SharedOrigin>>,
 }
 
 /// Snapshot of the parameters that were last successfully verified on PX4.
@@ -90,6 +95,7 @@ impl BuildConfigHandler {
         param_value_tx: Option<broadcast::Sender<ParamValue>>,
         terrain_cache: Option<std::sync::Arc<terrain::TerrainCache>>,
         terrain_ref: (f64, f64, f64),
+        flight_origin: Option<std::sync::Arc<simulation::SharedOrigin>>,
     ) -> Self {
         let api_url =
             std::env::var("RELEASE_API_URL").unwrap_or_else(|_| DEFAULT_API_URL.to_string());
@@ -111,31 +117,7 @@ impl BuildConfigHandler {
             system_config_tx,
             terrain_cache,
             terrain_ref: Mutex::new(terrain_ref),
-        }
-    }
-
-    /// Load terrain from URL if provided and valid
-    pub async fn load_terrain_if_provided(
-        &self,
-        config: &crate::protocol::ConfigureBuild,
-    ) -> Result<bool, String> {
-        let url = match config.validate_terrain_url()? {
-            Some(u) => u,
-            None => return Ok(false),
-        };
-
-        let cache = match &self.terrain_cache {
-            Some(c) => c,
-            None => return Err("Terrain cache not initialized".to_string()),
-        };
-
-        let (lat, lon, _alt) = *self.terrain_ref.lock().unwrap();
-
-        if cache.load(&url, lat, lon).await {
-            info!("Terrain loaded from {}", url);
-            Ok(true)
-        } else {
-            Err(format!("Failed to load terrain from {}", url))
+            flight_origin,
         }
     }
 
@@ -200,9 +182,47 @@ impl BuildConfigHandler {
     ) -> ConfigResult {
         Self::report_stage(&progress_tx, ConfigStage::FetchingSpecs).await;
 
-        // Load terrain if URL provided (non-blocking for config flow)
-        if let Err(e) = self.load_terrain_if_provided(&request).await {
-            warn!("Terrain load failed: {}", e);
+        // Resolve the origin and datum before anything else. An invalid
+        // location fails the whole configuration: the caller asked to fly
+        // somewhere specific and must not be flown somewhere else instead.
+        let location = match request.resolve_flight_location() {
+            Ok(loc) => loc,
+            Err(e) => {
+                return ConfigResult {
+                    state: ConfigState::Error,
+                    success: false,
+                    error: Some(e),
+                    config: None,
+                    stage: None,
+                };
+            }
+        };
+        if let Some(origin) = &self.flight_origin {
+            let fallback_alt = self.terrain_ref.lock().unwrap().2;
+            origin.set(
+                location.lat,
+                location.lon,
+                request.origin_elevation_msl,
+                fallback_alt,
+            );
+            let resolved = origin.get();
+            if resolved.from_terrain {
+                info!(
+                    lat = resolved.lat,
+                    lon = resolved.lon,
+                    datum = resolved.alt_datum,
+                    "Flight origin set; terrain elevation is the altitude datum"
+                );
+            } else {
+                warn!(
+                    lat = resolved.lat,
+                    lon = resolved.lon,
+                    datum = resolved.alt_datum,
+                    "Flight origin set but no elevation data covered it; \
+                     falling back to the configured altitude for ground \
+                     contact, barometer and GPS alike"
+                );
+            }
         }
 
         let motor_specs = match self.fetch_motor_specs(&request.motor_slug).await {
@@ -1299,6 +1319,7 @@ mod tests {
             param_value_tx,
             None,
             (40.0, -105.0, 1655.0),
+            None,
         )
     }
 
@@ -1584,6 +1605,7 @@ mod reconnect_repush_tests {
             Some(pv_tx),
             None,
             (40.0, -105.0, 1655.0),
+            None,
         )
     }
 

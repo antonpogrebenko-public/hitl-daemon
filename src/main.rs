@@ -11,7 +11,7 @@ use mavlink::ardupilotmega::MavMessage;
 use mavlink_io::async_io::{reconnect_delay, MavlinkIo, NshRequest};
 use mavlink_io::serial::detect_flight_controller;
 use protocol::{ActuatorOutputs, DaemonState, DaemonStatus};
-use simulation::{SimulationConfig, SimulationLoop, SimulationState, TerrainCache};
+use simulation::{SharedOrigin, SimulationConfig, SimulationLoop, SimulationState, TerrainCache};
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -26,6 +26,7 @@ use websocket::{
     WebSocketServer, WebSocketServerConfig,
 };
 
+mod terrain_pack;
 mod tui;
 mod update;
 
@@ -76,9 +77,13 @@ struct Args {
     #[arg(long)]
     log_file: Option<String>,
 
-    /// Terrain tiles URL for ground collision (e.g. https://th3seus-terrain.s3.amazonaws.com/tiles)
+    /// Local terrain tile pack for ground collision, laid out `{z}/{x}/{y}.bin`.
+    ///
+    /// For headless and CI runs. With a browser attached the tiles arrive over
+    /// the WebSocket instead — the daemon never fetches terrain itself, so that
+    /// the physics cannot resolve a tile differently from the viewer.
     #[arg(long)]
-    terrain_url: Option<String>,
+    terrain_pack: Option<std::path::PathBuf>,
 
     /// UDP port for QGroundControl bridge (0 to disable)
     #[arg(long, default_value = "14550")]
@@ -250,8 +255,9 @@ fn spawn_simulation_thread(
         hitl_sensors::SensorsConfig,
     )>,
     sim_stats_tx: tokio::sync::watch::Sender<protocol::SimulationStats>,
+    origin: Arc<SharedOrigin>,
 ) -> (thread::JoinHandle<()>, SimulationState) {
-    let mut sim_loop = SimulationLoop::new(config, actuator_rx, config_rx, mav_tx)
+    let mut sim_loop = SimulationLoop::new(config, actuator_rx, config_rx, mav_tx, origin)
         .with_stats_publisher(sim_stats_tx);
     let state = sim_loop.state_handle();
 
@@ -392,8 +398,8 @@ async fn main() {
     let args = Args::parse();
 
     if args.update {
-        let api_url = std::env::var("HITL_API_URL")
-            .unwrap_or_else(|_| "https://api.th3seus.net".to_string());
+        let api_url =
+            std::env::var("HITL_API_URL").unwrap_or_else(|_| "https://api.th3seus.net".to_string());
         match update::run_update(&api_url, VERSION).await {
             Ok(()) => {
                 println!("Daemon is up to date or was updated successfully.");
@@ -457,41 +463,39 @@ async fn main() {
     let terrain_cache = Arc::new(TerrainCache::new());
     let terrain_ref = (args.reference_lat, args.reference_lon, args.reference_alt);
 
-    // Load terrain tiles if URL provided via CLI (blocking - must complete before sim starts)
-    //
-    // The DEM's elevation at the origin becomes the vertical datum for the whole
-    // simulation. Three things reference "altitude" and they must agree:
-    //   - ground collision  (terrain: origin_elevation - msl)
-    //   - barometer         (reference_alt - position.down)
-    //   - HIL_GPS MSL       (reference_alt + height above origin)
-    // Keeping the CLI --alt when the DEM says otherwise leaves baro and GPS
-    // self-consistent but both offset from true MSL, so the vehicle plots below
-    // real terrain in QGC. Adopt the sampled elevation instead.
+    // Terrain for a run with no browser. The vertical datum is the elevation
+    // at the origin, and ground collision, the barometer and HIL_GPS all adopt
+    // it together — keeping the CLI --alt when the terrain says otherwise
+    // leaves baro and GPS self-consistent but both offset from true MSL, so the
+    // vehicle plots below real terrain in QGC.
     let mut reference_alt = args.reference_alt;
-    if let Some(ref url) = args.terrain_url {
-        if terrain_cache.load(url, terrain_ref.0, terrain_ref.1).await {
-            match terrain_cache.origin_elevation_msl() {
-                Some(dem_alt) => {
-                    if (dem_alt - args.reference_alt).abs() > 1.0 {
-                        info!(
-                            cli_alt = args.reference_alt,
-                            dem_alt,
-                            "Terrain loaded — adopting DEM elevation at the origin as the \
-                             altitude datum (overrides --alt)"
-                        );
-                    }
-                    reference_alt = dem_alt;
+    terrain_cache.set_origin(terrain_ref.0, terrain_ref.1, None);
+    if let Some(ref pack) = args.terrain_pack {
+        match terrain_pack::load_pack(&terrain_cache, pack) {
+            Ok(0) => warn!(
+                pack = %pack.display(),
+                "Terrain pack held no usable tiles — flying on flat ground"
+            ),
+            Ok(accepted) => {
+                // Re-anchor with the elevation sampled from the pack itself, so
+                // the datum matches the ground that is actually loaded.
+                if let Some(msl) = terrain_cache
+                    .sample_ground_ned(0.0, 0.0)
+                    .map(|_| terrain_cache.origin_elevation_msl())
+                    .flatten()
+                {
+                    reference_alt = msl;
                 }
-                None => warn!(
-                    "Terrain loaded but the origin is outside tile coverage — \
-                     keeping --alt {} as the altitude datum",
-                    args.reference_alt
-                ),
+                info!(accepted, "Terrain pack ready for ground collision");
             }
-            info!("Terrain loaded for ground collision detection");
-        } else {
-            warn!("Failed to load terrain from CLI URL - using flat ground at Z=0");
+            Err(e) => warn!(
+                pack = %pack.display(),
+                error = %e,
+                "Could not read terrain pack — flying on flat ground"
+            ),
         }
+    } else {
+        info!("No terrain pack given; terrain arrives from the browser over the WebSocket");
     }
 
     let sim_config = SimulationConfig {
@@ -575,8 +579,15 @@ async fn main() {
         Some(sim_mav_tx.clone())
     };
 
-    // Capture reference_alt before moving sim_config
-    let terrain_reference_alt = sim_config.reference_alt as f32;
+    // The shared origin the whole flight is anchored to. Ground contact, the
+    // barometer and HIL_GPS all read its datum, so there is one altitude
+    // reference rather than three that have to be kept in step. Seeded from the
+    // CLI; `ConfigureBuild` replaces it with the browser's choice.
+    let flight_origin = Arc::new(SharedOrigin::new(
+        sim_config.reference_lat,
+        sim_config.reference_lon,
+        sim_config.reference_alt,
+    ));
 
     // Spawn simulation thread
     let (sim_handle, sim_state) = spawn_simulation_thread(
@@ -586,6 +597,7 @@ async fn main() {
         shutdown.clone(),
         build_config_rx,
         sim_stats_tx,
+        flight_origin.clone(),
     );
 
     // Thread handles to join later
@@ -650,7 +662,8 @@ async fn main() {
     // was actually applied before signalling the simulation "ready" stage.
     // Capacity is generous because PX4 may emit unrelated PARAM_VALUE traffic
     // during the wait window (e.g. QGC parameter pull).
-    let (param_value_tx, _) = tokio::sync::broadcast::channel::<websocket::param_io::ParamValue>(256);
+    let (param_value_tx, _) =
+        tokio::sync::broadcast::channel::<websocket::param_io::ParamValue>(256);
 
     // Create WebSocket server
     let ws_config = WebSocketServerConfig {
@@ -697,8 +710,9 @@ async fn main() {
         nsh_tx_for_config,
         build_config_mav_tx,
         build_config_param_value_tx,
-        Some(terrain_cache),
+        Some(terrain_cache.clone()),
         terrain_ref,
+        Some(flight_origin.clone()),
     ));
     // Keep a clone for the reconnect task so it can re-push PIDs after FC power cycles.
     let build_config_handler_for_reconnect = build_config_handler.clone();
@@ -721,6 +735,11 @@ async fn main() {
 
     // Enable terrain origin broadcasting
     ws_server.set_terrain_origin_receiver(terrain_origin_tx.subscribe());
+
+    // The browser is the sole fetcher of elevation data: it pushes decoded
+    // tiles in, and the server asks it for whatever the physics still lacks
+    // around the vehicle.
+    ws_server.set_terrain_cache(terrain_cache.clone());
 
     // Get browser shutdown signal before ws_server is moved
     let ws_shutdown = ws_server.shutdown_signal();
@@ -761,8 +780,8 @@ async fn main() {
     // a corporate proxy must never stop someone flying. The result is a
     // notification, not a precondition.
     {
-        let api_url = std::env::var("HITL_API_URL")
-            .unwrap_or_else(|_| "https://api.th3seus.net".to_string());
+        let api_url =
+            std::env::var("HITL_API_URL").unwrap_or_else(|_| "https://api.th3seus.net".to_string());
         tokio::spawn(async move {
             match update::check_for_update(&api_url, VERSION).await {
                 Ok(Some(available)) => {
@@ -1318,8 +1337,8 @@ async fn main() {
                             serial_port: port_path.clone(),
                             fc_model: None,
                             bootloader_suspected: false,
-                        link_state: LinkState::Connected,
-                    });
+                            link_state: LinkState::Connected,
+                        });
 
                         // After a reconnect (not the initial connection), re-push
                         // PIDs to PX4 — a power cycle resets PX4's RAM parameters.
@@ -1350,7 +1369,11 @@ async fn main() {
                         let qgc_socket_recv = qgc_socket_reconnect.clone();
                         let vehicle_msg_tx_recv = vehicle_msg_tx.clone();
                         let terrain_origin_tx_recv = terrain_origin_tx.clone();
-                        let reference_alt_recv = terrain_reference_alt;
+                        // The live datum, not a startup snapshot: the browser
+                        // must anchor its world to the same altitude reference
+                        // the physics is using right now, and ConfigureBuild
+                        // can have replaced it since the daemon started.
+                        let flight_origin_recv = flight_origin.clone();
                         let fc_model_recv = fc_model_reconnect.clone();
                         let board_identity_recv = board_identity_reconnect.clone();
                         let conn_status_tx_recv = conn_status_tx_reconnect.clone();
@@ -1387,8 +1410,8 @@ async fn main() {
                                         serial_port: String::new(),
                                         fc_model: None,
                                         bootloader_suspected: true,
-                        link_state: LinkState::SuspectedBootloader,
-                    });
+                                        link_state: LinkState::SuspectedBootloader,
+                                    });
                                     mav_io_recv.signal_disconnect();
                                     break;
                                 }
@@ -1457,10 +1480,8 @@ async fn main() {
                                     // sends this only on request, so it arrives once
                                     // per connection after the request below.
                                     if let MavMessage::AUTOPILOT_VERSION(av) = &msg {
-                                        let derived = websocket::board_identity::derive(
-                                            av,
-                                            PX4_SYSTEM_ID,
-                                        );
+                                        let derived =
+                                            websocket::board_identity::derive(av, PX4_SYSTEM_ID);
                                         match &derived {
                                             Some(id) => info!(
                                                 board_identity = %id,
@@ -1483,8 +1504,8 @@ async fn main() {
                                         // proven. Requesting before the first heartbeat
                                         // races PX4's own startup and the reply is lost.
                                         if first_heartbeat {
-                                            let _ = mav_io_recv
-                                                .send(make_autopilot_version_request());
+                                            let _ =
+                                                mav_io_recv.send(make_autopilot_version_request());
                                         }
 
                                         // Update flight mode from custom_mode
@@ -1497,7 +1518,8 @@ async fn main() {
                                         // synchronously instead of a fresh MAVLink round-trip.
                                         let (hitl_enabled, is_quadrotor) =
                                             websocket::heartbeat_hitl_signals(hb);
-                                        sim_state_recv.set_heartbeat_status(hitl_enabled, is_quadrotor);
+                                        sim_state_recv
+                                            .set_heartbeat_status(hitl_enabled, is_quadrotor);
 
                                         use mavlink::ardupilotmega::{MavAutopilot, MavType};
                                         let mut model = fc_model_recv.write().await;
@@ -1539,8 +1561,8 @@ async fn main() {
                                                         serial_port: port_path_recv.clone(),
                                                         fc_model: Some(name.to_string()),
                                                         bootloader_suspected: false,
-                        link_state: LinkState::Connected,
-                    });
+                                                        link_state: LinkState::Connected,
+                                                    });
                                             }
                                         }
                                     }
@@ -1605,13 +1627,14 @@ async fn main() {
                                                     websocket::TerrainOrigin {
                                                         ref_lat: lat,
                                                         ref_lon: lon,
-                                                        ref_alt: reference_alt_recv,
+                                                        ref_alt: flight_origin_recv.get().alt_datum
+                                                            as f32,
                                                         source: source as u8,
                                                     },
                                                 );
                                                 info!(
                                                     lat, lon,
-                                                    alt = reference_alt_recv,
+                                                    alt = flight_origin_recv.get().alt_datum,
                                                     source = ?source,
                                                     "Terrain origin updated"
                                                 );
@@ -1743,8 +1766,8 @@ async fn main() {
             serial_port: "simulation".to_string(),
             fc_model: None,
             bootloader_suspected: false,
-                        link_state: LinkState::Searching,
-                    });
+            link_state: LinkState::Searching,
+        });
         None
     };
 

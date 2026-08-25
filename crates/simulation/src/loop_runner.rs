@@ -8,6 +8,7 @@ use hitl_physics::{
 use mavlink::ardupilotmega::{HilSensorUpdatedFlags, MavMessage, HIL_GPS_DATA, HIL_SENSOR_DATA};
 use protocol::ActuatorOutputs;
 pub use protocol::SimulationStats;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tracing::{debug, error, info, trace, warn};
@@ -139,6 +140,9 @@ const BARO_FLAGS: HilSensorUpdatedFlags = HilSensorUpdatedFlags::HIL_SENSOR_UPDA
 pub struct SimulationLoop {
     state: SimulationState,
     config: SimulationConfig,
+    /// Where the flight is and what zero altitude means. Shared with the
+    /// WebSocket task, which sets it from `ConfigureBuild`.
+    origin: Arc<crate::origin::SharedOrigin>,
     actuator_rx: Receiver<ActuatorOutputs>,
     config_rx: Receiver<(PhysicsConfig, BatteryConfig, hitl_sensors::SensorsConfig)>,
     mav_tx: Sender<MavMessage>,
@@ -196,6 +200,7 @@ impl SimulationLoop {
         actuator_rx: Receiver<ActuatorOutputs>,
         config_rx: Receiver<(PhysicsConfig, BatteryConfig, hitl_sensors::SensorsConfig)>,
         mav_tx: Sender<MavMessage>,
+        origin: Arc<crate::origin::SharedOrigin>,
     ) -> Self {
         let state = SimulationState::new(config.clone());
         // Seed from the config actually in force, not the default: relying on
@@ -205,6 +210,7 @@ impl SimulationLoop {
         Self {
             state,
             config,
+            origin,
             actuator_rx,
             config_rx,
             mav_tx,
@@ -420,6 +426,13 @@ impl SimulationLoop {
         // floor until it hits conservation::check_position_bounds's 10km
         // debug-assert, permanently killing the simulation thread.
         let terrain = self.config.terrain.as_ref().filter(|t| t.is_loaded());
+
+        // Tell the cache where the vehicle is. It orders eviction by distance
+        // from this point — so the tile underfoot is the last thing dropped —
+        // and derives which tiles to ask the browser for.
+        if let Some(terrain) = self.config.terrain.as_ref() {
+            terrain.set_vehicle_ned(state.quadrotor.position[0], state.quadrotor.position[1]);
+        }
 
         let ground_z: Option<f64> = match terrain {
             Some(terrain) => terrain
@@ -658,6 +671,10 @@ impl SimulationLoop {
         let sim_time_us;
 
         // Compute sensor inputs from physics state
+        // One read per tick: the barometer and GPS derive altitude from the
+        // same datum, so they must not straddle a change to it.
+        let origin = self.origin.get();
+
         let (accel_body, gyro_body, altitude_m, position_ned, velocity_ned, attitude) = {
             let state = self.state.read();
             sim_time_us = state.sim_time_us;
@@ -713,8 +730,11 @@ impl SimulationLoop {
                 q.angular_velocity[2],
             ];
 
-            // Altitude is negative of NED down position, plus reference altitude
-            let altitude_m = self.config.reference_alt - q.position[2];
+            // Altitude is negative of NED down position, plus the shared
+            // datum. Ground contact, this barometer and HIL_GPS all read the
+            // same `alt_datum`; when they did not, the EKF absorbed the
+            // difference as a standing altitude error.
+            let altitude_m = origin.alt_datum - q.position[2];
 
             let position_ned = [q.position[0], q.position[1], q.position[2]];
             let velocity_ned = [q.velocity[0], q.velocity[1], q.velocity[2]];
@@ -763,8 +783,8 @@ impl SimulationLoop {
             let gps = state.sensors.gps.sample(
                 &position_ned,
                 &velocity_ned,
-                self.config.reference_lat,
-                self.config.reference_lon,
+                origin.lat,
+                origin.lon,
                 time_s,
             );
 
@@ -907,11 +927,11 @@ impl SimulationLoop {
         };
         let cog_positive = if cog < 0.0 { cog + 360.0 } else { cog };
 
-        // gps.alt is AGL (height above launch point = -ned_down, no reference_alt).
-        // HIL_GPS requires MSL in millimeters, so we add reference_alt here.
-        // This is NOT double-counting: the GPS sensor deliberately omits reference_alt
-        // so that the sensor library stays free of daemon-specific config.
-        let alt_msl = gps.alt as f64 + self.config.reference_alt;
+        // gps.alt is AGL (height above launch point = -ned_down, no datum).
+        // HIL_GPS requires MSL in millimetres, so the shared datum is added
+        // here. This is NOT double-counting: the GPS sensor deliberately omits
+        // it so the sensor library stays free of daemon-specific config.
+        let alt_msl = gps.alt as f64 + self.origin.get().alt_datum;
 
         HIL_GPS_DATA {
             time_usec: time_us,
@@ -1019,9 +1039,8 @@ impl SimulationLoop {
 mod tests {
     use super::*;
     use nalgebra::{UnitQuaternion, Vector3};
-    use std::collections::HashMap;
     use std::sync::Arc;
-    use terrain::{BBox, ElevationMeta, TerrainCache, TileCoord, TileMeta, TILE_SIZE};
+    use terrain::{TerrainCache, TileCoord, TILE_SIZE};
 
     const DT: f64 = 1.0 / 400.0;
     const TEST_LAT: f64 = 40.015;
@@ -1036,7 +1055,12 @@ mod tests {
         let (actuator_tx, actuator_rx) = crossbeam_channel::unbounded();
         let (config_tx, config_rx) = crossbeam_channel::unbounded();
         let (mav_tx, mav_rx) = crossbeam_channel::unbounded();
-        let sim = SimulationLoop::new(config, actuator_rx, config_rx, mav_tx);
+        let origin = Arc::new(crate::origin::SharedOrigin::new(
+            config.reference_lat,
+            config.reference_lon,
+            config.reference_alt,
+        ));
+        let sim = SimulationLoop::new(config, actuator_rx, config_rx, mav_tx, origin);
         (
             sim,
             TestChannels {
@@ -1057,7 +1081,7 @@ mod tests {
     /// 3x3 tiles of flat terrain at `elevation_msl` around the reference point.
     fn flat_terrain(elevation_msl: f32) -> Arc<TerrainCache> {
         let center = TileCoord::from_lon_lat(TEST_LON, TEST_LAT, TEST_ZOOM);
-        let mut tiles = HashMap::new();
+        let mut tiles = Vec::new();
         for dy in -1i32..=1 {
             for dx in -1i32..=1 {
                 let coord = TileCoord {
@@ -1065,29 +1089,14 @@ mod tests {
                     y: (center.y as i32 + dy) as u32,
                     z: TEST_ZOOM,
                 };
-                tiles.insert(coord, vec![elevation_msl; TILE_SIZE * TILE_SIZE]);
+                tiles.push((coord, vec![elevation_msl; TILE_SIZE * TILE_SIZE], false));
             }
         }
 
-        let meta = TileMeta {
-            schema_version: 1,
-            provider: "test".to_string(),
-            zoom: TEST_ZOOM,
-            tile_size: TILE_SIZE as u32,
-            bbox: BBox {
-                west: -180.0,
-                south: -85.0,
-                east: 180.0,
-                north: 85.0,
-            },
-            elevation: ElevationMeta {
-                units: "meters".to_string(),
-                datum: "test".to_string(),
-            },
-        };
-
         let cache = TerrainCache::new();
-        assert!(cache.load_from_tiles(meta, tiles, TEST_LAT, TEST_LON));
+        cache.set_origin(TEST_LAT, TEST_LON, Some(elevation_msl as f64));
+        let report = cache.insert_tiles(TILE_SIZE as u32, tiles);
+        assert_eq!(report.accepted, 9, "rejected: {:?}", report.rejected);
         Arc::new(cache)
     }
 

@@ -1,38 +1,44 @@
-use parking_lot::RwLock as SyncRwLock;
-use serde::Deserialize;
-use std::collections::HashMap;
-use tracing::{debug, info, warn};
+//! Terrain the physics collides against.
+//!
+//! The daemon does not fetch elevation data. The browser is the sole fetcher:
+//! it resolves each tile (authoritative store first, free global fallback
+//! second), decodes it once, and pushes the decoded heights in over the
+//! WebSocket. That is what makes "the physics collides against what the viewer
+//! draws" true by construction rather than by two systems independently
+//! resolving the same coordinate and happening to agree.
+//!
+//! Because the WebSocket is therefore a data ingress, every tile is validated
+//! at the boundary — see [`TerrainCache::insert_tiles`].
 
-/// Samples per tile edge. Part of the public tile contract: callers of
-/// [`TerrainCache::load_from_tiles`] must supply `TILE_SIZE * TILE_SIZE` heights.
+use parking_lot::RwLock as SyncRwLock;
+use std::collections::HashMap;
+use tracing::{debug, warn};
+
+/// Samples per tile edge. Part of the tile contract shared with the store, the
+/// baker and the viewer: `{z}/{x}/{y}.bin` is `TILE_SIZE * TILE_SIZE` f32 LE,
+/// row-major from the tile's north-west corner, in MSL metres.
 pub const TILE_SIZE: usize = 256;
 const R_EARTH: f64 = 6378137.0;
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct TileMeta {
-    #[serde(rename = "schemaVersion")]
-    pub schema_version: u32,
-    pub provider: String,
-    pub zoom: u32,
-    #[serde(rename = "tileSize")]
-    pub tile_size: u32,
-    pub bbox: BBox,
-    pub elevation: ElevationMeta,
-}
+/// Elevation bounds for real terrain on Earth, with generous margin.
+///
+/// Everest is 8849 m and the lowest exposed land is about −430 m. Anything well
+/// outside this is corrupt rather than unusual, and colliding against it would
+/// fling the vehicle or bury it.
+const MIN_ELEVATION_M: f32 = -12_000.0;
+const MAX_ELEVATION_M: f32 = 12_000.0;
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct BBox {
-    pub west: f64,
-    pub south: f64,
-    pub east: f64,
-    pub north: f64,
-}
+/// Beyond this the coordinate is not a rounding error, it is a different place.
+/// A tile that far from the origin can only be a stale frame or a bad sender,
+/// and accepting it would put phantom ground under the vehicle.
+const MAX_ORIGIN_DISTANCE_M: f64 = 200_000.0;
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct ElevationMeta {
-    pub units: String,
-    pub datum: String,
-}
+/// Slippy zoom levels that exist. Also guards `2u32.pow(z)` from overflowing.
+const MAX_ZOOM: u32 = 24;
+
+/// Resident tile bound. 64 tiles of 256^2 f32 is 16 MiB, which is far more
+/// than a vehicle-centred ring needs and small enough to never matter.
+pub const DEFAULT_MAX_RESIDENT_TILES: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TileCoord {
@@ -43,7 +49,7 @@ pub struct TileCoord {
 
 impl TileCoord {
     pub fn from_lon_lat(lon: f64, lat: f64, z: u32) -> Self {
-        let n = 2_u32.pow(z) as f64;
+        let n = 2_u32.pow(z.min(MAX_ZOOM)) as f64;
         let x = ((lon + 180.0) / 360.0 * n).floor() as u32;
         let lat_rad = lat.to_radians();
         let y = ((1.0 - (lat_rad.tan() + 1.0 / lat_rad.cos()).ln() / std::f64::consts::PI) / 2.0
@@ -53,254 +59,331 @@ impl TileCoord {
     }
 }
 
+/// Why a submitted tile was refused.
+///
+/// Every rejection names the tile and the reason so the sender can be told
+/// rather than left to infer it from terrain that silently never appears.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TileRejection {
+    UnsupportedTileSize {
+        declared: u32,
+        supported: u32,
+    },
+    WrongSampleCount {
+        got: usize,
+        expected: usize,
+    },
+    CoordOutOfRange {
+        coord: TileCoord,
+    },
+    TooFarFromOrigin {
+        metres: f64,
+        limit: f64,
+    },
+    ImplausibleElevation {
+        index: usize,
+        value: f32,
+    },
+    /// No origin has been set, so "near the vehicle" has no meaning yet.
+    NoOrigin,
+}
+
+impl std::fmt::Display for TileRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedTileSize {
+                declared,
+                supported,
+            } => write!(f, "tile_size {declared} is not the supported {supported}"),
+            Self::WrongSampleCount { got, expected } => {
+                write!(f, "{got} samples, expected {expected}")
+            }
+            Self::CoordOutOfRange { coord } => write!(
+                f,
+                "coord {}/{}/{} is out of range for its zoom",
+                coord.z, coord.x, coord.y
+            ),
+            Self::TooFarFromOrigin { metres, limit } => {
+                write!(f, "{metres:.0} m from the origin, limit {limit:.0} m")
+            }
+            Self::ImplausibleElevation { index, value } => {
+                write!(f, "sample {index} is {value}, not a real elevation")
+            }
+            Self::NoOrigin => write!(f, "no flight origin has been set"),
+        }
+    }
+}
+
+/// Outcome of one `insert_tiles` call.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct InsertReport {
+    pub accepted: usize,
+    pub rejected: Vec<(TileCoord, TileRejection)>,
+    /// Tiles dropped to stay within the resident bound.
+    pub evicted: usize,
+}
+
+#[derive(Debug, Clone)]
+struct TileEntry {
+    heights: Vec<f32>,
+    /// True when this tile came from the free global fallback rather than
+    /// authoritative coverage. Drives the "approximate terrain" warning, so it
+    /// must survive ingestion.
+    approximate: bool,
+}
+
 fn tile_to_lon_lat(x: u32, y: u32, z: u32) -> (f64, f64) {
-    let n = 2_u32.pow(z) as f64;
+    let n = 2_u32.pow(z.min(MAX_ZOOM)) as f64;
     let lon = x as f64 / n * 360.0 - 180.0;
     let lat_rad = (std::f64::consts::PI * (1.0 - 2.0 * y as f64 / n))
         .sinh()
         .atan();
-    let lat = lat_rad.to_degrees();
-    (lon, lat)
+    (lon, lat_rad.to_degrees())
 }
 
-/// Sync terrain cache for use in physics loop.
-/// Populated async at startup, queried sync during simulation.
+/// Sync terrain cache for use in the physics loop.
+///
+/// Written from the WebSocket task as tiles arrive, read from the 400 Hz loop.
 pub struct TerrainCache {
     inner: SyncRwLock<TerrainCacheInner>,
+    max_resident: usize,
 }
 
 struct TerrainCacheInner {
-    meta: Option<TileMeta>,
-    tiles: HashMap<TileCoord, Vec<f32>>,
+    /// Zoom of the resident tiles. The collision set is always at one zoom —
+    /// the finest available — so ground contact never depends on which level of
+    /// detail happened to load.
+    zoom: Option<u32>,
+    tiles: HashMap<TileCoord, TileEntry>,
     origin_lat: f64,
     origin_lon: f64,
     origin_elevation: Option<f64>,
+    has_origin: bool,
+    /// Vehicle position in NED metres from the origin, for eviction ordering.
+    vehicle_ned: (f64, f64),
 }
 
 impl TerrainCache {
     pub fn new() -> Self {
+        Self::with_capacity(DEFAULT_MAX_RESIDENT_TILES)
+    }
+
+    pub fn with_capacity(max_resident: usize) -> Self {
         Self {
             inner: SyncRwLock::new(TerrainCacheInner {
-                meta: None,
+                zoom: None,
                 tiles: HashMap::new(),
                 origin_lat: 0.0,
                 origin_lon: 0.0,
                 origin_elevation: None,
+                has_origin: false,
+                vehicle_ned: (0.0, 0.0),
             }),
+            max_resident: max_resident.max(1),
         }
     }
 
-    /// Load terrain tiles around origin. Call from async context at startup.
-    pub async fn load(&self, base_url: &str, lat: f64, lon: f64) -> bool {
-        let client = reqwest::Client::new();
-        let base_url = base_url.trim_end_matches('/');
+    /// Anchor the cache to a flight origin.
+    ///
+    /// Re-anchoring to a materially different place discards the resident
+    /// tiles: they describe ground relative to the old origin, and keeping them
+    /// would compute contact against terrain anchored somewhere else.
+    pub fn set_origin(&self, lat: f64, lon: f64, elevation_msl: Option<f64>) {
+        let mut inner = self.inner.write();
+        let moved =
+            inner.has_origin && distance_m(inner.origin_lat, inner.origin_lon, lat, lon) > 1.0;
+        if moved {
+            debug!(
+                from = ?(inner.origin_lat, inner.origin_lon),
+                to = ?(lat, lon),
+                dropped = inner.tiles.len(),
+                "Terrain re-anchored; dropping tiles anchored to the old origin"
+            );
+            inner.tiles.clear();
+            inner.zoom = None;
+        }
+        inner.origin_lat = lat;
+        inner.origin_lon = lon;
+        inner.origin_elevation = elevation_msl;
+        inner.has_origin = true;
+        inner.vehicle_ned = (0.0, 0.0);
+    }
 
-        let meta_url = format!("{}/meta.json", base_url);
-        let meta: TileMeta = match client.get(&meta_url).send().await {
-            Ok(resp) if resp.status().is_success() => match resp.json().await {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!("Failed to parse terrain meta: {}", e);
-                    return false;
-                }
-            },
-            Ok(resp) => {
-                warn!("Failed to fetch terrain meta: HTTP {}", resp.status());
-                return false;
+    /// Report where the vehicle is, in NED metres from the origin.
+    ///
+    /// Used only to order eviction, so the tile under the vehicle is the last
+    /// thing dropped.
+    pub fn set_vehicle_ned(&self, north: f64, east: f64) {
+        self.inner.write().vehicle_ned = (north, east);
+    }
+
+    /// Accept decoded elevation tiles.
+    ///
+    /// This is the one way terrain enters the physics. Every tile is validated
+    /// before it is stored, and a rejected tile leaves previously accepted
+    /// terrain untouched — a bad frame degrades to "no new terrain", never to
+    /// corrupted ground.
+    pub fn insert_tiles(
+        &self,
+        tile_size: u32,
+        tiles: Vec<(TileCoord, Vec<f32>, bool)>,
+    ) -> InsertReport {
+        let mut report = InsertReport::default();
+
+        if tile_size as usize != TILE_SIZE {
+            // One rejection per tile so the sender learns which were dropped.
+            for (coord, _, _) in tiles {
+                report.rejected.push((
+                    coord,
+                    TileRejection::UnsupportedTileSize {
+                        declared: tile_size,
+                        supported: TILE_SIZE as u32,
+                    },
+                ));
             }
-            Err(e) => {
-                warn!("Failed to fetch terrain meta: {}", e);
-                return false;
-            }
+            return report;
+        }
+
+        // Validate outside the lock.
+        //
+        // The 400 Hz loop takes a read lock every 2.5 ms. Validation walks
+        // 65 536 samples per tile, so doing it while holding the write lock
+        // would stall the simulation for the length of a whole batch — the
+        // ingress must not be able to slow the thing it is feeding.
+        let (origin_lat, origin_lon, has_origin) = {
+            let inner = self.inner.read();
+            (inner.origin_lat, inner.origin_lon, inner.has_origin)
         };
 
-        let center = TileCoord::from_lon_lat(lon, lat, meta.zoom);
-        let mut tiles = HashMap::new();
+        if !has_origin {
+            for (coord, _, _) in tiles {
+                report.rejected.push((coord, TileRejection::NoOrigin));
+            }
+            return report;
+        }
 
-        for dy in -1i32..=1 {
-            for dx in -1i32..=1 {
-                let coord = TileCoord {
-                    x: (center.x as i32 + dx) as u32,
-                    y: (center.y as i32 + dy) as u32,
-                    z: meta.zoom,
-                };
-
-                let url = format!("{}/{}/{}/{}.bin", base_url, coord.z, coord.x, coord.y);
-                match client.get(&url).send().await {
-                    Ok(resp) if resp.status().is_success() => {
-                        if let Ok(bytes) = resp.bytes().await {
-                            if bytes.len() == TILE_SIZE * TILE_SIZE * 4 {
-                                let heights: Vec<f32> = bytes
-                                    .chunks_exact(4)
-                                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                                    .collect();
-                                tiles.insert(coord, heights);
-                                debug!("Loaded terrain tile {}/{}/{}", coord.z, coord.x, coord.y);
-                            }
-                        }
-                    }
-                    _ => {
-                        debug!("Tile not available: {}/{}/{}", coord.z, coord.x, coord.y);
-                    }
-                }
+        let mut valid: Vec<(TileCoord, Vec<f32>, bool)> = Vec::with_capacity(tiles.len());
+        for (coord, heights, approximate) in tiles {
+            match validate_tile(coord, &heights, origin_lat, origin_lon) {
+                Ok(()) => valid.push((coord, heights, approximate)),
+                Err(reason) => report.rejected.push((coord, reason)),
             }
         }
 
-        self.load_from_tiles(meta, tiles, lat, lon)
-    }
-
-    /// Populate the cache from already-decoded height tiles, bypassing HTTP.
-    ///
-    /// `tiles` maps tile coordinates to `TILE_SIZE * TILE_SIZE` f32 samples in
-    /// MSL metres, row-major from the tile's north-west corner. Shared by
-    /// [`TerrainCache::load`] and by callers that source tiles from disk, a
-    /// bundle, or a test fixture. Returns whether any tile was stored.
-    pub fn load_from_tiles(
-        &self,
-        meta: TileMeta,
-        tiles: HashMap<TileCoord, Vec<f32>>,
-        lat: f64,
-        lon: f64,
-    ) -> bool {
-        let tile_count = tiles.len();
-
-        let origin_elevation = Self::sample_elevation_raw(&tiles, &meta, lat, lon);
-
-        {
-            let mut inner = self.inner.write();
-            inner.meta = Some(meta);
-            inner.tiles = tiles;
-            inner.origin_lat = lat;
-            inner.origin_lon = lon;
-            inner.origin_elevation = origin_elevation;
+        let mut inner = self.inner.write();
+        for (coord, heights, approximate) in valid {
+            // Tiles all share one zoom. A frame at a different zoom replaces the
+            // set rather than mixing levels of detail under the vehicle.
+            if inner.zoom != Some(coord.z) {
+                inner.tiles.clear();
+                inner.zoom = Some(coord.z);
+            }
+            inner.tiles.insert(
+                coord,
+                TileEntry {
+                    heights,
+                    approximate,
+                },
+            );
+            report.accepted += 1;
         }
 
-        if let Some(elev) = origin_elevation {
-            info!(
-                "Terrain cache loaded: {} tiles around ({}, {}), origin elevation: {:.1}m MSL",
-                tile_count, lat, lon, elev
+        report.evicted = evict_to_bound(&mut inner, self.max_resident);
+
+        if report.accepted > 0 {
+            debug!(
+                accepted = report.accepted,
+                rejected = report.rejected.len(),
+                evicted = report.evicted,
+                resident = inner.tiles.len(),
+                "Terrain tiles ingested"
             );
-        } else {
+        }
+        for (coord, reason) in &report.rejected {
             warn!(
-                "Terrain cache loaded: {} tiles around ({}, {}) but origin outside tile coverage",
-                tile_count, lat, lon
+                coord = format!("{}/{}/{}", coord.z, coord.x, coord.y),
+                reason = %reason,
+                "Rejected terrain tile"
             );
         }
-
-        tile_count > 0
+        report
     }
 
-    fn sample_elevation_raw(
-        tiles: &HashMap<TileCoord, Vec<f32>>,
-        meta: &TileMeta,
-        lat: f64,
-        lon: f64,
-    ) -> Option<f64> {
-        let coord = TileCoord::from_lon_lat(lon, lat, meta.zoom);
-        let heights = tiles.get(&coord)?;
+    /// Coordinates the physics wants around the vehicle but does not hold.
+    ///
+    /// The daemon is the only party that knows what it is missing, so it is the
+    /// one that asks. An empty result is the steady state.
+    pub fn missing_around_vehicle(&self, radius: u32) -> Vec<TileCoord> {
+        let inner = self.inner.read();
+        let Some(z) = inner.zoom else {
+            // Nothing has ever arrived, so there is no zoom to ask at. The
+            // browser sends the first batch unprompted after configuration.
+            return Vec::new();
+        };
+        if !inner.has_origin {
+            return Vec::new();
+        }
+        let (north, east) = inner.vehicle_ned;
+        let (lat, lon) = ned_to_lat_lon(north, east, inner.origin_lat, inner.origin_lon);
+        let centre = TileCoord::from_lon_lat(lon, lat, z);
 
-        let (nw_lon, nw_lat) = tile_to_lon_lat(coord.x, coord.y, coord.z);
-        let (se_lon, se_lat) = tile_to_lon_lat(coord.x + 1, coord.y + 1, coord.z);
+        let r = radius as i64;
+        let mut missing = Vec::new();
+        for dy in -r..=r {
+            for dx in -r..=r {
+                let coord = TileCoord {
+                    x: (centre.x as i64 + dx).max(0) as u32,
+                    y: (centre.y as i64 + dy).max(0) as u32,
+                    z,
+                };
+                if !inner.tiles.contains_key(&coord) {
+                    missing.push(coord);
+                }
+            }
+        }
+        missing
+    }
 
-        let fx = ((lon - nw_lon) / (se_lon - nw_lon) * (TILE_SIZE - 1) as f64)
-            .clamp(0.0, (TILE_SIZE - 1) as f64);
-        let fy = ((nw_lat - lat) / (nw_lat - se_lat) * (TILE_SIZE - 1) as f64)
-            .clamp(0.0, (TILE_SIZE - 1) as f64);
+    /// Whether any resident tile came from the free global fallback.
+    pub fn any_approximate(&self) -> bool {
+        self.inner.read().tiles.values().any(|t| t.approximate)
+    }
 
-        let x0 = fx.floor() as usize;
-        let y0 = fy.floor() as usize;
-        let x1 = (x0 + 1).min(TILE_SIZE - 1);
-        let y1 = (y0 + 1).min(TILE_SIZE - 1);
-        let dx = fx - x0 as f64;
-        let dy = fy - y0 as f64;
-
-        let h00 = heights[y0 * TILE_SIZE + x0] as f64;
-        let h10 = heights[y0 * TILE_SIZE + x1] as f64;
-        let h01 = heights[y1 * TILE_SIZE + x0] as f64;
-        let h11 = heights[y1 * TILE_SIZE + x1] as f64;
-
-        let elevation = h00 * (1.0 - dx) * (1.0 - dy)
-            + h10 * dx * (1.0 - dy)
-            + h01 * (1.0 - dx) * dy
-            + h11 * dx * dy;
-
-        Some(elevation)
+    pub fn resident_tiles(&self) -> usize {
+        self.inner.read().tiles.len()
     }
 
     /// Sample ground elevation in NED coordinates relative to origin terrain.
-    /// Returns the NED "down" coordinate of the ground at (north, east).
-    /// Positive = below origin ground level, negative = above.
-    /// Uses origin_elevation (terrain at lat/lon origin) as vertical reference
-    /// so ground_z=0 at origin, matching the frontend 3D mesh (Y=0 at origin).
-    /// Returns None if terrain not loaded or position outside cached tiles.
-    /// Call from sync physics loop.
+    ///
+    /// Returns the NED "down" coordinate of the ground at (north, east):
+    /// positive is below origin ground level, negative above. `None` means the
+    /// height is *unknown* — outside resident coverage — which is deliberately
+    /// distinct from flat: collapsing it to 0.0 teleports a vehicle flying
+    /// below the origin datum straight up to it.
     pub fn sample_ground_ned(&self, north: f64, east: f64) -> Option<f32> {
         let inner = self.inner.read();
-        let meta = inner.meta.as_ref()?;
         let origin_elev = inner.origin_elevation?;
-
-        let (lat, lon) = ned_to_lat_lon(north, east, inner.origin_lat, inner.origin_lon);
-
-        let coord = TileCoord::from_lon_lat(lon, lat, meta.zoom);
-        let heights = inner.tiles.get(&coord)?;
-
-        let (nw_lon, nw_lat) = tile_to_lon_lat(coord.x, coord.y, coord.z);
-        let (se_lon, se_lat) = tile_to_lon_lat(coord.x + 1, coord.y + 1, coord.z);
-
-        let fx = ((lon - nw_lon) / (se_lon - nw_lon) * (TILE_SIZE - 1) as f64)
-            .clamp(0.0, (TILE_SIZE - 1) as f64);
-        let fy = ((nw_lat - lat) / (nw_lat - se_lat) * (TILE_SIZE - 1) as f64)
-            .clamp(0.0, (TILE_SIZE - 1) as f64);
-
-        let x0 = fx.floor() as usize;
-        let y0 = fy.floor() as usize;
-        let x1 = (x0 + 1).min(TILE_SIZE - 1);
-        let y1 = (y0 + 1).min(TILE_SIZE - 1);
-        let dx = fx - x0 as f64;
-        let dy = fy - y0 as f64;
-
-        let h00 = heights[y0 * TILE_SIZE + x0] as f64;
-        let h10 = heights[y0 * TILE_SIZE + x1] as f64;
-        let h01 = heights[y1 * TILE_SIZE + x0] as f64;
-        let h11 = heights[y1 * TILE_SIZE + x1] as f64;
-
-        let msl_elevation = h00 * (1.0 - dx) * (1.0 - dy)
-            + h10 * dx * (1.0 - dy)
-            + h01 * (1.0 - dx) * dy
-            + h11 * dx * dy;
-
-        // Ground in NED: how far below origin ground level is this point.
-        // origin_elev - msl_elevation: positive if point is lower than origin,
-        // negative if point is higher (e.g., a hill).
-        // At origin (north=0, east=0), this returns 0.0 (ground = NED zero).
-        let ned_ground = origin_elev - msl_elevation;
-        Some(ned_ground as f32)
+        let msl = inner.sample_msl_ned(north, east)?;
+        Some((origin_elev - msl) as f32)
     }
 
     /// Unit surface normal at (north, east), in NED.
     ///
     /// NED is down-positive, so a level surface returns `[0, 0, -1]` — the
-    /// normal points *up*, against the down axis. Returns `None` whenever any
-    /// of the four probe points falls outside cached coverage, so callers get
-    /// the same "unknown" signal as [`TerrainCache::sample_ground_ned`] rather
-    /// than a normal derived from a partially-missing neighbourhood.
+    /// normal points *up*, against the down axis. Returns `None` whenever the
+    /// centre falls outside resident coverage, keeping this function's coverage
+    /// identical to [`TerrainCache::sample_ground_ned`]'s: a shell where the
+    /// ground has a height but no normal would let a caller default it to
+    /// "level" and flatten genuinely sloped terrain.
     ///
-    /// The probe spacing is deliberately close to the DEM's own sample
-    /// spacing (~7 m at zoom 14): sampling much tighter only re-reads the
-    /// bilinear patch between the same two posts and reports its slope, not
-    /// the terrain's.
+    /// The probe spacing is deliberately close to the DEM's own sample spacing
+    /// (~7 m at zoom 14): sampling much tighter only re-reads the bilinear patch
+    /// between the same two posts and reports its slope, not the terrain's.
     pub fn sample_ground_normal_ned(&self, north: f64, east: f64) -> Option<[f32; 3]> {
         const PROBE_M: f64 = 5.0;
 
         // Height above the datum is the negation of the NED down coordinate.
         let h = |n: f64, e: f64| self.sample_ground_ned(n, e).map(|z| -(z as f64));
-
-        // The centre must be known — that is the same condition under which the
-        // *height* is known, which keeps this function's coverage identical to
-        // `sample_ground_ned`'s. Anything narrower would leave a shell along the
-        // tile-block edge where the ground has a height but no normal, and a
-        // caller defaulting that to "level" would flatten genuinely sloped
-        // terrain — the same unknown-vs-flat conflation the height path avoids.
         let h_centre = h(north, east)?;
 
         // Central differences where both probes land inside coverage, one-sided
@@ -325,17 +408,133 @@ impl TerrainCache {
         ])
     }
 
-    /// Check if terrain is loaded
+    /// Whether any terrain is resident.
     pub fn is_loaded(&self) -> bool {
         let inner = self.inner.read();
-        inner.meta.is_some() && !inner.tiles.is_empty()
+        inner.zoom.is_some() && !inner.tiles.is_empty()
     }
 
-    /// Get the MSL elevation at the origin point.
-    /// Returns None if terrain not loaded or origin outside tile coverage.
+    /// MSL elevation at the origin, as set by [`TerrainCache::set_origin`].
     pub fn origin_elevation_msl(&self) -> Option<f64> {
         self.inner.read().origin_elevation
     }
+}
+
+impl TerrainCacheInner {
+    /// Bilinear MSL elevation at a NED offset from the origin.
+    fn sample_msl_ned(&self, north: f64, east: f64) -> Option<f64> {
+        let z = self.zoom?;
+        let (lat, lon) = ned_to_lat_lon(north, east, self.origin_lat, self.origin_lon);
+        let coord = TileCoord::from_lon_lat(lon, lat, z);
+        let entry = self.tiles.get(&coord)?;
+
+        let (nw_lon, nw_lat) = tile_to_lon_lat(coord.x, coord.y, coord.z);
+        let (se_lon, se_lat) = tile_to_lon_lat(coord.x + 1, coord.y + 1, coord.z);
+
+        let fx = ((lon - nw_lon) / (se_lon - nw_lon) * (TILE_SIZE - 1) as f64)
+            .clamp(0.0, (TILE_SIZE - 1) as f64);
+        let fy = ((nw_lat - lat) / (nw_lat - se_lat) * (TILE_SIZE - 1) as f64)
+            .clamp(0.0, (TILE_SIZE - 1) as f64);
+
+        let x0 = fx.floor() as usize;
+        let y0 = fy.floor() as usize;
+        let x1 = (x0 + 1).min(TILE_SIZE - 1);
+        let y1 = (y0 + 1).min(TILE_SIZE - 1);
+        let dx = fx - x0 as f64;
+        let dy = fy - y0 as f64;
+
+        let h = &entry.heights;
+        let h00 = h[y0 * TILE_SIZE + x0] as f64;
+        let h10 = h[y0 * TILE_SIZE + x1] as f64;
+        let h01 = h[y1 * TILE_SIZE + x0] as f64;
+        let h11 = h[y1 * TILE_SIZE + x1] as f64;
+
+        Some(
+            h00 * (1.0 - dx) * (1.0 - dy)
+                + h10 * dx * (1.0 - dy)
+                + h01 * (1.0 - dx) * dy
+                + h11 * dx * dy,
+        )
+    }
+}
+
+fn validate_tile(
+    coord: TileCoord,
+    heights: &[f32],
+    origin_lat: f64,
+    origin_lon: f64,
+) -> Result<(), TileRejection> {
+    if heights.len() != TILE_SIZE * TILE_SIZE {
+        return Err(TileRejection::WrongSampleCount {
+            got: heights.len(),
+            expected: TILE_SIZE * TILE_SIZE,
+        });
+    }
+    // Checked before `2u32.pow(z)` is evaluated anywhere.
+    if coord.z > MAX_ZOOM {
+        return Err(TileRejection::CoordOutOfRange { coord });
+    }
+    let n = 2u32.pow(coord.z);
+    if coord.x >= n || coord.y >= n {
+        return Err(TileRejection::CoordOutOfRange { coord });
+    }
+
+    let (nw_lon, nw_lat) = tile_to_lon_lat(coord.x, coord.y, coord.z);
+    let metres = distance_m(origin_lat, origin_lon, nw_lat, nw_lon);
+    if metres > MAX_ORIGIN_DISTANCE_M {
+        return Err(TileRejection::TooFarFromOrigin {
+            metres,
+            limit: MAX_ORIGIN_DISTANCE_M,
+        });
+    }
+
+    for (index, value) in heights.iter().enumerate() {
+        if !value.is_finite() || *value < MIN_ELEVATION_M || *value > MAX_ELEVATION_M {
+            return Err(TileRejection::ImplausibleElevation {
+                index,
+                value: *value,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Drop the tiles furthest from the vehicle until the resident bound holds.
+/// The tile under the vehicle is by construction the nearest, so it is never
+/// the one dropped.
+fn evict_to_bound(inner: &mut TerrainCacheInner, max_resident: usize) -> usize {
+    if inner.tiles.len() <= max_resident {
+        return 0;
+    }
+    let Some(z) = inner.zoom else { return 0 };
+    let (north, east) = inner.vehicle_ned;
+    let (lat, lon) = ned_to_lat_lon(north, east, inner.origin_lat, inner.origin_lon);
+    let centre = TileCoord::from_lon_lat(lon, lat, z);
+
+    let mut by_distance: Vec<(i64, TileCoord)> = inner
+        .tiles
+        .keys()
+        .map(|c| {
+            let dx = c.x as i64 - centre.x as i64;
+            let dy = c.y as i64 - centre.y as i64;
+            (dx * dx + dy * dy, *c)
+        })
+        .collect();
+    // Furthest first.
+    by_distance.sort_by(|a, b| b.0.cmp(&a.0));
+
+    let excess = inner.tiles.len() - max_resident;
+    for (_, coord) in by_distance.into_iter().take(excess) {
+        inner.tiles.remove(&coord);
+    }
+    excess
+}
+
+/// Great-circle-ish distance, flat-earth at these scales.
+fn distance_m(lat_a: f64, lon_a: f64, lat_b: f64, lon_b: f64) -> f64 {
+    let dn = (lat_b - lat_a).to_radians() * R_EARTH;
+    let de = (lon_b - lon_a).to_radians() * R_EARTH * lat_a.to_radians().cos();
+    (dn * dn + de * de).sqrt()
 }
 
 impl Default for TerrainCache {
@@ -380,32 +579,13 @@ mod tests {
     const TEST_LON: f64 = -105.2705;
     const TEST_ZOOM: u32 = 14;
 
-    fn test_meta() -> TileMeta {
-        TileMeta {
-            schema_version: 1,
-            provider: "test".to_string(),
-            zoom: TEST_ZOOM,
-            tile_size: TILE_SIZE as u32,
-            bbox: BBox {
-                west: -180.0,
-                south: -85.0,
-                east: 180.0,
-                north: 85.0,
-            },
-            elevation: ElevationMeta {
-                units: "meters".to_string(),
-                datum: "test".to_string(),
-            },
-        }
-    }
-
     /// Build a cache holding the 3x3 tile block around (TEST_LAT, TEST_LON) —
     /// the same footprint the real HTTP loader fetches. `height_at(lat, lon)`
     /// supplies MSL metres, so tests can express real-world gradients without
     /// caring which tile a sample lands in.
     fn cache_with_tiles(height_at: impl Fn(f64, f64) -> f32) -> TerrainCache {
         let center = TileCoord::from_lon_lat(TEST_LON, TEST_LAT, TEST_ZOOM);
-        let mut tiles = HashMap::new();
+        let mut tiles = Vec::new();
 
         for dy in -1i32..=1 {
             for dx in -1i32..=1 {
@@ -428,12 +608,20 @@ mod tests {
                         heights[row * TILE_SIZE + col] = height_at(lat, lon);
                     }
                 }
-                tiles.insert(coord, heights);
+                tiles.push((coord, heights, false));
             }
         }
 
         let cache = TerrainCache::new();
-        assert!(cache.load_from_tiles(test_meta(), tiles, TEST_LAT, TEST_LON));
+        // The origin elevation is what the browser sampled at the origin; here
+        // it is derived from the same generator so tests stay self-consistent.
+        cache.set_origin(
+            TEST_LAT,
+            TEST_LON,
+            Some(height_at(TEST_LAT, TEST_LON) as f64),
+        );
+        let report = cache.insert_tiles(TILE_SIZE as u32, tiles);
+        assert_eq!(report.accepted, 9, "rejected: {:?}", report.rejected);
         cache
     }
 
@@ -650,5 +838,605 @@ mod tests {
             (elev - 1655.0).abs() < 1e-3,
             "expected 1655 m MSL at origin, got {elev}"
         );
+    }
+}
+
+#[cfg(test)]
+mod ingress_validation_tests {
+    use super::*;
+
+    const LAT: f64 = 40.015;
+    const LON: f64 = -105.2705;
+    const Z: u32 = 14;
+
+    fn cache() -> TerrainCache {
+        let c = TerrainCache::new();
+        c.set_origin(LAT, LON, Some(1655.0));
+        c
+    }
+
+    fn origin_coord() -> TileCoord {
+        TileCoord::from_lon_lat(LON, LAT, Z)
+    }
+
+    fn flat(v: f32) -> Vec<f32> {
+        vec![v; TILE_SIZE * TILE_SIZE]
+    }
+
+    #[test]
+    fn a_valid_tile_is_accepted() {
+        let c = cache();
+        let report = c.insert_tiles(
+            TILE_SIZE as u32,
+            vec![(origin_coord(), flat(1655.0), false)],
+        );
+        assert_eq!(report.accepted, 1, "rejected: {:?}", report.rejected);
+        assert!(report.rejected.is_empty());
+        assert!(c.is_loaded());
+    }
+
+    #[test]
+    fn a_tile_with_the_wrong_sample_count_is_rejected() {
+        let c = cache();
+        let report = c.insert_tiles(
+            TILE_SIZE as u32,
+            vec![(origin_coord(), vec![1655.0; 10], false)],
+        );
+        assert_eq!(report.accepted, 0);
+        assert!(matches!(
+            report.rejected[0].1,
+            TileRejection::WrongSampleCount { .. }
+        ));
+    }
+
+    #[test]
+    fn a_declared_tile_size_that_does_not_match_the_cache_is_rejected() {
+        let c = cache();
+        // 128 would silently halve every index into the height grid.
+        let report = c.insert_tiles(128, vec![(origin_coord(), vec![1655.0; 128 * 128], false)]);
+        assert_eq!(report.accepted, 0);
+        assert!(matches!(
+            report.rejected[0].1,
+            TileRejection::UnsupportedTileSize { .. }
+        ));
+    }
+
+    #[test]
+    fn a_coordinate_outside_the_range_for_its_zoom_is_rejected() {
+        let c = cache();
+        let n = 2u32.pow(Z);
+        for bad in [
+            TileCoord { x: n, y: 0, z: Z },
+            TileCoord { x: 0, y: n, z: Z },
+        ] {
+            let report = c.insert_tiles(TILE_SIZE as u32, vec![(bad, flat(1655.0), false)]);
+            assert_eq!(report.accepted, 0, "{bad:?} must be rejected");
+            assert!(matches!(
+                report.rejected[0].1,
+                TileRejection::CoordOutOfRange { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn an_absurd_zoom_is_rejected_before_it_is_used_as_an_exponent() {
+        let c = cache();
+        let report = c.insert_tiles(
+            TILE_SIZE as u32,
+            vec![(TileCoord { x: 0, y: 0, z: 40 }, flat(1655.0), false)],
+        );
+        assert_eq!(report.accepted, 0);
+    }
+
+    #[test]
+    fn a_tile_far_from_the_origin_is_rejected() {
+        let c = cache();
+        // Same zoom, but on the other side of the planet.
+        let far = TileCoord::from_lon_lat(100.0, -30.0, Z);
+        let report = c.insert_tiles(TILE_SIZE as u32, vec![(far, flat(0.0), false)]);
+        assert_eq!(report.accepted, 0);
+        assert!(matches!(
+            report.rejected[0].1,
+            TileRejection::TooFarFromOrigin { .. }
+        ));
+    }
+
+    #[test]
+    fn non_finite_heights_are_rejected() {
+        let c = cache();
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut heights = flat(1655.0);
+            heights[42] = bad;
+            let report = c.insert_tiles(TILE_SIZE as u32, vec![(origin_coord(), heights, false)]);
+            assert_eq!(report.accepted, 0, "{bad} must be rejected");
+            assert!(matches!(
+                report.rejected[0].1,
+                TileRejection::ImplausibleElevation { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn elevations_outside_earths_real_range_are_rejected() {
+        let c = cache();
+        // Everest is 8849 m; the Dead Sea shore is about -430 m. Anything well
+        // outside that is corrupt data, and colliding against it would fling
+        // the vehicle.
+        for bad in [-20_000.0f32, 100_000.0] {
+            let mut heights = flat(1655.0);
+            heights[7] = bad;
+            let report = c.insert_tiles(TILE_SIZE as u32, vec![(origin_coord(), heights, false)]);
+            assert_eq!(report.accepted, 0, "{bad} m must be rejected");
+        }
+    }
+
+    #[test]
+    fn a_rejected_tile_leaves_previously_accepted_terrain_untouched() {
+        let c = cache();
+        c.insert_tiles(
+            TILE_SIZE as u32,
+            vec![(origin_coord(), flat(1655.0), false)],
+        );
+        let before = c.sample_ground_ned(0.0, 0.0);
+
+        let mut poison = flat(1655.0);
+        poison[0] = f32::NAN;
+        let report = c.insert_tiles(TILE_SIZE as u32, vec![(origin_coord(), poison, false)]);
+
+        assert_eq!(report.accepted, 0);
+        assert_eq!(
+            c.sample_ground_ned(0.0, 0.0),
+            before,
+            "a bad tile must not overwrite good terrain"
+        );
+    }
+
+    #[test]
+    fn a_mixed_batch_accepts_the_good_and_names_the_bad() {
+        let c = cache();
+        let good = origin_coord();
+        let bad = TileCoord {
+            x: good.x + 1,
+            y: good.y,
+            z: Z,
+        };
+        let report = c.insert_tiles(
+            TILE_SIZE as u32,
+            vec![(good, flat(1655.0), false), (bad, vec![0.0; 4], false)],
+        );
+        assert_eq!(report.accepted, 1);
+        assert_eq!(report.rejected.len(), 1);
+        assert_eq!(report.rejected[0].0, bad);
+    }
+
+    #[test]
+    fn provenance_survives_ingestion() {
+        // The "approximate terrain" warning is driven by this flag; losing it
+        // would tell the user authoritative ground was under them when it was
+        // not.
+        let c = cache();
+        c.insert_tiles(TILE_SIZE as u32, vec![(origin_coord(), flat(1655.0), true)]);
+        assert!(c.any_approximate());
+    }
+}
+
+#[cfg(test)]
+mod streaming_lifecycle_tests {
+    use super::*;
+
+    const LAT: f64 = 40.015;
+    const LON: f64 = -105.2705;
+    const Z: u32 = 14;
+
+    fn flat(v: f32) -> Vec<f32> {
+        vec![v; TILE_SIZE * TILE_SIZE]
+    }
+
+    fn ring(centre: TileCoord, r: i64) -> Vec<(TileCoord, Vec<f32>, bool)> {
+        let mut out = Vec::new();
+        for dy in -r..=r {
+            for dx in -r..=r {
+                out.push((
+                    TileCoord {
+                        x: (centre.x as i64 + dx) as u32,
+                        y: (centre.y as i64 + dy) as u32,
+                        z: centre.z,
+                    },
+                    flat(1655.0),
+                    false,
+                ));
+            }
+        }
+        out
+    }
+
+    fn cache(max_resident: usize) -> TerrainCache {
+        let c = TerrainCache::with_capacity(max_resident);
+        c.set_origin(LAT, LON, Some(1655.0));
+        c
+    }
+
+    #[test]
+    fn the_resident_bound_holds_across_a_long_traverse() {
+        let c = cache(9);
+        let start = TileCoord::from_lon_lat(LON, LAT, Z);
+
+        // Fly north across many tiles, feeding a ring at each step — more
+        // distinct tiles than the bound by a wide margin.
+        for step in 0..12 {
+            let north = step as f64 * 1_900.0; // ~one z14 tile at this latitude
+            c.set_vehicle_ned(north, 0.0);
+            let centre = TileCoord {
+                x: start.x,
+                y: start.y - step,
+                z: Z,
+            };
+            c.insert_tiles(TILE_SIZE as u32, ring(centre, 1));
+            assert!(
+                c.resident_tiles() <= 9,
+                "resident {} exceeded the bound at step {step}",
+                c.resident_tiles()
+            );
+        }
+    }
+
+    #[test]
+    fn the_tile_under_the_vehicle_is_never_the_one_evicted() {
+        let c = cache(4);
+        let centre = TileCoord::from_lon_lat(LON, LAT, Z);
+        c.set_vehicle_ned(0.0, 0.0);
+
+        // Nine tiles into a cache that holds four: five must go, and the one
+        // the vehicle is standing on must not be among them.
+        let report = c.insert_tiles(TILE_SIZE as u32, ring(centre, 1));
+        assert_eq!(report.accepted, 9);
+        assert_eq!(report.evicted, 5);
+        assert_eq!(c.resident_tiles(), 4);
+        assert!(
+            c.sample_ground_ned(0.0, 0.0).is_some(),
+            "the ground under the vehicle was evicted"
+        );
+    }
+
+    #[test]
+    fn eviction_drops_the_furthest_tiles_first() {
+        let c = cache(1);
+        let centre = TileCoord::from_lon_lat(LON, LAT, Z);
+        c.set_vehicle_ned(0.0, 0.0);
+        c.insert_tiles(TILE_SIZE as u32, ring(centre, 1));
+
+        assert_eq!(c.resident_tiles(), 1);
+        // The single survivor is the centre tile, so a sample at the vehicle
+        // still resolves and a sample two tiles away does not.
+        assert!(c.sample_ground_ned(0.0, 0.0).is_some());
+        assert!(c.sample_ground_ned(4_000.0, 0.0).is_none());
+    }
+
+    #[test]
+    fn a_flood_cannot_grow_memory_without_bound() {
+        let c = cache(16);
+        let centre = TileCoord::from_lon_lat(LON, LAT, Z);
+        // Twenty batches of 25 tiles: 500 submissions against a 16-tile bound.
+        for _ in 0..20 {
+            c.insert_tiles(TILE_SIZE as u32, ring(centre, 2));
+            assert!(c.resident_tiles() <= 16);
+        }
+        assert!(c.resident_tiles() <= 16);
+    }
+
+    #[test]
+    fn re_anchoring_discards_terrain_tied_to_the_old_origin() {
+        let c = cache(64);
+        let centre = TileCoord::from_lon_lat(LON, LAT, Z);
+        c.insert_tiles(TILE_SIZE as u32, ring(centre, 1));
+        assert!(c.is_loaded());
+
+        // A materially different place. Keeping the old tiles would compute
+        // ground contact against terrain anchored somewhere else entirely.
+        c.set_origin(51.5, -0.12, Some(35.0));
+        assert!(!c.is_loaded());
+        assert_eq!(c.resident_tiles(), 0);
+        assert!(c.sample_ground_ned(0.0, 0.0).is_none());
+    }
+
+    #[test]
+    fn re_anchoring_to_effectively_the_same_place_keeps_its_tiles() {
+        // Origin reports jitter by centimetres. Throwing the whole set away on
+        // every one of them would keep the physics permanently without ground.
+        let c = cache(64);
+        let centre = TileCoord::from_lon_lat(LON, LAT, Z);
+        c.insert_tiles(TILE_SIZE as u32, ring(centre, 1));
+        let before = c.resident_tiles();
+
+        c.set_origin(LAT + 0.000_001, LON, Some(1655.0));
+        assert_eq!(c.resident_tiles(), before);
+    }
+
+    #[test]
+    fn missing_coords_are_reported_around_the_vehicle() {
+        let c = cache(64);
+        let centre = TileCoord::from_lon_lat(LON, LAT, Z);
+        // Seed one tile so the cache knows which zoom to ask at.
+        c.insert_tiles(TILE_SIZE as u32, vec![(centre, flat(1655.0), false)]);
+
+        let missing = c.missing_around_vehicle(1);
+        assert_eq!(
+            missing.len(),
+            8,
+            "the centre is held, its 8 neighbours are not"
+        );
+        assert!(!missing.contains(&centre));
+    }
+
+    #[test]
+    fn nothing_is_missing_once_the_ring_is_complete() {
+        // The steady state, which is what keeps the exchange quiet.
+        let c = cache(64);
+        let centre = TileCoord::from_lon_lat(LON, LAT, Z);
+        c.insert_tiles(TILE_SIZE as u32, ring(centre, 1));
+        assert!(c.missing_around_vehicle(1).is_empty());
+    }
+
+    #[test]
+    fn moving_the_vehicle_makes_new_tiles_missing() {
+        let c = cache(64);
+        let centre = TileCoord::from_lon_lat(LON, LAT, Z);
+        c.insert_tiles(TILE_SIZE as u32, ring(centre, 1));
+        assert!(c.missing_around_vehicle(1).is_empty());
+
+        c.set_vehicle_ned(4_000.0, 0.0);
+        assert!(
+            !c.missing_around_vehicle(1).is_empty(),
+            "the vehicle moved off the loaded ring and nothing was requested"
+        );
+    }
+
+    #[test]
+    fn nothing_is_requested_before_any_terrain_has_arrived() {
+        // There is no zoom to ask at yet. The browser sends the first batch
+        // unprompted after configuration.
+        let c = cache(64);
+        assert!(c.missing_around_vehicle(1).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod ingress_does_not_stall_the_loop_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const LAT: f64 = 40.015;
+    const LON: f64 = -105.2705;
+    const Z: u32 = 14;
+
+    /// The simulation loop reads ground at 400 Hz, i.e. every 2.5 ms. A flood of
+    /// tiles arriving on the WebSocket must not stall it. The bar here is
+    /// deliberately loose (25 ms, ten loop periods) so this measures "the
+    /// ingress does not hold the lock across a whole batch" rather than
+    /// machine speed — before validation was moved out of the write lock, a
+    /// batch held it for the length of 1.6M float checks.
+    const MAX_ACCEPTABLE_STALL: Duration = Duration::from_millis(25);
+
+    #[test]
+    fn a_reader_is_never_starved_by_a_flood_of_tiles() {
+        let cache = Arc::new(TerrainCache::with_capacity(16));
+        cache.set_origin(LAT, LON, Some(1655.0));
+        let centre = TileCoord::from_lon_lat(LON, LAT, Z);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader_cache = cache.clone();
+        let reader_stop = stop.clone();
+
+        let reader = std::thread::spawn(move || {
+            let mut worst = Duration::ZERO;
+            let mut reads: u64 = 0;
+            while !reader_stop.load(Ordering::Relaxed) {
+                let t0 = Instant::now();
+                let _ = reader_cache.sample_ground_ned(0.0, 0.0);
+                worst = worst.max(t0.elapsed());
+                reads += 1;
+                std::thread::sleep(Duration::from_micros(250));
+            }
+            (worst, reads)
+        });
+
+        for _ in 0..20 {
+            let mut batch = Vec::new();
+            for dy in -2i64..=2 {
+                for dx in -2i64..=2 {
+                    batch.push((
+                        TileCoord {
+                            x: (centre.x as i64 + dx) as u32,
+                            y: (centre.y as i64 + dy) as u32,
+                            z: Z,
+                        },
+                        vec![1655.0f32; TILE_SIZE * TILE_SIZE],
+                        false,
+                    ));
+                }
+            }
+            cache.insert_tiles(TILE_SIZE as u32, batch);
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        let (worst, reads) = reader.join().expect("reader thread");
+
+        assert!(reads > 0, "the reader never ran");
+        assert!(
+            worst < MAX_ACCEPTABLE_STALL,
+            "a ground sample blocked for {worst:?} during ingestion (limit {MAX_ACCEPTABLE_STALL:?}); \
+             the ingress is holding the write lock across validation"
+        );
+        assert!(
+            cache.resident_tiles() <= 16,
+            "the bound was breached under load"
+        );
+    }
+}
+
+#[cfg(test)]
+mod parity_tests {
+    use super::*;
+    use std::collections::HashMap as Map;
+
+    const LAT: f64 = 40.015;
+    const LON: f64 = -105.2705;
+    const Z: u32 = 14;
+
+    fn sloped_tile() -> Vec<f32> {
+        // A real gradient, so a disagreement between the two paths shows up as
+        // a number rather than cancelling out on a flat surface.
+        let mut h = vec![0.0f32; TILE_SIZE * TILE_SIZE];
+        for row in 0..TILE_SIZE {
+            for col in 0..TILE_SIZE {
+                h[row * TILE_SIZE + col] = 1600.0 + row as f32 * 0.35 + col as f32 * 0.15;
+            }
+        }
+        h
+    }
+
+    /// The viewer's `sampleMslAt`, written out independently.
+    ///
+    /// The point of a parity test is that two separate expressions of the same
+    /// rule agree, so this mirrors the browser rather than calling the
+    /// production path: pick the tile containing the point, then bilinearly
+    /// blend the four surrounding posts *of that tile*. Clamping fx/fy to a
+    /// single tile instead of selecting the neighbour is exactly the mistake
+    /// this shape is written to avoid.
+    fn viewer_msl(tiles: &Map<TileCoord, Vec<f32>>, lat: f64, lon: f64) -> Option<f64> {
+        let coord = TileCoord::from_lon_lat(lon, lat, Z);
+        let heights = tiles.get(&coord)?;
+        let (nw_lon, nw_lat) = tile_to_lon_lat(coord.x, coord.y, Z);
+        let (se_lon, se_lat) = tile_to_lon_lat(coord.x + 1, coord.y + 1, Z);
+        let last = (TILE_SIZE - 1) as f64;
+
+        let fx = ((lon - nw_lon) / (se_lon - nw_lon) * last).clamp(0.0, last);
+        let fy = ((nw_lat - lat) / (nw_lat - se_lat) * last).clamp(0.0, last);
+        let x0 = fx.floor() as usize;
+        let y0 = fy.floor() as usize;
+        let x1 = (x0 + 1).min(TILE_SIZE - 1);
+        let y1 = (y0 + 1).min(TILE_SIZE - 1);
+        let dx = fx - x0 as f64;
+        let dy = fy - y0 as f64;
+        let h = |r: usize, c: usize| heights[r * TILE_SIZE + c] as f64;
+        Some(
+            h(y0, x0) * (1.0 - dx) * (1.0 - dy)
+                + h(y0, x1) * dx * (1.0 - dy)
+                + h(y1, x0) * (1.0 - dx) * dy
+                + h(y1, x1) * dx * dy,
+        )
+    }
+
+    /// A 3x3 ring, and the same tiles in a plain map for the viewer reference.
+    fn scene(approximate: bool) -> (TerrainCache, Map<TileCoord, Vec<f32>>, f64) {
+        let heights = sloped_tile();
+        let centre = TileCoord::from_lon_lat(LON, LAT, Z);
+        let mut map = Map::new();
+        let mut batch = Vec::new();
+        for dy in -1i64..=1 {
+            for dx in -1i64..=1 {
+                let coord = TileCoord {
+                    x: (centre.x as i64 + dx) as u32,
+                    y: (centre.y as i64 + dy) as u32,
+                    z: Z,
+                };
+                map.insert(coord, heights.clone());
+                batch.push((coord, heights.clone(), approximate));
+            }
+        }
+
+        // The datum is what the browser sampled at the origin, exactly as it is
+        // in production: an input to configuration, not something re-derived.
+        let origin_elev = viewer_msl(&map, LAT, LON).expect("origin is covered");
+
+        let cache = TerrainCache::new();
+        cache.set_origin(LAT, LON, Some(origin_elev));
+        let report = cache.insert_tiles(TILE_SIZE as u32, batch);
+        assert_eq!(report.accepted, 9, "rejected: {:?}", report.rejected);
+        (cache, map, origin_elev)
+    }
+
+    #[test]
+    fn a_vehicle_at_rest_at_the_origin_is_on_the_ground_in_both() {
+        // Ground contact and the drawn surface must put the origin at the same
+        // height, or a vehicle sitting still reads as hovering in one of them.
+        let (cache, _, _) = scene(false);
+        let physics_ground = cache.sample_ground_ned(0.0, 0.0).expect("covered") as f64;
+        // The viewer places local Y = 0 at the origin elevation by construction.
+        assert!(
+            physics_ground.abs() < 1e-3,
+            "physics puts the origin {physics_ground} m off the viewer's ground plane"
+        );
+    }
+
+    #[test]
+    fn the_two_paths_agree_away_from_the_origin_on_a_slope() {
+        let (cache, map, origin_elev) = scene(false);
+
+        for (north, east) in [
+            (0.0, 0.0),
+            (120.0, 0.0),
+            (0.0, 200.0),
+            (-90.0, -150.0),
+            (900.0, 900.0),
+            (-1500.0, 1200.0),
+        ] {
+            let physics = cache.sample_ground_ned(north, east).expect("covered") as f64;
+            let (lat, lon) = ned_to_lat_lon(north, east, LAT, LON);
+            let viewer_local_y = viewer_msl(&map, lat, lon).expect("covered") - origin_elev;
+
+            // ground_z (NED, down-positive) == -local_y (viewer, up-positive)
+            assert!(
+                (physics - (-viewer_local_y)).abs() < 1e-3,
+                "at ({north}, {east}): physics {physics} vs viewer {viewer_local_y}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fallback_sourced_tile_is_collided_against_not_ignored() {
+        // The defect this replaces: the browser drew hills from the fallback
+        // while the physics had nothing and used flat ground.
+        let (cache, _, _) = scene(true);
+        let ground = cache.sample_ground_ned(300.0, 300.0);
+        assert!(
+            ground.is_some(),
+            "fallback terrain must be collided against"
+        );
+        assert!(
+            ground.unwrap().abs() > 0.01,
+            "a sloped fallback tile must not read as flat ground"
+        );
+        assert!(
+            cache.any_approximate(),
+            "provenance must survive to the label"
+        );
+    }
+
+    #[test]
+    fn provenance_changes_the_label_not_the_surface() {
+        let (approx, _, _) = scene(true);
+        let (auth, _, _) = scene(false);
+        for (north, east) in [(0.0, 0.0), (150.0, -75.0), (-400.0, 600.0)] {
+            assert_eq!(
+                approx.sample_ground_ned(north, east),
+                auth.sample_ground_ned(north, east),
+                "provenance must not change the surface"
+            );
+        }
+        assert!(approx.any_approximate());
+        assert!(!auth.any_approximate());
+    }
+
+    #[test]
+    fn with_no_terrain_at_all_neither_side_invents_a_surface() {
+        let cache = TerrainCache::new();
+        cache.set_origin(LAT, LON, None);
+        // Unknown, not flat: the caller decides, and both sides get the same
+        // "no data" answer rather than one of them making something up.
+        assert!(cache.sample_ground_ned(0.0, 0.0).is_none());
+        assert!(!cache.is_loaded());
     }
 }
