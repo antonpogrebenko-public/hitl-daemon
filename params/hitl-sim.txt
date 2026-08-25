@@ -38,9 +38,19 @@ COM_ARM_MAG_ANG 180        # Accept any mag/GPS heading difference
 COM_ARM_MAG_STR 0          # Disable mag field strength check
 COM_ARM_SDCARD 0           # Do not require an SD card
 
+# === Sensor selection ===
+# SYS_HITL only tells PX4 to accept HIL_SENSOR/HIL_GPS. It does nothing about
+# the drivers and gates that expect real hardware, which is what these cover.
+SENS_IMU_MODE 0            # Do not auto-select among physical IMUs
+SENS_MAG_AUTOCAL 0         # No in-flight mag calibration against a simulated field
+EKF2_MULTI_IMU 1           # One estimator instance
+
 # === EKF2 gates ===
 EKF2_GPS_CHECK 0           # Simulated GPS does not carry real quality metrics
 EKF2_MAG_CHECK 0           # Simulated mag is not consistency-checked against the world
+EKF2_ABL_LIM 0.0000        # No accel bias limit; a simulated IMU has no physical bias
+EKF2_REQ_HDRIFT 3.0000     # Loosened horizontal drift gate
+EKF2_REQ_VDRIFT 3.0000     # Loosened vertical drift gate
 
 # === CRSF receiver ===
 RC_CRSF_PRT_CFG 101        # CRSF on TELEM1 (Serial 1) — was 104/TELEM4 before 2026-08

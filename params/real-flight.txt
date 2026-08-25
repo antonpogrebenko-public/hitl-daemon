@@ -21,6 +21,11 @@ SYS_HITL 0                 # Use the board's own sensors again
 SYS_HAS_BARO DEFAULT       # Re-enable the onboard barometer
 GPS_1_CONFIG DEFAULT       # Re-enable the GPS port
 
+# SYS_AUTOSTART is deliberately absent. Provisioning sets it to 4001, but that
+# is the airframe this aircraft actually is, not something done for the
+# simulator's benefit — resetting it would leave the board with no airframe at
+# all. It is the one parameter provisioning writes that should survive a revert.
+
 # === Drop the HIL actuator outputs ===
 # Left set, these route motor outputs to the simulator rather than the ESCs.
 HIL_ACT_FUNC1 0
@@ -37,9 +42,20 @@ COM_ARM_MAG_ANG DEFAULT    # Mag/GPS heading agreement enforced again
 COM_ARM_MAG_STR DEFAULT    # Mag field strength check back on
 COM_ARM_SDCARD DEFAULT     # SD card requirement back
 
+# === Restore sensor selection ===
+# Without these the board stays in the state that caused "Accel Sensor 0
+# missing" and "Found 0 compass": real sensors present and healthy, but the
+# drivers told not to select or calibrate them.
+SENS_IMU_MODE DEFAULT      # Auto-select among physical IMUs again
+SENS_MAG_AUTOCAL DEFAULT   # In-flight mag calibration back on
+EKF2_MULTI_IMU DEFAULT     # Estimator instance count back to default
+
 # === Restore the EKF2 gates ===
 EKF2_GPS_CHECK DEFAULT     # GPS quality gates back on
 EKF2_MAG_CHECK DEFAULT     # Mag consistency check back on
+EKF2_ABL_LIM DEFAULT       # Accel bias limit back on — a real IMU does drift
+EKF2_REQ_HDRIFT DEFAULT    # Horizontal drift gate back to its real-flight value
+EKF2_REQ_VDRIFT DEFAULT    # Vertical drift gate back to its real-flight value
 
 # === Kept, not reverted ===
 # The receiver and its calibration are the same in both directions, so they are
