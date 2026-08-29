@@ -495,10 +495,20 @@ async fn health_handler() -> impl IntoResponse {
 /// log it. The connection was closed and the interface waited forever on a
 /// restore that never started.
 ///
-/// 64 KB leaves room for a snapshot several times larger than any board's
-/// current parameter set while still bounding what an unauthenticated local
-/// client can make the daemon buffer.
-const MAX_INCOMING_MESSAGE_SIZE: usize = 64 * 1024;
+/// 64 KB then left room for a snapshot several times larger than any board's
+/// current parameter set — but a restore stopped being the largest message
+/// this protocol defines the moment the browser became the only party that
+/// fetches terrain. One 256x256 f32 tile is 256 KB, and a collision set is
+/// several of them, so *every* terrain push was killed at the transport with
+/// `Space limit exceeded` and the physics ran the whole session on flat
+/// ground. `TerrainTiles::MAX_FRAME_BYTES` was unreachable: axum rejected the
+/// frame long before `from_bytes` could apply it.
+///
+/// Deriving the transport limit from the protocol's own bound is the point.
+/// Two independent limits for one message is what allowed the smaller to sit
+/// below the larger unnoticed, and the protocol test suite could not catch it
+/// because those tests never cross a socket.
+const MAX_INCOMING_MESSAGE_SIZE: usize = crate::protocol::TerrainTiles::MAX_FRAME_BYTES;
 
 /// How often the server sends a WebSocket Ping frame to each client
 const PING_INTERVAL: Duration = Duration::from_secs(5);
@@ -982,5 +992,43 @@ mod message_size_tests {
         // Provisioning writes ~21 parameters today. A future one that writes
         // ten times as many must not silently hit the same wall.
         assert!(restore_frame_size(210) < MAX_INCOMING_MESSAGE_SIZE);
+    }
+
+    /// The transport must accept every frame the protocol says it will accept.
+    ///
+    /// It did not: the cap sat at 64 KB while a single terrain tile is 256 KB,
+    /// so the browser's terrain push was rejected by axum before any handler
+    /// ran, and the physics silently fell back to flat ground for a whole
+    /// session. `TerrainTiles::from_bytes` has its own limit and a test for it,
+    /// but that test hands bytes straight to the parser and never crosses a
+    /// socket, so it could not see the smaller wall in front of it.
+    #[test]
+    fn the_transport_accepts_every_frame_the_protocol_defines() {
+        use crate::protocol::TerrainTiles;
+        assert!(
+            MAX_INCOMING_MESSAGE_SIZE >= TerrainTiles::MAX_FRAME_BYTES,
+            "transport cap ({MAX_INCOMING_MESSAGE_SIZE}) is below the terrain \
+             frame limit the protocol advertises ({}) — frames the parser would \
+             accept die at the socket instead",
+            TerrainTiles::MAX_FRAME_BYTES
+        );
+    }
+
+    /// The specific size that was being dropped, stated concretely so the
+    /// regression is legible without reconstructing the arithmetic.
+    #[test]
+    fn a_single_terrain_tile_fits() {
+        const TILE_SAMPLES: usize = 256 * 256;
+        // 1 tag byte + 4 header-length bytes + a JSON header + the payload.
+        let one_tile = 1 + 4 + 256 + TILE_SAMPLES * 4;
+        assert!(
+            one_tile > 64 * 1024,
+            "a tile that fits in the old 64 KB limit would mean this test \
+             guards nothing (was {one_tile} bytes)"
+        );
+        assert!(
+            one_tile < MAX_INCOMING_MESSAGE_SIZE,
+            "one 256x256 f32 tile ({one_tile} bytes) must fit"
+        );
     }
 }

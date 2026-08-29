@@ -12,7 +12,9 @@ use mavlink::ardupilotmega::{MavModeFlag, MavType, HEARTBEAT_DATA};
 /// Derive `(hitl_enabled, is_quadrotor)` from a HEARTBEAT. Pure function so
 /// the bit-flag logic is testable without a live MAVLink connection.
 pub fn heartbeat_hitl_signals(hb: &HEARTBEAT_DATA) -> (bool, bool) {
-    let hitl_enabled = hb.base_mode.contains(MavModeFlag::MAV_MODE_FLAG_HIL_ENABLED);
+    let hitl_enabled = hb
+        .base_mode
+        .contains(MavModeFlag::MAV_MODE_FLAG_HIL_ENABLED);
     let is_quadrotor = hb.mavtype == MavType::MAV_TYPE_QUADROTOR;
     (hitl_enabled, is_quadrotor)
 }
@@ -35,7 +37,10 @@ mod tests {
 
     #[test]
     fn hitl_and_quadrotor_both_true() {
-        let hb = heartbeat(MavModeFlag::MAV_MODE_FLAG_HIL_ENABLED, MavType::MAV_TYPE_QUADROTOR);
+        let hb = heartbeat(
+            MavModeFlag::MAV_MODE_FLAG_HIL_ENABLED,
+            MavType::MAV_TYPE_QUADROTOR,
+        );
         assert_eq!(heartbeat_hitl_signals(&hb), (true, true));
     }
 
@@ -47,7 +52,10 @@ mod tests {
 
     #[test]
     fn non_quadrotor_type_reads_false() {
-        let hb = heartbeat(MavModeFlag::MAV_MODE_FLAG_HIL_ENABLED, MavType::MAV_TYPE_FIXED_WING);
+        let hb = heartbeat(
+            MavModeFlag::MAV_MODE_FLAG_HIL_ENABLED,
+            MavType::MAV_TYPE_FIXED_WING,
+        );
         assert_eq!(heartbeat_hitl_signals(&hb), (true, false));
     }
 
@@ -92,24 +100,23 @@ mod tests {
     }
 }
 
+use crate::board_identity::BoardIdentity;
 use crate::build_config::{
-    PARAM_ACK_EPSILON,
-    make_param_save, make_param_set, wait_for_param_ack, PARAM_ACK_TIMEOUT, PARAM_RETRY_COUNT,
-    PX4_TARGET_COMPONENT, PX4_TARGET_SYSTEM,
+    make_param_save, make_param_set, wait_for_param_ack, PARAM_ACK_EPSILON, PARAM_ACK_TIMEOUT,
+    PARAM_RETRY_COUNT, PX4_TARGET_COMPONENT, PX4_TARGET_SYSTEM,
 };
 use crate::handler::ValidatedNshCommand;
-use crate::board_identity::BoardIdentity;
 use crate::param_io::{read_params_with, ParamReadPolicy, ParamValue};
-use crate::snapshot::{SessionSnapshot, StoredSnapshot};
-use std::sync::Arc;
 use crate::protocol::{
     OutgoingMessage, PreflightApplyResult, PreflightApplyState, PreflightReadiness,
     PreflightStatus, RestoreMismatch, RestoreResult, RestoreSnapshot, RestoreState,
     SnapshotCaptured, SnapshotParam, SnapshotStored,
 };
+use crate::snapshot::{SessionSnapshot, StoredSnapshot};
 use crossbeam_channel::Sender;
 use mavlink::ardupilotmega::{MavMessage, MavParamType, PARAM_SET_DATA};
 use simulation::SimulationState;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tracing::warn;
@@ -138,7 +145,20 @@ const QUADROTOR_AUTOSTART_ID: i32 = 4001;
 /// cross-checked 3-for-3 against ground truth already established this
 /// session (SYS_HITL, RC1_MIN, RC_CHAN_CNT).
 const HITL_SUPPORT_PARAMS_I32: &[(&str, i32)] = &[
-    ("SYS_HAS_BARO", 0),
+    // 1, not 0. The daemon already simulates a barometer and ships it in every
+    // HIL_SENSOR; telling PX4 there is none meant `vehicle_air_data` was never
+    // published and EKF2 held height on GPS alone. That is survivable at the
+    // 0.3 m altitude sigma the no-GPS defaults use and not survivable at the
+    // 3 m a real module reports, so arming failed with "height estimate not
+    // stable" the moment a build selected a GPS component. The backup this
+    // table came from was captured on a board that had no such build applied,
+    // which is why the 0 looked known-good.
+    //
+    // Reboot-required: the sensors module only creates the air-data path at
+    // startup. The preflight flow already reboots after applying these, so the
+    // change costs nothing extra there — but a hand-set value does nothing
+    // until the board restarts.
+    ("SYS_HAS_BARO", 1),
     ("CBRK_SUPPLY_CHK", 894281),
     ("COM_ARM_HFLT_CHK", 0),
     ("COM_ARM_MAG_ANG", 180),
@@ -532,9 +552,11 @@ impl PreflightHandler {
             }))
             .is_err()
         {
-            return Err("No browser is connected to save the restore point. Nothing was \
+            return Err(
+                "No browser is connected to save the restore point. Nothing was \
                         changed."
-                .to_string());
+                    .to_string(),
+            );
         }
 
         await_snapshot_ack(&mut ack_rx, identity.as_str(), self.ack_timeout).await
@@ -923,11 +945,13 @@ impl PreflightHandler {
     fn broadcast_progress(&self, state: PreflightApplyState) {
         let _ = self
             .provisioning_tx
-            .send(OutgoingMessage::PreflightApplyResult(PreflightApplyResult {
-                state,
-                success: true,
-                error: None,
-            }));
+            .send(OutgoingMessage::PreflightApplyResult(
+                PreflightApplyResult {
+                    state,
+                    success: true,
+                    error: None,
+                },
+            ));
     }
 
     fn broadcast_restore(&self, state: RestoreState) {
@@ -954,9 +978,12 @@ impl PreflightHandler {
     ) -> Result<(), ApplyFailure> {
         self.broadcast_progress(PreflightApplyState::Applying);
 
-        for (name, value) in [("SYS_HITL", 1i32), ("SYS_AUTOSTART", QUADROTOR_AUTOSTART_ID)]
-            .into_iter()
-            .chain(HITL_SUPPORT_PARAMS_I32.iter().copied())
+        for (name, value) in [
+            ("SYS_HITL", 1i32),
+            ("SYS_AUTOSTART", QUADROTOR_AUTOSTART_ID),
+        ]
+        .into_iter()
+        .chain(HITL_SUPPORT_PARAMS_I32.iter().copied())
         {
             let mut acked = false;
             for attempt in 1..=PARAM_RETRY_COUNT {
@@ -964,12 +991,17 @@ impl PreflightHandler {
                 match mav_tx.try_send(make_param_set_i32(name, value)) {
                     Ok(()) => {}
                     Err(crossbeam_channel::TrySendError::Full(_)) => {
-                        warn!(param = name, attempt, "MAVLink tx channel full — retrying PARAM_SET");
+                        warn!(
+                            param = name,
+                            attempt, "MAVLink tx channel full — retrying PARAM_SET"
+                        );
                         tokio::time::sleep(Duration::from_millis(50)).await;
                         continue;
                     }
                     Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-                        return Err(ApplyFailure::fatal(format!("MAVLink tx disconnected while sending {name}")));
+                        return Err(ApplyFailure::fatal(format!(
+                            "MAVLink tx disconnected while sending {name}"
+                        )));
                     }
                 }
 
@@ -977,13 +1009,16 @@ impl PreflightHandler {
                     acked = true;
                     break;
                 }
-                warn!(param = name, attempt, "Preflight PARAM_VALUE ack timed out — retrying");
+                warn!(
+                    param = name,
+                    attempt, "Preflight PARAM_VALUE ack timed out — retrying"
+                );
             }
 
             if !acked {
                 return Err(ApplyFailure::fatal(format!(
-                        "Failed to verify {name} after {PARAM_RETRY_COUNT} retries"
-                    )));
+                    "Failed to verify {name} after {PARAM_RETRY_COUNT} retries"
+                )));
             }
         }
 
@@ -994,12 +1029,17 @@ impl PreflightHandler {
                 match mav_tx.try_send(make_param_set(name, value)) {
                     Ok(()) => {}
                     Err(crossbeam_channel::TrySendError::Full(_)) => {
-                        warn!(param = name, attempt, "MAVLink tx channel full — retrying PARAM_SET");
+                        warn!(
+                            param = name,
+                            attempt, "MAVLink tx channel full — retrying PARAM_SET"
+                        );
                         tokio::time::sleep(Duration::from_millis(50)).await;
                         continue;
                     }
                     Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-                        return Err(ApplyFailure::fatal(format!("MAVLink tx disconnected while sending {name}")));
+                        return Err(ApplyFailure::fatal(format!(
+                            "MAVLink tx disconnected while sending {name}"
+                        )));
                     }
                 }
 
@@ -1007,13 +1047,16 @@ impl PreflightHandler {
                     acked = true;
                     break;
                 }
-                warn!(param = name, attempt, "Preflight PARAM_VALUE ack timed out — retrying");
+                warn!(
+                    param = name,
+                    attempt, "Preflight PARAM_VALUE ack timed out — retrying"
+                );
             }
 
             if !acked {
                 return Err(ApplyFailure::fatal(format!(
-                        "Failed to verify {name} after {PARAM_RETRY_COUNT} retries"
-                    )));
+                    "Failed to verify {name} after {PARAM_RETRY_COUNT} retries"
+                )));
             }
         }
 
@@ -1043,7 +1086,9 @@ impl PreflightHandler {
 
         self.broadcast_progress(PreflightApplyState::Rebooting);
         if let Err(e) = self.send_reboot_via_nsh().await {
-            return Err(ApplyFailure::fatal(format!("Failed to send reboot command: {e}")));
+            return Err(ApplyFailure::fatal(format!(
+                "Failed to send reboot command: {e}"
+            )));
         }
 
         self.broadcast_progress(PreflightApplyState::Reconnecting);
@@ -1056,7 +1101,9 @@ impl PreflightHandler {
             )
             .await
         {
-            return Err(ApplyFailure::fatal("FC did not reconnect after reboot".to_string()));
+            return Err(ApplyFailure::fatal(
+                "FC did not reconnect after reboot".to_string(),
+            ));
         }
 
         // Re-read the flags a few times instead of trusting the single
@@ -1148,7 +1195,8 @@ impl PreflightHandler {
                 // Straggler: bump our watermark and restart the quiet countdown.
                 last_seen_count = count;
                 quiet_start = tokio::time::Instant::now();
-            } else if !confirmed_quiet && tokio::time::Instant::now() >= quiet_start + quiet_period {
+            } else if !confirmed_quiet && tokio::time::Instant::now() >= quiet_start + quiet_period
+            {
                 confirmed_quiet = true;
             }
 
@@ -1191,7 +1239,10 @@ async fn send_with_backpressure(
             Ok(()) => return Ok(()),
             Err(crossbeam_channel::TrySendError::Full(_)) => {
                 if attempt % 10 == 0 {
-                    warn!(param = param_name, attempt, "MAVLink tx still full during restore");
+                    warn!(
+                        param = param_name,
+                        attempt, "MAVLink tx still full during restore"
+                    );
                 }
                 tokio::time::sleep(RESTORE_SEND_BACKOFF).await;
             }
@@ -1302,9 +1353,9 @@ mod apply_tests {
             param_value_tx,
             Some(nsh_tx),
             sim_state,
-            Arc::new(tokio::sync::RwLock::new(Some(BoardIdentity::from_raw_for_test(
-                "uid:testboard",
-            )))),
+            Arc::new(tokio::sync::RwLock::new(Some(
+                BoardIdentity::from_raw_for_test("uid:testboard"),
+            ))),
         )
         .with_fast_capture()
     }
@@ -1351,16 +1402,17 @@ mod apply_tests {
                             .unwrap_or("")
                             .trim_end_matches('\0')
                             .to_string();
-                        captured_clone
-                            .lock()
-                            .unwrap()
-                            .push(CapturedMsg::ParamSet(name.clone(), p.param_value, p.param_type));
+                        captured_clone.lock().unwrap().push(CapturedMsg::ParamSet(
+                            name.clone(),
+                            p.param_value,
+                            p.param_type,
+                        ));
                         let _ = param_value_tx.send(ParamValue {
-                        name,
-                        value: p.param_value,
-                        param_type: p.param_type,
-                        index: 0,
-                    });
+                            name,
+                            value: p.param_value,
+                            param_type: p.param_type,
+                            index: 0,
+                        });
                     }
                     MavMessage::COMMAND_LONG(c) => {
                         captured_clone
@@ -1466,9 +1518,9 @@ mod apply_tests {
             Some(pv_tx),
             Some(nsh_tx),
             sim_state,
-            Arc::new(tokio::sync::RwLock::new(Some(BoardIdentity::from_raw_for_test(
-                "uid:testboard",
-            )))),
+            Arc::new(tokio::sync::RwLock::new(Some(
+                BoardIdentity::from_raw_for_test("uid:testboard"),
+            ))),
         )
         .with_fast_capture();
         let ack_tx = handler.snapshot_ack_sender();
@@ -1626,7 +1678,10 @@ mod apply_tests {
                 Duration::from_millis(150),
             )
             .await;
-        assert!(!ok, "a lone straggler heartbeat must not be trusted as a genuine reconnect");
+        assert!(
+            !ok,
+            "a lone straggler heartbeat must not be trusted as a genuine reconnect"
+        );
     }
 
     #[tokio::test]
@@ -1771,7 +1826,10 @@ mod apply_tests {
             .contains("already in progress"));
 
         let first_result = first.await.unwrap();
-        assert!(!first_result.success, "unrelated ack-timeout failure expected: {first_result:?}");
+        assert!(
+            !first_result.success,
+            "unrelated ack-timeout failure expected: {first_result:?}"
+        );
 
         // The guard must release once the first call finishes, so a
         // subsequent apply() is not permanently locked out.
@@ -2046,7 +2104,12 @@ mod snapshot_gate_tests {
         *cell.write().await = Some(BoardIdentity::from_raw_for_test("uid:3034510f33323831"));
 
         assert_eq!(
-            handler.board_identity.read().await.as_ref().map(|b| b.as_str().to_string()),
+            handler
+                .board_identity
+                .read()
+                .await
+                .as_ref()
+                .map(|b| b.as_str().to_string()),
             Some("uid:3034510f33323831".to_string())
         );
     }
@@ -2141,9 +2204,9 @@ mod reapply_tests {
             Some(pv_tx),
             Some(nsh_tx),
             sim_state,
-            Arc::new(tokio::sync::RwLock::new(Some(BoardIdentity::from_raw_for_test(
-                "uid:testboard",
-            )))),
+            Arc::new(tokio::sync::RwLock::new(Some(
+                BoardIdentity::from_raw_for_test("uid:testboard"),
+            ))),
         )
         .with_fast_capture();
         (handler, writes)
@@ -2161,7 +2224,10 @@ mod reapply_tests {
     fn the_retry_budget_is_bounded() {
         // Each cycle commits parameters to flash; an unbounded retry on a board
         // that will never verify would wear it out.
-        assert!(PROVISION_ATTEMPTS >= 2, "one attempt would defeat the point");
+        assert!(
+            PROVISION_ATTEMPTS >= 2,
+            "one attempt would defeat the point"
+        );
         assert!(PROVISION_ATTEMPTS <= 3, "flash wear grows with every cycle");
     }
 
@@ -2209,8 +2275,15 @@ mod reapply_tests {
         drop(handler);
         let reconnects = driver.await.unwrap();
 
-        assert!(result.success, "re-apply should have succeeded: {:?}", result.error);
-        assert_eq!(reconnects, 2, "the board should have been provisioned twice");
+        assert!(
+            result.success,
+            "re-apply should have succeeded: {:?}",
+            result.error
+        );
+        assert_eq!(
+            reconnects, 2,
+            "the board should have been provisioned twice"
+        );
         // Two full parameter pushes, not one: the second cycle re-wrote them.
         assert!(
             writes.load(Ordering::SeqCst) > PreflightHandler::provisioned_param_names().len(),
@@ -2244,7 +2317,10 @@ mod restore_tests {
                     MavMessage::PARAM_SET(p) => {
                         let name = crate::param_io::decode_param_id(&p.param_id);
                         if !stuck.contains(&name.as_str()) {
-                            state_clone.lock().unwrap().insert(name.clone(), p.param_value);
+                            state_clone
+                                .lock()
+                                .unwrap()
+                                .insert(name.clone(), p.param_value);
                         }
                         // PX4 acks with the value it was asked to set, even
                         // when the stored value ends up different.
@@ -2363,7 +2439,10 @@ mod restore_tests {
 
         let result = handler.restore(request("uid:aaaa")).await;
 
-        assert!(!result.success, "a board with a stuck parameter is not restored");
+        assert!(
+            !result.success,
+            "a board with a stuck parameter is not restored"
+        );
         assert_eq!(result.mismatches.len(), 1);
         let mismatch = &result.mismatches[0];
         assert_eq!(mismatch.name, "COM_ARM_SDCARD");
@@ -2379,7 +2458,10 @@ mod restore_tests {
         let result = handler.restore(request("uid:bbbb")).await;
 
         assert!(!result.success);
-        assert!(result.error.unwrap().contains("different flight controller"));
+        assert!(result
+            .error
+            .unwrap()
+            .contains("different flight controller"));
         assert!(
             board.lock().unwrap().is_empty(),
             "nothing may be written when the snapshot belongs to another board"
@@ -2496,7 +2578,10 @@ mod broadcast_tests {
                 }
             }
         }
-        assert!(saw_terminal, "a late subscriber must still learn how it ended");
+        assert!(
+            saw_terminal,
+            "a late subscriber must still learn how it ended"
+        );
     }
 }
 
@@ -2622,7 +2707,10 @@ mod param_save_tests {
         let started = tokio::time::Instant::now();
         let result = send_with_backpressure(&mav_tx, make_param_save(), "PARAM_SAVE").await;
 
-        assert!(result.is_err(), "a queue that never drains must be reported");
+        assert!(
+            result.is_err(),
+            "a queue that never drains must be reported"
+        );
         assert!(result.unwrap_err().contains("not accepting writes"));
         // Bounded: it gives up rather than blocking provisioning forever.
         assert!(started.elapsed() < Duration::from_secs(10));
@@ -2639,9 +2727,11 @@ mod param_save_tests {
             while mav_rx.recv().is_ok() {}
         });
 
-        assert!(send_with_backpressure(&mav_tx, make_param_save(), "PARAM_SAVE")
-            .await
-            .is_ok());
+        assert!(
+            send_with_backpressure(&mav_tx, make_param_save(), "PARAM_SAVE")
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]

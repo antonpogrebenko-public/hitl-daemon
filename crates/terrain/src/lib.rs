@@ -418,6 +418,41 @@ impl TerrainCache {
     pub fn origin_elevation_msl(&self) -> Option<f64> {
         self.inner.read().origin_elevation
     }
+
+    /// Whether a vertical datum has been set. Ground contact needs one: without
+    /// it `sample_ground_ned` returns `None` no matter how many tiles are
+    /// resident, which is a wholly different fault from being off the edge of
+    /// coverage and must not be reported as one.
+    pub fn has_datum(&self) -> bool {
+        self.inner.read().origin_elevation.is_some()
+    }
+
+    /// Diagnostic: the coordinate a NED offset resolves to, and what is resident.
+    pub fn describe_lookup(&self, north: f64, east: f64) -> String {
+        let inner = self.inner.read();
+        let Some(z) = inner.zoom else {
+            return "no zoom (nothing resident)".to_string();
+        };
+        let (lat, lon) = ned_to_lat_lon(north, east, inner.origin_lat, inner.origin_lon);
+        let want = TileCoord::from_lon_lat(lon, lat, z);
+        let mut have: Vec<String> = inner
+            .tiles
+            .keys()
+            .map(|c| format!("{}/{}/{}", c.z, c.x, c.y))
+            .collect();
+        have.sort();
+        format!(
+            "origin=({:.7},{:.7}) probe=({:.7},{:.7}) want={}/{}/{} have=[{}]",
+            inner.origin_lat,
+            inner.origin_lon,
+            lat,
+            lon,
+            want.z,
+            want.x,
+            want.y,
+            have.join(" ")
+        )
+    }
 }
 
 impl TerrainCacheInner {

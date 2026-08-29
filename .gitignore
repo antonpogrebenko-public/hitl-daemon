@@ -3,3 +3,9 @@ Cargo.lock
 *.swp
 *.swo
 .DS_Store
+
+# Playwright MCP session artifacts
+.playwright-mcp/
+
+# Release binaries, published via the release tool
+dist/

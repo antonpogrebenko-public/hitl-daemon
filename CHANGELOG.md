@@ -5,6 +5,104 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.1]
+
+### Changed
+
+- Picks up `hitl-physics` 0.11.0: the thrust basis is re-anchored to lab bench
+  data and the operating point is capped by available current. Every build's
+  simulated thrust changes. The reported regression build (2212 1000KV, 6x4x3,
+  4S 10 Ah) goes from TWR 0.6542 to **1.025** — it flies, which is what the user
+  reported it used to do.
+
+## [0.21.0]
+
+### Fixed
+
+- **A build that cannot lift its own weight is now reported instead of being
+  silently handed an impossible hover throttle.** `hover_throttle_percent()` is
+  `1/sqrt(TWR)`, so a thrust-to-weight ratio below 1.0 demands more than full
+  throttle. The reported regression build (2212 1000KV, 6x4x3, 4S 10 Ah) needed
+  123.6%; that was clamped to 0.8 and pushed to PX4 as `MPC_THR_HOVER`. The
+  position controller then believed 80% throttle would hover, announced
+  takeoff, and the airframe never moved. `MPC_THR_HOVER` is no longer pushed
+  when the build cannot hover, the condition is logged at WARN, and
+  `AppliedConfig` carries `can_hover` and `hover_required` so the browser can
+  say so before launch. The decision is carried in `LastVerifiedParams`, so a
+  re-push after an FC power cycle makes the same call.
+
+- **Propeller mass was never read.** The propeller spec fetch pulled diameter,
+  pitch and blade count but not `weightG`, so every propeller in every build
+  used the 3 g `BuildSpec` default. A 6" tri-blade is nearer 8 g, counted four
+  times.
+
+- **The battery's measured mass was unreachable.** The daemon has always read
+  `weightG` when `battery_slug` is present, but the browser never sent that
+  field, so every build took the `capacity_mah * cells * 0.035` estimate. For a
+  4S 10 Ah pack that is 1400 g against a real ~850 g — 55% of the reported
+  build's all-up weight.
+
+### Added
+
+- `AppliedConfig.estimated_masses` lists the components whose mass was guessed
+  rather than measured, so an estimate is never shown as a specification. The
+  battery estimator's fit range (1100-4500 mAh, from its own three data points)
+  is now named as `BATTERY_FIT_MIN_MAH`/`BATTERY_FIT_MAX_MAH`; applying it
+  outside that span logs a warning and marks the entry `extrapolated`.
+
+### Note
+
+Correcting both mass defects takes the reported build from 2544.5 g to 2014.5 g
+and its TWR from 0.6542 to 0.8263 — still below 1.0. The mass bugs were real
+and are fixed, but they are not what stopped that build flying. See
+`openspec/changes/fix-hitl-sim-flight-regression`.
+
+## [0.20.1]
+
+### Fixed
+
+- **The vehicle fell through the terrain.** `TerrainCache::sample_ground_ned`
+  needs a vertical datum and returns `None` without one, and the only
+  production caller of `set_origin` — in `main` at startup — passed `None`.
+  `ConfigureBuild` set the browser-supplied datum into `SharedOrigin`, which the
+  barometer and `HIL_GPS` read, but never into the terrain cache, which is what
+  ground contact reads. The datum stayed `None` for the whole session, so every
+  ground sample returned "no ground" with a full set of tiles resident and the
+  vehicle had nothing to land on. Both are now anchored together in
+  `anchor_origin`, from one resolved origin, so they cannot disagree.
+- The loop reported a missing datum as `Outside terrain coverage`, which is a
+  different fault entirely — it sent a debugging session after tile coordinates
+  that were resident and correct. The two cases now log distinctly, and
+  `TerrainCache::describe_lookup` reports the coordinate wanted against those
+  held.
+
+## [0.20.0]
+
+### Fixed
+
+- **Terrain never reached the physics.** The WebSocket transport capped incoming
+  messages at 64 KB while a single 256x256 f32 tile is 256 KB, so every terrain
+  push the browser made was rejected with `Space limit exceeded` and the socket
+  was closed. `TerrainTiles::MAX_FRAME_BYTES` (16 MiB) was unreachable — axum
+  refused the frame before the parser saw it — and the protocol tests never
+  crossed a socket, so nothing caught it. The physics silently ran every session
+  on flat ground via its empty-cache fallback. The transport limit is now
+  derived from the protocol's own bound rather than being a second independent
+  number.
+- **`SYS_HAS_BARO` is now pushed as 1, not 0.** The daemon simulates a
+  barometer and ships it in every `HIL_SENSOR`; telling PX4 there was none meant
+  `vehicle_air_data` was never published and EKF2 held height on GPS alone.
+  Reboot-required, and the preflight flow already reboots.
+
+### Changed
+
+- Requires `hitl-sensors` 0.2.0, which stops applying a GPS module's datasheet
+  accuracy as per-sample white noise. Builds that selected a GPS component
+  could not arm: PX4 reported "vertical velocity unstable" and "height estimate
+  not stable" because consecutive fixes jumped the full 3 m altitude sigma
+  55 ms apart. The stated accuracy is preserved, but most of it now sits in a
+  slowly-varying term, as it does in a real receiver.
+
 ## [0.19.1] - 2026-08-25
 
 ### Fixed

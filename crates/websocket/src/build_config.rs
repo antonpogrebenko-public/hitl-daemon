@@ -85,7 +85,18 @@ struct LastVerifiedParams {
     pids: Px4Pids,
     hover_cmd: f32,
     thr_min: f32,
+    /// Carried so a re-push after an FC power cycle makes the same decision
+    /// about MPC_THR_HOVER that the original push did. Without it a build
+    /// that was correctly refused a hover value would be handed one on
+    /// reconnect.
+    can_hover: bool,
 }
+
+/// Capacity range the battery mass estimator was fitted over, in mAh. The fit
+/// is three FPV packs (4S 1500, 4S 4500, 6S 1100); outside this span the linear
+/// relation stops holding because larger packs use denser cells.
+const BATTERY_FIT_MIN_MAH: f64 = 1100.0;
+const BATTERY_FIT_MAX_MAH: f64 = 4500.0;
 
 impl BuildConfigHandler {
     pub fn new(
@@ -121,6 +132,49 @@ impl BuildConfigHandler {
         }
     }
 
+    /// Anchor the whole vertical stack to a flight origin.
+    ///
+    /// `SharedOrigin` is what the barometer and `HIL_GPS` read, but ground
+    /// contact reads the *terrain cache*, and the cache carries its own datum.
+    /// Setting only the former left `TerrainCache::origin_elevation` at the
+    /// `None` that `main` installs at startup, and `sample_ground_ned` returns
+    /// `None` without a datum — so with a full set of tiles resident the physics
+    /// still found no ground anywhere and the vehicle fell through the terrain
+    /// for the whole session. The loop's warning called that "outside coverage",
+    /// which it was not.
+    ///
+    /// Both are set here, from one resolved origin, so they cannot disagree.
+    fn anchor_origin(&self, lat: f64, lon: f64, elevation_msl: Option<f64>) {
+        let Some(origin) = &self.flight_origin else {
+            return;
+        };
+        let fallback_alt = self.terrain_ref.lock().unwrap().2;
+        origin.set(lat, lon, elevation_msl, fallback_alt);
+        let resolved = origin.get();
+
+        if let Some(cache) = &self.terrain_cache {
+            cache.set_origin(resolved.lat, resolved.lon, Some(resolved.alt_datum));
+        }
+
+        if resolved.from_terrain {
+            info!(
+                lat = resolved.lat,
+                lon = resolved.lon,
+                datum = resolved.alt_datum,
+                "Flight origin set; terrain elevation is the altitude datum"
+            );
+        } else {
+            warn!(
+                lat = resolved.lat,
+                lon = resolved.lon,
+                datum = resolved.alt_datum,
+                "Flight origin set but no elevation data covered it; \
+                 falling back to the configured altitude for ground \
+                 contact, barometer and GPS alike"
+            );
+        }
+    }
+
     /// Subscribe to system-initiated `ConfigResult` messages.  The WebSocket
     /// server calls this once during setup so reconnect-triggered results are
     /// forwarded to all connected browsers.
@@ -135,6 +189,7 @@ impl BuildConfigHandler {
             pids,
             hover_cmd,
             thr_min,
+            can_hover: true,
         });
     }
 
@@ -197,33 +252,7 @@ impl BuildConfigHandler {
                 };
             }
         };
-        if let Some(origin) = &self.flight_origin {
-            let fallback_alt = self.terrain_ref.lock().unwrap().2;
-            origin.set(
-                location.lat,
-                location.lon,
-                request.origin_elevation_msl,
-                fallback_alt,
-            );
-            let resolved = origin.get();
-            if resolved.from_terrain {
-                info!(
-                    lat = resolved.lat,
-                    lon = resolved.lon,
-                    datum = resolved.alt_datum,
-                    "Flight origin set; terrain elevation is the altitude datum"
-                );
-            } else {
-                warn!(
-                    lat = resolved.lat,
-                    lon = resolved.lon,
-                    datum = resolved.alt_datum,
-                    "Flight origin set but no elevation data covered it; \
-                     falling back to the configured altitude for ground \
-                     contact, barometer and GPS alike"
-                );
-            }
-        }
+        self.anchor_origin(location.lat, location.lon, request.origin_elevation_msl);
 
         let motor_specs = match self.fetch_motor_specs(&request.motor_slug).await {
             Ok(specs) => specs,
@@ -258,7 +287,7 @@ impl BuildConfigHandler {
             .unwrap_or(30.0);
 
         // Fetch propeller specs if provided, otherwise use defaults
-        let (prop_diameter, prop_pitch, blade_count) = if let Some(ref prop_slug) =
+        let (prop_diameter, prop_pitch, blade_count, prop_weight_g) = if let Some(ref prop_slug) =
             request.prop_slug
         {
             match self.fetch_component_specs(prop_slug).await {
@@ -275,8 +304,12 @@ impl BuildConfigHandler {
                         .get("bladeCount")
                         .and_then(|v| v.as_i64())
                         .unwrap_or(3) as i32;
-                    info!(slug = %prop_slug, diameter, pitch, blades, "Loaded propeller specs");
-                    (diameter, pitch, blades)
+                    // Mass was previously never read here, so every propeller
+                    // in every build weighed the 3 g BuildSpec default — a
+                    // 6" tri-blade is nearer 8 g, and it is counted four times.
+                    let weight = specs.get("weightG").and_then(|v| v.as_f64());
+                    info!(slug = %prop_slug, diameter, pitch, blades, ?weight, "Loaded propeller specs");
+                    (diameter, pitch, blades, weight)
                 }
                 Err(e) => {
                     warn!(slug = %prop_slug, error = %e, "Failed to fetch propeller specs, using defaults");
@@ -284,6 +317,7 @@ impl BuildConfigHandler {
                         request.prop_diameter_inches,
                         request.prop_diameter_inches * 0.9,
                         3,
+                        None,
                     )
                 }
             }
@@ -292,6 +326,7 @@ impl BuildConfigHandler {
                 request.prop_diameter_inches,
                 request.prop_diameter_inches * 0.9,
                 3,
+                None,
             )
         };
 
@@ -305,13 +340,31 @@ impl BuildConfigHandler {
         spec.propellers.diameter_in = prop_diameter;
         spec.propellers.pitch_in = prop_pitch;
         spec.propellers.blade_count = blade_count;
+
+        // Components whose mass this build could not measure. Reported to the
+        // user so an estimate is never presented as a specification.
+        let mut estimated_masses: Vec<String> = Vec::new();
+
+        match prop_weight_g {
+            Some(w) => spec.propellers.weight_g = Some(w),
+            None => estimated_masses.push("propeller".to_string()),
+        }
+
         spec.battery.cell_count = request.battery_cell_count;
         spec.battery.capacity_mah = request.battery_capacity_mah;
         // Estimate battery weight from capacity when no battery_slug will provide
         // an exact value. Regression across FPV packs: ~7g per cell per 100mAh
         // (4S 1500mAh ≈ 210g, 4S 4500mAh ≈ 630g, 6S 1100mAh ≈ 230g).
+        //
+        // Those three points are the whole of the fit, so the formula is only
+        // calibrated over BATTERY_FIT_MIN_MAH..BATTERY_FIT_MAX_MAH. Applied to a
+        // 10000 mAh pack it returns 1400 g against a real ~850 g, because large
+        // packs use higher-energy-density cells and amortise their packaging.
+        // Extrapolating is still better than refusing to simulate, but it must
+        // be disclosed rather than presented as the pack's weight.
         spec.battery.weight_g =
             request.battery_capacity_mah * request.battery_cell_count as f64 * 0.035;
+        let mut battery_mass_measured = false;
 
         // Fetch frame specs if frame_slug provided — gets wheelbase/material
         // but frame_weight_g from the request always takes priority (user-tunable).
@@ -390,12 +443,29 @@ impl BuildConfigHandler {
                 Ok(specs) => {
                     if let Some(weight) = specs.get("weightG").and_then(|v| v.as_f64()) {
                         spec.battery.weight_g = weight;
+                        battery_mass_measured = true;
                     }
                     info!(slug = %battery_slug, weight_g = spec.battery.weight_g, "Loaded battery specs");
                 }
                 Err(e) => {
                     warn!(slug = %battery_slug, error = %e, "Failed to fetch battery specs, using default weight");
                 }
+            }
+        }
+
+        if !battery_mass_measured {
+            estimated_masses.push("battery".to_string());
+            if request.battery_capacity_mah < BATTERY_FIT_MIN_MAH
+                || request.battery_capacity_mah > BATTERY_FIT_MAX_MAH
+            {
+                estimated_masses.push("battery (extrapolated)".to_string());
+                warn!(
+                    capacity_mah = request.battery_capacity_mah,
+                    estimated_g = spec.battery.weight_g,
+                    fit_min_mah = BATTERY_FIT_MIN_MAH,
+                    fit_max_mah = BATTERY_FIT_MAX_MAH,
+                    "Battery mass extrapolated beyond the range its estimator was fitted over"
+                );
             }
         }
 
@@ -506,7 +576,34 @@ impl BuildConfigHandler {
         // model (TWR~8, hover~12%); with the recalibrated model (TWR~2, hover~45%)
         // it inflated MPC_THR_HOVER to 62% vs actual 44%, making the position
         // controller unable to take off after landing (sess113).
-        let hover_cmd = physics.hover_throttle_percent().clamp(0.1, 0.8) as f32;
+        let hover_required = physics.hover_throttle_percent();
+
+        // `hover_throttle_percent()` is `1/sqrt(TWR)`, so a hover command above
+        // 1.0 and a thrust-to-weight ratio below 1.0 are the same fact stated
+        // two ways. Below 1.0 the build cannot lift its own weight at any
+        // throttle: there is no hover command, and clamping the impossible
+        // value into PX4's accepted range invents one.
+        //
+        // That clamp is how a 2212 1000KV on a 6x4x3 with a 4S 10Ah pack
+        // reached PX4 as `MPC_THR_HOVER = 0.8` when the build actually needed
+        // 1.236. The position controller believed 80% throttle would hover,
+        // announced takeoff, and the airframe never moved.
+        let can_hover = thrust_to_weight_ratio > 1.0;
+        if !can_hover {
+            warn!(
+                twr = thrust_to_weight_ratio,
+                mass_kg = physics.mass_kg,
+                max_thrust_per_motor_g,
+                hover_required,
+                "Build cannot hover: total static thrust is below its weight. \
+                 MPC_THR_HOVER will not be pushed; the vehicle will not leave the ground."
+            );
+        }
+
+        // Still used to scale the rate PIDs and MPC_THR_MIN, which are
+        // meaningful regardless of whether hover is reachable. Only the
+        // MPC_THR_HOVER push is gated on `can_hover`.
+        let hover_cmd = hover_required.clamp(0.1, 0.8) as f32;
 
         Self::report_stage(&progress_tx, ConfigStage::Computing).await;
 
@@ -545,6 +642,9 @@ impl BuildConfigHandler {
             max_motor_rpm,
             estimated_flight_time_min: flight_time,
             hover_cmd,
+            can_hover,
+            hover_required,
+            estimated_masses: estimated_masses.clone(),
             applied_pids: None,
             verified_params: 0,
         };
@@ -565,20 +665,22 @@ impl BuildConfigHandler {
         // Stage 2: push PIDs and await per-param PARAM_VALUE acks. Fail-closed:
         // any verification failure aborts before touching the sim loop, so the
         // user can't accidentally fly with mismatched PIDs vs. physics.
-        let (applied_pids, verified_params) =
-            match self.push_pids_and_verify(&pids, hover_cmd, thr_min).await {
-                Ok(view) => view,
-                Err(e) => {
-                    error!(error = %e, "PID verification failed — aborting reconfigure");
-                    return ConfigResult {
-                        state: ConfigState::Error,
-                        success: false,
-                        error: Some(format!("PID verification failed: {e}")),
-                        config: None,
-                        stage: None,
-                    };
-                }
-            };
+        let (applied_pids, verified_params) = match self
+            .push_pids_and_verify(&pids, hover_cmd, thr_min, can_hover)
+            .await
+        {
+            Ok(view) => view,
+            Err(e) => {
+                error!(error = %e, "PID verification failed — aborting reconfigure");
+                return ConfigResult {
+                    state: ConfigState::Error,
+                    success: false,
+                    error: Some(format!("PID verification failed: {e}")),
+                    config: None,
+                    stage: None,
+                };
+            }
+        };
 
         // Stage 3: hand new physics to the simulation loop. Only at this point
         // is the running drone state reconfigured. PX4 already has matching
@@ -637,6 +739,7 @@ impl BuildConfigHandler {
         pids: &Px4Pids,
         hover_cmd: f32,
         thr_min: f32,
+        can_hover: bool,
     ) -> Result<(Option<Px4PidsView>, u32), String> {
         let (Some(mav_tx), Some(param_value_tx)) =
             (self.mav_tx.as_ref(), self.param_value_tx.as_ref())
@@ -682,7 +785,7 @@ impl BuildConfigHandler {
         //   above weight, the drone can't descend, position mode locks into
         //   a ~0.8 Hz limit cycle. Scaled to 30% of hover (≥0.5 g descent
         //   authority), clamped to PX4's [0.05, 0.20] range.
-        let params: [(&str, f32); 21] = [
+        let mut params: Vec<(&str, f32)> = vec![
             ("MC_ROLLRATE_P", pids.roll_p),
             ("MC_ROLLRATE_I", pids.roll_i),
             ("MC_ROLLRATE_D", pids.roll_d),
@@ -696,7 +799,6 @@ impl BuildConfigHandler {
             ("MC_YAWRATE_D", pids.yaw_d),
             ("MC_YAWRATE_FF", pids.yaw_ff),
             ("THR_MDL_FAC", 1.0),
-            ("MPC_THR_HOVER", hover_cmd),
             ("MPC_THR_MIN", thr_min),
             // Zero accel/gyro calibration offsets: the simulated IMU has no
             // physical mounting bias. Real-hardware offsets create a persistent
@@ -709,6 +811,20 @@ impl BuildConfigHandler {
             ("CAL_GYRO0_YOFF", 0.0),
             ("CAL_GYRO0_ZOFF", 0.0),
         ];
+
+        // A build whose thrust is below its weight has no hover throttle to
+        // report. Pushing the clamped stand-in would tell PX4 that a
+        // reachable throttle produces hover, which is the defect this guard
+        // exists to prevent. PX4 keeps whatever MPC_THR_HOVER it already
+        // holds; the condition is reported to the user instead.
+        if can_hover {
+            params.push(("MPC_THR_HOVER", hover_cmd));
+        } else {
+            warn!(
+                hover_cmd,
+                "skipping MPC_THR_HOVER push — build cannot hover"
+            );
+        }
 
         let mut verified = 0u32;
         for (name, value) in params {
@@ -779,6 +895,7 @@ impl BuildConfigHandler {
             pids: pids.clone(),
             hover_cmd,
             thr_min,
+            can_hover,
         });
 
         // Persist to PX4 flash. PARAM_SET only writes RAM, so a Pixhawk
@@ -961,7 +1078,7 @@ impl BuildConfigHandler {
             .expect("PID cache poisoned") = None;
 
         match self
-            .push_pids_and_verify(&p.pids, p.hover_cmd, p.thr_min)
+            .push_pids_and_verify(&p.pids, p.hover_cmd, p.thr_min, p.can_hover)
             .await
         {
             Ok(_) => {
@@ -1223,10 +1340,18 @@ fn build_sensors_config(
             velocity_noise_sigma: request
                 .gps_velocity_noise
                 .unwrap_or(gp.velocity_noise_sigma_mps),
-            position_drift_sigma: 0.0, // No drift in HITL
+            // Still no *extra* random walk on top of the module's stated
+            // accuracy. That accuracy is no longer applied as per-sample white
+            // noise: `GpsSensor` splits it into a small uncorrelated part and a
+            // slow correlated one, so the wander a real receiver shows is
+            // already inside `horizontal_noise_sigma` / `altitude_noise_sigma`.
+            // Feeding the profile's own drift figures in here as well would
+            // count the same physical error twice.
+            position_drift_sigma: 0.0,
             position_drift_tau: 1000.0,
             update_rate_hz: gp.update_rate_hz,
             delay_ms: gp.delay_ms,
+            ..GpsConfig::default()
         }
     } else {
         // No GPS module selected — use API values or tight defaults for HITL
@@ -1238,6 +1363,7 @@ fn build_sensors_config(
             position_drift_tau: 1000.0,
             update_rate_hz: 10.0,
             delay_ms: 80.0,
+            ..GpsConfig::default()
         }
     };
 
@@ -1387,7 +1513,7 @@ mod tests {
     async fn sim_only_mode_skips_verification() {
         let handler = make_handler(None, None);
         let result = handler
-            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN)
+            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN, true)
             .await;
         assert!(matches!(result, Ok((None, 0))));
     }
@@ -1400,7 +1526,7 @@ mod tests {
 
         let handler = make_handler(Some(mav_tx), Some(pv_tx));
         let (view, verified) = handler
-            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN)
+            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN, true)
             .await
             .unwrap();
         assert!(view.is_some());
@@ -1437,7 +1563,7 @@ mod tests {
 
         let handler = make_handler(Some(mav_tx), Some(pv_tx));
         let (view, verified) = handler
-            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN)
+            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN, true)
             .await
             .unwrap();
         assert!(view.is_some());
@@ -1452,7 +1578,7 @@ mod tests {
         // comes back. Each param exhausts PARAM_RETRY_COUNT attempts.
         let handler = make_handler(Some(mav_tx), Some(pv_tx));
         let err = handler
-            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN)
+            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN, true)
             .await
             .unwrap_err();
         assert!(
@@ -1469,14 +1595,14 @@ mod tests {
 
         let handler = make_handler(Some(mav_tx), Some(pv_tx));
         let (_, verified_first) = handler
-            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN)
+            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN, true)
             .await
             .unwrap();
         assert_eq!(verified_first, 21);
 
         // Identical PIDs + hover_cmd → fingerprint matches → no push, no acks needed.
         let (view, verified_second) = handler
-            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN)
+            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN, true)
             .await
             .unwrap();
         assert!(view.is_none());
@@ -1491,14 +1617,14 @@ mod tests {
 
         let handler = make_handler(Some(mav_tx), Some(pv_tx));
         let (_, verified_first) = handler
-            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN)
+            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN, true)
             .await
             .unwrap();
         assert_eq!(verified_first, 21);
 
         // Baseline: the identical push is skipped while the fingerprint stands.
         let (view, verified_skipped) = handler
-            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN)
+            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN, true)
             .await
             .unwrap();
         assert!(view.is_none());
@@ -1508,7 +1634,7 @@ mod tests {
         // next ConfigureBuild push for real instead of trusting the cache.
         handler.invalidate_pid_fingerprint();
         let (view, verified_after) = handler
-            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN)
+            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN, true)
             .await
             .unwrap();
         assert!(
@@ -1530,7 +1656,7 @@ mod tests {
 
         let handler = make_handler(Some(mav_tx), Some(pv_tx));
         let (_, verified) = handler
-            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN)
+            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN, true)
             .await
             .unwrap();
         assert_eq!(verified, 21);
@@ -1569,7 +1695,7 @@ mod tests {
 
         let handler = make_handler(Some(mav_tx), Some(pv_tx));
         let (_, verified_first) = handler
-            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN)
+            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN, true)
             .await
             .unwrap();
         assert_eq!(verified_first, 21);
@@ -1578,15 +1704,111 @@ mod tests {
         // new MPC_THR_HOVER. A TWR change without re-pushing was the original
         // cause of position-mode oscillation.
         let (view, verified_second) = handler
-            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD_ALT, REF_THR_MIN)
+            .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD_ALT, REF_THR_MIN, true)
             .await
             .unwrap();
         assert!(view.is_some());
         assert_eq!(verified_second, 21);
     }
+
+    mod unflyable_build_tests {
+        //! A build whose thrust is below its weight must be reported, never
+        //! handed to PX4 as a clamped stand-in.
+        //!
+        //! The reported regression build (2212 1000KV, 6x4x3, 4S 10Ah) needs
+        //! 123.6% throttle to hover. The old code clamped that to 0.8 and pushed
+        //! it as MPC_THR_HOVER, so PX4 believed 80% throttle would hover and
+        //! announced takeoff for an airframe that never left the ground.
+
+        use super::*;
+        use crossbeam_channel::bounded;
+        use tokio::sync::broadcast;
+
+        /// `hover_throttle_percent()` is `1/sqrt(TWR)`, so this is the same
+        /// condition the daemon gates on, stated as the test sees it.
+        fn hover_required_for(twr: f64) -> f64 {
+            1.0 / twr.sqrt()
+        }
+
+        #[test]
+        fn a_build_below_unity_thrust_needs_more_than_full_throttle() {
+            // The reported build's logged TWR.
+            let required = hover_required_for(0.6542);
+            assert!(
+                required > 1.0,
+                "TWR 0.6542 must require more than full throttle, got {required:.4}"
+            );
+            assert!((required - 1.2363).abs() < 0.001, "got {required:.4}");
+        }
+
+        #[test]
+        fn clamping_is_what_made_the_impossible_look_reachable() {
+            // This is the old behaviour, kept as a statement of the defect: the
+            // clamp turns "cannot hover" into a value PX4 will happily accept.
+            let required = hover_required_for(0.6542);
+            let clamped = required.clamp(0.1, 0.8);
+            assert!(required > 1.0 && clamped <= 0.8);
+        }
+
+        #[tokio::test]
+        async fn no_hover_param_is_sent_when_the_build_cannot_hover() {
+            let (mav_tx, mav_rx) = bounded::<MavMessage>(64);
+            let (pv_tx, _) = broadcast::channel::<ParamValue>(64);
+            let (_px4, captured) = spawn_fake_px4_with_capture(mav_rx, pv_tx.clone());
+
+            let handler = make_handler(Some(mav_tx), Some(pv_tx));
+            let (_view, verified) = handler
+                .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN, false)
+                .await
+                .unwrap();
+
+            let names: Vec<String> = captured
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|m| match m {
+                    CapturedMsg::ParamSet(n, _) => Some(n.clone()),
+                    _ => None,
+                })
+                .collect();
+
+            assert!(
+                !names.iter().any(|n| n == "MPC_THR_HOVER"),
+                "MPC_THR_HOVER must not be pushed for a build that cannot hover; sent: {names:?}"
+            );
+            // Everything else still goes: the PIDs and the descent-authority floor
+            // are meaningful whether or not the build can lift itself.
+            assert!(names.iter().any(|n| n == "MPC_THR_MIN"));
+            assert!(names.iter().any(|n| n == "MC_ROLLRATE_P"));
+            assert_eq!(verified, 20, "one fewer param than the flyable path");
+        }
+
+        #[tokio::test]
+        async fn the_hover_param_is_sent_when_the_build_can_hover() {
+            let (mav_tx, mav_rx) = bounded::<MavMessage>(64);
+            let (pv_tx, _) = broadcast::channel::<ParamValue>(64);
+            let (_px4, captured) = spawn_fake_px4_with_capture(mav_rx, pv_tx.clone());
+
+            let handler = make_handler(Some(mav_tx), Some(pv_tx));
+            handler
+                .push_pids_and_verify(&REF_PIDS, REF_HOVER_CMD, REF_THR_MIN, true)
+                .await
+                .unwrap();
+
+            let names: Vec<String> = captured
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|m| match m {
+                    CapturedMsg::ParamSet(n, _) => Some(n.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert!(names.iter().any(|n| n == "MPC_THR_HOVER"));
+        }
+    }
 }
 
-#[cfg(test)]
 mod reconnect_repush_tests {
     use super::*;
     use crossbeam_channel::bounded as cb_bounded;
@@ -1646,6 +1868,108 @@ mod reconnect_repush_tests {
         assert!(
             client.try_recv().is_err(),
             "no config result should be emitted"
+        );
+    }
+}
+
+#[cfg(test)]
+mod origin_anchor_tests {
+    use super::*;
+    use crossbeam_channel::bounded;
+    use terrain::{TileCoord, TILE_SIZE};
+
+    const LAT: f64 = 40.015;
+    const LON: f64 = -105.2705;
+    const DATUM: f64 = 1621.4869497456395;
+
+    fn handler_with_cache(cache: std::sync::Arc<terrain::TerrainCache>) -> BuildConfigHandler {
+        let (config_tx, _rx) =
+            bounded::<(PhysicsConfig, BatteryConfig, hitl_sensors::SensorsConfig)>(4);
+        BuildConfigHandler::new(
+            config_tx,
+            None,
+            None,
+            None,
+            Some(cache),
+            (LAT, LON, 1655.0),
+            Some(std::sync::Arc::new(simulation::SharedOrigin::new(
+                LAT, LON, 1655.0,
+            ))),
+        )
+    }
+
+    /// A flat tile covering the origin, as the browser would supply it.
+    fn seed_origin_tile(cache: &terrain::TerrainCache, msl: f32) {
+        let coord = TileCoord::from_lon_lat(LON, LAT, 15);
+        let report = cache.insert_tiles(
+            TILE_SIZE as u32,
+            vec![(coord, vec![msl; TILE_SIZE * TILE_SIZE], false)],
+        );
+        assert_eq!(
+            report.accepted, 1,
+            "seed tile rejected: {:?}",
+            report.rejected
+        );
+    }
+
+    /// Ground contact reads the terrain cache's own datum, not `SharedOrigin`.
+    /// Anchoring only the latter left the cache on the `None` that `main`
+    /// installs at startup, and `sample_ground_ned` yields `None` without a
+    /// datum — so a fully populated cache still reported no ground anywhere and
+    /// the vehicle fell through the terrain for the entire session.
+    #[test]
+    fn anchoring_the_origin_gives_the_terrain_cache_its_datum() {
+        let cache = std::sync::Arc::new(terrain::TerrainCache::new());
+        let handler = handler_with_cache(cache.clone());
+
+        handler.anchor_origin(LAT, LON, Some(DATUM));
+
+        assert_eq!(
+            cache.origin_elevation_msl(),
+            Some(DATUM),
+            "the browser's datum must reach the cache that decides ground contact"
+        );
+    }
+
+    /// The end-to-end property that actually matters: tiles resident plus an
+    /// anchored origin must produce ground, not `None`.
+    #[test]
+    fn a_resident_tile_under_an_anchored_origin_has_ground() {
+        let cache = std::sync::Arc::new(terrain::TerrainCache::new());
+        let handler = handler_with_cache(cache.clone());
+
+        handler.anchor_origin(LAT, LON, Some(DATUM));
+        seed_origin_tile(&cache, DATUM as f32);
+
+        assert!(cache.is_loaded(), "the seeded tile should be resident");
+        let ground = cache.sample_ground_ned(0.0, 0.0);
+        assert!(
+            ground.is_some(),
+            "ground contact must find terrain at the origin when a tile covering \
+             it is resident and the origin is anchored"
+        );
+        assert!(
+            ground.unwrap().abs() < 0.01,
+            "terrain at the datum elevation should put ground at NED 0, got {:?}",
+            ground
+        );
+    }
+
+    /// Without the fallback path the datum would be absent whenever the browser
+    /// could not resolve an elevation, which is the same silent no-ground state
+    /// by another route.
+    #[test]
+    fn an_unresolved_elevation_still_anchors_the_cache() {
+        let cache = std::sync::Arc::new(terrain::TerrainCache::new());
+        let handler = handler_with_cache(cache.clone());
+
+        handler.anchor_origin(LAT, LON, None);
+
+        assert_eq!(
+            cache.origin_elevation_msl(),
+            Some(1655.0),
+            "with no elevation data the configured altitude must still anchor the \
+             cache, or ground contact is silently disabled"
         );
     }
 }

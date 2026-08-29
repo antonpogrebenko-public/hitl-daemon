@@ -456,11 +456,35 @@ impl SimulationLoop {
         if ground_z.is_none()
             && self.last_terrain_miss_warning.elapsed() >= TERRAIN_MISS_WARN_INTERVAL
         {
-            warn!(
-                north = state.quadrotor.position[0],
-                east = state.quadrotor.position[1],
-                "Outside terrain coverage — ground collision disabled until the drone returns"
-            );
+            // Two distinct faults reach here and they need different names.
+            // Reporting a missing datum as "outside coverage" sent a whole
+            // debugging session after tile coordinates that were in fact
+            // resident and correct.
+            let has_datum = self.config.terrain.as_ref().is_some_and(|t| t.has_datum());
+            if has_datum {
+                warn!(
+                    north = state.quadrotor.position[0],
+                    east = state.quadrotor.position[1],
+                    detail = %self
+                        .config
+                        .terrain
+                        .as_ref()
+                        .map(|t| t.describe_lookup(
+                            state.quadrotor.position[0],
+                            state.quadrotor.position[1]
+                        ))
+                        .unwrap_or_default(),
+                    "Outside terrain coverage — ground collision disabled until the drone returns"
+                );
+            } else {
+                warn!(
+                    north = state.quadrotor.position[0],
+                    east = state.quadrotor.position[1],
+                    "Terrain has no altitude datum — ground collision disabled everywhere, \
+                     the vehicle will fall through the terrain. The flight origin was never \
+                     anchored into the terrain cache."
+                );
+            }
             self.last_terrain_miss_warning = Instant::now();
         }
 

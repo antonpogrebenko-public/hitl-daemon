@@ -624,6 +624,22 @@ pub struct AppliedConfig {
     /// to the actuator — matching the simulator's linear cmd→ω model and
     /// real ESC behavior.
     pub hover_cmd: f32,
+    /// Whether this build can hover at all — `thrust_to_weight_ratio > 1.0`.
+    ///
+    /// When false, `hover_cmd` is a clamped stand-in that was NOT pushed to
+    /// PX4, and `hover_required` states what the build would actually need.
+    /// Surfaces to the user so an unflyable build is reported at configure
+    /// time rather than discovered on the pad.
+    pub can_hover: bool,
+    /// Throttle fraction this build needs to hover, unclamped. Equals
+    /// `1/sqrt(thrust_to_weight_ratio)`, so it exceeds 1.0 exactly when the
+    /// build cannot lift its own weight.
+    pub hover_required: f64,
+    /// Components whose mass was estimated rather than read from the database,
+    /// so the user is never shown a guess presented as a specification. A
+    /// `"battery (extrapolated)"` entry additionally means the estimator was
+    /// applied outside the capacity range it was fitted over.
+    pub estimated_masses: Vec<String>,
     /// Per-build PX4 rate-controller gains pushed via `PARAM_SET` (Phase 6).
     /// Absent when the daemon ran in `--sim-only` mode or the fingerprint
     /// matched the previously-applied build (so we skipped the push).

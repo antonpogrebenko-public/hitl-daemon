@@ -455,6 +455,7 @@ async fn main() {
             velocity_noise_sigma: 0.05,  // 5cm/s velocity noise
             delay_ms: 80.0,              // Moderate delay
             update_rate_hz: 10.0,        // 10 Hz GPS
+            ..hitl_sensors::GpsConfig::default()
         },
         mag: hitl_sensors::MagConfig::default(),
     };
