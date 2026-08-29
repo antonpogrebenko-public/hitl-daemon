@@ -5,6 +5,22 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.22.1]
+
+### Fixed
+
+- **The battery's C-rating was never read from the component record.** It stayed
+  at the `BuildSpec` default of 75 while the browser read the catalogue's real
+  figure, so the two disagreed on the current ceiling — `min(esc.burst_amps,
+  C x Ah / 4)` — and therefore on thrust. Caught by running the real product
+  rather than the model: for a 6S 1350 mAh 120C pack the configurator showed
+  TWR 9.8 and the daemon simulated 6.11, a ratio of exactly 120/75. They now
+  agree at 9.84.
+
+  Same class as the `battery_slug` gap in 0.21.0: a specification the API
+  serves and nothing read. Current limiting, added in 0.21.x, is what made it
+  load-bearing.
+
 ## [0.22.0]
 
 ### Changed

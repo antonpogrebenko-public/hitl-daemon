@@ -473,7 +473,29 @@ impl BuildConfigHandler {
                         spec.battery.weight_g = weight;
                         battery_mass_measured = true;
                     }
-                    info!(slug = %battery_slug, weight_g = spec.battery.weight_g, "Loaded battery specs");
+                    // The pack's C-rating, which was never read. It sets the
+                    // current ceiling — `min(esc.burst_amps, C x Ah / 4)` — so
+                    // leaving it at the BuildSpec default of 75 while the web
+                    // read the catalogue's real figure made the two disagree on
+                    // thrust-to-weight by the ratio of the two C-ratings. On a
+                    // 120C pack that is 1.6x, and the configurator and the
+                    // daemon showed 9.8 against 6.11 for the same build.
+                    //
+                    // Printed C-ratings are marketing, but the two sides have to
+                    // read the same marketing.
+                    if let Some(c) = specs
+                        .get("dischargeRateC")
+                        .and_then(|v| v.as_f64())
+                        .filter(|c| *c > 0.0)
+                    {
+                        spec.battery.c_rating = c;
+                    }
+                    info!(
+                        slug = %battery_slug,
+                        weight_g = spec.battery.weight_g,
+                        c_rating = spec.battery.c_rating,
+                        "Loaded battery specs"
+                    );
                 }
                 Err(e) => {
                     warn!(slug = %battery_slug, error = %e, "Failed to fetch battery specs, using default weight");
