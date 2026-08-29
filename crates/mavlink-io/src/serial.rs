@@ -630,7 +630,10 @@ mod tests {
         let started = std::time::Instant::now();
         let deadline = started + Duration::from_millis(100);
         assert!(!scan_for_heartbeat(&mut source, deadline));
-        assert!(started.elapsed() < Duration::from_secs(2), "probe must be bounded");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "probe must be bounded"
+        );
     }
 
     #[test]

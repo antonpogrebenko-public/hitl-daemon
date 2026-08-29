@@ -17,9 +17,9 @@ pub use build_config::BuildConfigHandler;
 pub use handler::{ConnectionHandler, ValidatedCommand, ValidatedNshCommand};
 pub use preflight::{heartbeat_hitl_signals, PreflightHandler};
 pub use protocol::{
-    Command, CommandType, ConnectionStatus, LinkState, HandshakeAck, IncomingMessage, NshCommand, NshResponse,
-    OutgoingMessage, PreflightApplyResult, PreflightApplyState, PreflightStatus, StateUpdate,
-    TerrainOrigin, VehicleMessage,
+    Command, CommandType, ConnectionStatus, HandshakeAck, IncomingMessage, LinkState, NshCommand,
+    NshResponse, OutgoingMessage, PreflightApplyResult, PreflightApplyState, PreflightStatus,
+    StateUpdate, TerrainOrigin, VehicleMessage,
 };
 pub use server::{WebSocketServer, WebSocketServerConfig};
 pub use snapshot::{SessionSnapshot, StoredSnapshot};

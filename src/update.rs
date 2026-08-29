@@ -61,7 +61,10 @@ pub enum UpdateError {
     ChannelUnavailable(String),
     /// The download did not match the published hash. The running binary is
     /// untouched.
-    HashMismatch { expected: String, actual: String },
+    HashMismatch {
+        expected: String,
+        actual: String,
+    },
     Io(String),
 }
 
@@ -303,7 +306,10 @@ pub async fn download_verified(update: &AvailableUpdate) -> Result<Vec<u8>, Upda
 /// nothing here happens on its own.
 pub async fn run_update(api_url: &str, current_version: &str) -> Result<(), UpdateError> {
     let Some(available) = check_for_update(api_url, current_version).await? else {
-        info!(version = current_version, "Already running the latest daemon");
+        info!(
+            version = current_version,
+            "Already running the latest daemon"
+        );
         return Ok(());
     };
 

@@ -234,7 +234,11 @@ impl SimulationState {
     /// themselves rather than clearing shared state.
     pub fn heartbeat_status(&self) -> (u64, bool, bool) {
         let inner = self.inner.read();
-        (inner.heartbeat_count, inner.hitl_enabled, inner.is_quadrotor)
+        (
+            inner.heartbeat_count,
+            inner.hitl_enabled,
+            inner.is_quadrotor,
+        )
     }
 
     /// Get current simulation time in microseconds
