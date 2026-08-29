@@ -5,6 +5,23 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.22.0]
+
+### Changed
+
+- Picks up `hitl-physics` 0.13.0. Every simulated build's thrust changes again,
+  from two corrections on top of 0.11.0's re-anchor:
+  - **Blade count** is now `(blades/2)^0.7` rather than `0.85 + 0.05*blades`,
+    fitted to UIUC's blade-count control pairs. A three-blade is 1.328x a
+    two-blade, not 1.053x. `K_CT` is re-normalised so the six-inch three-blade
+    lab anchor is unmoved, so **three-blade builds are unaffected** and
+    two-blade builds read about 21% lower.
+  - **All four reference builds** were corrected against manufacturer sources;
+    two described a different aircraft than their name claimed.
+
+  The reported regression build is a 6x4x3 — three blades — so its figures are
+  unchanged from 0.21.x: mass 2.2033 kg, TWR 1.2400.
+
 ## [0.21.2]
 
 ### Changed
