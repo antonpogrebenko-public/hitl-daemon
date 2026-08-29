@@ -286,6 +286,32 @@ impl BuildConfigHandler {
             .and_then(|v| v.as_f64())
             .unwrap_or(30.0);
 
+        // Winding resistance and no-load current, when the component record
+        // carries them. Absent, `PhysicsConfig::from_build_specs` falls back to
+        // a KV-only heuristic (`0.05 + 0.02/(kv/1000)`), which reads 0.070 ohm
+        // for a motor whose published figure is 0.116. Under-estimating
+        // resistance lets the torque balance settle at a higher speed than the
+        // motor can actually reach, so it inflates thrust.
+        //
+        // Read here rather than defaulted so the model improves the moment the
+        // catalogue gains the fields, and so the log says which path was taken.
+        let motor_resistance_ohm = motor_specs
+            .get("resistanceOhm")
+            .and_then(|v| v.as_f64())
+            .filter(|r| *r > 0.0);
+        let motor_no_load_amps = motor_specs
+            .get("noLoadCurrentA")
+            .or_else(|| motor_specs.get("idleCurrentA"))
+            .and_then(|v| v.as_f64())
+            .filter(|a| *a >= 0.0);
+        if motor_resistance_ohm.is_none() {
+            debug!(
+                slug = %request.motor_slug,
+                "motor record has no resistanceOhm — falling back to the KV heuristic, which \
+                 under-reads for low-KV outrunners and inflates full-throttle thrust"
+            );
+        }
+
         // Fetch propeller specs if provided, otherwise use defaults
         let (prop_diameter, prop_pitch, blade_count, prop_weight_g) = if let Some(ref prop_slug) =
             request.prop_slug
@@ -337,6 +363,8 @@ impl BuildConfigHandler {
         spec.frame.weight_g = request.frame_weight_g;
         spec.motors.kv = kv;
         spec.motors.weight_g = motor_weight_g;
+        spec.motors.resistance_ohm = motor_resistance_ohm;
+        spec.motors.no_load_amps = motor_no_load_amps;
         spec.propellers.diameter_in = prop_diameter;
         spec.propellers.pitch_in = prop_pitch;
         spec.propellers.blade_count = blade_count;

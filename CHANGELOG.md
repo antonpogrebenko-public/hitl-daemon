@@ -5,6 +5,18 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.2]
+
+### Changed
+
+- Motor winding resistance and no-load current are read from the component
+  record (`resistanceOhm`, `noLoadCurrentA`/`idleCurrentA`) when it carries
+  them. Absent, the KV-only heuristic still applies and a DEBUG line names the
+  fallback. The heuristic reads 0.070 ohm for a motor whose published figure is
+  0.116, and under-reading resistance lets the torque balance settle above the
+  speed the motor can reach — so it inflates thrust. The catalogue does not
+  carry these fields yet; this makes the model improve the moment it does.
+
 ## [0.21.1]
 
 ### Changed
