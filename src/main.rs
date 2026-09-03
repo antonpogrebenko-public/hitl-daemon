@@ -8,7 +8,7 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use hitl_physics::{throttle_to_omega_with_config, PhysicsConfig};
 use hitl_sensors::{ImuConfig, SensorsConfig};
 use mavlink::ardupilotmega::MavMessage;
-use mavlink_io::async_io::{reconnect_delay, MavlinkIo, NshRequest};
+use mavlink_io::async_io::{reconnect_delay, MavlinkIo, NshRequest, TrySendError};
 use mavlink_io::serial::detect_flight_controller;
 use protocol::{ActuatorOutputs, DaemonState, DaemonStatus};
 use simulation::{SharedOrigin, SimulationConfig, SimulationLoop, SimulationState, TerrainCache};
@@ -979,6 +979,12 @@ async fn main() {
             // Pending request tracking — serialized: one request at a time
             let mut current_request_id: Option<u32> = None;
             let mut response_buffer: Vec<u8> = Vec::new();
+            // The prompt forms this looks for, as bytes. PROMPT_MAX is the
+            // overlap the tail scan needs so a prompt split across two chunks is
+            // still found.
+            const PROMPT_WITH_CLEAR: &[u8] = b"nsh> \x1b[K";
+            const PROMPT_BARE: &[u8] = b"nsh>";
+            const PROMPT_MAX: usize = PROMPT_WITH_CLEAR.len();
             let mut request_deadline: Option<tokio::time::Instant> = None;
             let mut cached_mav_io: Option<Arc<MavlinkIo>> = None;
 
@@ -1066,16 +1072,44 @@ async fn main() {
                         if let Some(ref mav) = cached_mav_io {
                             // Check for NSH responses
                             while let Some(resp) = mav.try_recv_nsh() {
+                                // Only the tail is rescanned.
+                                //
+                                // This converted the whole accumulated buffer to
+                                // UTF-8 and searched all of it on every 70-byte
+                                // chunk: for a K-chunk response that is 70*K^2/2
+                                // bytes scanned — a 35 KB `param show` scans about
+                                // 8.75 MB. And once the buffer holds invalid UTF-8,
+                                // which a degraded cable produces and
+                                // `take_parse_stats` exists to instrument,
+                                // `from_utf8_lossy` stops borrowing and allocates a
+                                // fresh String of the entire buffer per chunk.
+                                //
+                                // A prompt cannot straddle more than its own length,
+                                // so an overlap of PROMPT_MAX is sufficient. Matched
+                                // on bytes, so no conversion happens until the
+                                // response is actually complete.
+                                let scan_from = response_buffer.len().saturating_sub(PROMPT_MAX);
                                 response_buffer.extend_from_slice(&resp.data);
 
-                                // Check for completion: either count==0 OR nsh> prompt detected
-                                let output_str = String::from_utf8_lossy(&response_buffer);
-                                let has_prompt = output_str.contains("nsh> \x1b[K") || output_str.trim_end().ends_with("nsh>");
+                                let tail = &response_buffer[scan_from..];
+                                let has_prompt = tail
+                                    .windows(PROMPT_WITH_CLEAR.len())
+                                    .any(|w| w == PROMPT_WITH_CLEAR)
+                                    || {
+                                        let trimmed = match tail.iter().rposition(|b| !b.is_ascii_whitespace()) {
+                                            Some(end) => &tail[..=end],
+                                            None => &tail[..0],
+                                        };
+                                        trimmed.ends_with(PROMPT_BARE)
+                                    };
                                 let is_complete = resp.complete || has_prompt;
 
                                 if is_complete {
                                     if let Some(req_id) = current_request_id.take() {
-                                        let output = output_str.to_string();
+                                        // Converted once, on completion, rather
+                                        // than on every chunk.
+                                        let output =
+                                            String::from_utf8_lossy(&response_buffer).into_owned();
                                         debug!(request_id = req_id, len = output.len(), "NSH response complete");
 
                                         let _ = nsh_resp_broadcast_tx.send(websocket::NshResponse {
@@ -1384,6 +1418,12 @@ async fn main() {
                         let bootloader_suspected_recv = bootloader_suspected.clone();
                         let start_time = std::time::Instant::now();
                         receiver_handle = Some(tokio::spawn(async move {
+                            // Dropped actuator frames, reported on a divider so a
+                            // stalled simulation says so once a second rather than
+                            // 400 times.
+                            let mut actuator_drops: u64 = 0;
+                            // Reusable serialisation buffer for QGC forwarding.
+                            let mut qgc_buf: Vec<u8> = Vec::with_capacity(300);
                             info!("MAVLink receiver task started");
                             let heartbeat_timeout = Duration::from_secs(5);
                             let mut heartbeat_received = false;
@@ -1420,16 +1460,38 @@ async fn main() {
                                 if let Some((header, msg)) = mav_io_recv.try_recv() {
                                     // Forward to QGC via UDP
                                     if let Some(ref socket) = qgc_socket_recv {
-                                        let mut buf = Vec::new();
-                                        if mavlink::write_v2_msg(&mut buf, header, &msg).is_ok() {
-                                            let _ = socket.send_to(&buf, qgc_target);
+                                        // Reused, not allocated per message. QGC
+                                        // forwarding is on by default, so this ran
+                                        // for every inbound frame — about 410 a
+                                        // second — whether or not QGroundControl
+                                        // was running.
+                                        qgc_buf.clear();
+                                        if mavlink::write_v2_msg(&mut qgc_buf, header, &msg).is_ok()
+                                        {
+                                            let _ = socket.send_to(&qgc_buf, qgc_target);
                                         }
                                     }
 
                                     // Process HIL_ACTUATOR_CONTROLS
                                     if let MavMessage::HIL_ACTUATOR_CONTROLS(_) = &msg {
                                         if let Ok(actuator) = ActuatorOutputs::from_mavlink(&msg) {
-                                            let _ = actuator_tx_recv.send(actuator);
+                                            // try_send, not send: this runs on a
+                                            // tokio worker, and the blocking form
+                                            // parks it until the simulation
+                                            // consumes — which, if the sim thread
+                                            // has aborted, is never. A full
+                                            // 16-deep queue already means the sim
+                                            // is not keeping up, so the newest
+                                            // command is the one worth keeping.
+                                            if actuator_tx_recv.try_send(actuator).is_err() {
+                                                actuator_drops += 1;
+                                                if actuator_drops % 400 == 1 {
+                                                    warn!(
+                                                        drops = actuator_drops,
+                                                        "actuator queue full — simulation is not consuming"
+                                                    );
+                                                }
+                                            }
                                         }
                                     }
 
@@ -1505,8 +1567,14 @@ async fn main() {
                                         // proven. Requesting before the first heartbeat
                                         // races PX4's own startup and the reply is lost.
                                         if first_heartbeat {
-                                            let _ =
-                                                mav_io_recv.send(make_autopilot_version_request());
+                                            // try_send: this is the async
+                                            // receiver task, and the blocking
+                                            // form would park a runtime worker
+                                            // behind the serial writer. A
+                                            // dropped version request costs a
+                                            // diagnostic field, not the link.
+                                            let _ = mav_io_recv
+                                                .try_send(make_autopilot_version_request());
                                         }
 
                                         // Update flight mode from custom_mode
@@ -1656,11 +1724,31 @@ async fn main() {
                         let qgc_socket_send = qgc_socket_reconnect.clone();
                         sender_handle = Some(tokio::spawn(async move {
                             info!("MAVLink sender task started");
+                            // Outbound frames dropped because the serial writer
+                            // was behind, reported on a divider so a stalled
+                            // port says so about once a second rather than 400
+                            // times.
+                            let mut outbound_drops: u64 = 0;
 
                             // Bridge crossbeam → tokio mpsc so we can use select!
                             let (sim_tx, mut sim_rx) =
                                 tokio::sync::mpsc::channel::<MavMessage>(128);
-                            let bridge_shutdown = shutdown_send.clone();
+                            // A shutdown flag of this bridge's own, not the
+                            // process-wide one.
+                            //
+                            // Teardown used `bridge_handle.abort()`, and `abort`
+                            // cannot cancel a `spawn_blocking` task that has
+                            // already started — and on the reconnect path that
+                            // line is never reached at all, because the parent
+                            // sender task is aborted first and this is the last
+                            // statement of its body. The bridge only stopped
+                            // because the parent's abort dropped `sim_rx` and
+                            // the next `blocking_send` failed, which meant it
+                            // first stole a message from the shared crossbeam
+                            // receiver that the replacement bridge should have
+                            // had. Correct by accident; now correct on purpose.
+                            let bridge_shutdown = Arc::new(AtomicBool::new(false));
+                            let bridge_stop = Arc::clone(&bridge_shutdown);
                             let bridge_rx = sim_mav_rx_send.clone();
                             let bridge_handle = tokio::task::spawn_blocking(move || {
                                 while !bridge_shutdown.load(Ordering::Relaxed) {
@@ -1728,19 +1816,42 @@ async fn main() {
                                     }
                                 };
 
-                                if mav_io_send.send(first_msg).is_err() {
-                                    break;
+                                // try_send throughout: this task is on the tokio
+                                // runtime, and the blocking form waits for the
+                                // serial writer, whose own write timeout is two
+                                // seconds. A stalled port would take a runtime
+                                // worker with it for that long, which is how
+                                // WebSocket handshakes were starved before.
+                                match mav_io_send.try_send(first_msg) {
+                                    Ok(()) => {}
+                                    Err(TrySendError::Disconnected) => break,
+                                    Err(TrySendError::Full) => {
+                                        outbound_drops += 1;
+                                        if outbound_drops % 400 == 1 {
+                                            warn!(
+                                                drops = outbound_drops,
+                                                "serial writer is behind — dropping outbound MAVLink"
+                                            );
+                                        }
+                                    }
                                 }
 
                                 // Drain all remaining buffered sim messages without blocking
                                 while let Ok(msg) = sim_rx.try_recv() {
-                                    if mav_io_send.send(msg).is_err() {
-                                        break;
+                                    match mav_io_send.try_send(msg) {
+                                        Ok(()) => {}
+                                        Err(TrySendError::Disconnected) => break,
+                                        Err(TrySendError::Full) => {
+                                            outbound_drops += 1;
+                                        }
                                     }
                                 }
                             }
 
-                            bridge_handle.abort();
+                            // Ask it to stop, then wait for it to notice. The
+                            // loop polls its flag every 5 ms.
+                            bridge_stop.store(true, Ordering::Relaxed);
+                            let _ = bridge_handle.await;
                             info!("MAVLink sender task exiting");
                         }));
                     }

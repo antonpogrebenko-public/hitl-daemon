@@ -1,5 +1,7 @@
 //! Tokio-based async reader/writer with channels
 
+use tokio::sync::mpsc as tokio_mpsc;
+use tokio::sync::mpsc::{Receiver as TokioReceiver, Sender as TokioSender};
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
 use mavlink::{ardupilotmega::MavMessage, MavHeader};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -23,6 +25,10 @@ const MAX_PARSE_BUFFER_SIZE: usize = 8192;
 const MAVLINK_V2_STX: u8 = 0xFD;
 
 /// Timeout for serial write operations
+/// How long the writer waits for outbound MAVLink before re-checking the NSH
+/// queue. Only bounds NSH's responsiveness; MAVLink itself is awaited.
+const NSH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long to wait for a serial `open()` before abandoning the port.
@@ -52,6 +58,15 @@ pub struct SerialConnectionState {
     pub retry_count: u8,
     /// Serial port path (empty if not connected)
     pub port: String,
+}
+
+/// Why a [`MavlinkIo::try_send`] failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrySendError {
+    /// The writer is behind, and the message was dropped.
+    Full,
+    /// The writer is gone; the link is finished.
+    Disconnected,
 }
 
 #[derive(Debug, Error)]
@@ -97,7 +112,14 @@ pub struct NshResponseData {
 /// Async MAVLink I/O handler
 pub struct MavlinkIo {
     /// Channel for sending messages to the flight controller
-    tx: Sender<MavMessage>,
+    /// Outbound queue to the serial writer.
+    ///
+    /// A tokio channel, not a crossbeam one, so the writer can `await` a
+    /// message instead of polling. Every producer is on the runtime, and the
+    /// writer's previous shape was `try_recv` plus a 1 ms sleep — which is 1 ms
+    /// of added latency on a link whose control period is 2.5 ms, and a
+    /// thousand pointless wakeups a second when idle.
+    tx: TokioSender<MavMessage>,
     /// Channel for receiving messages from the flight controller
     rx: Receiver<(MavHeader, MavMessage)>,
     /// Channel for sending NSH commands (raw bytes via SERIAL_CONTROL)
@@ -124,11 +146,13 @@ impl MavlinkIo {
     pub fn new() -> (
         Self,
         Sender<(MavHeader, MavMessage)>,
-        Receiver<MavMessage>,
+        // The outbound queue is a tokio receiver now, so the writer can await
+        // it rather than poll.
+        TokioReceiver<MavMessage>,
         Sender<NshResponseData>,
         Receiver<NshRequest>,
     ) {
-        let (tx_to_fc, rx_from_app) = bounded::<MavMessage>(CHANNEL_BUFFER_SIZE);
+        let (tx_to_fc, rx_from_app) = tokio_mpsc::channel::<MavMessage>(CHANNEL_BUFFER_SIZE);
         let (tx_to_app, rx_from_fc) = bounded::<(MavHeader, MavMessage)>(CHANNEL_BUFFER_SIZE);
         let (nsh_tx, nsh_rx_from_app) = bounded::<NshRequest>(32);
         let (nsh_tx_to_app, nsh_rx) = bounded::<NshResponseData>(64);
@@ -179,7 +203,7 @@ impl MavlinkIo {
         port: &str,
         baud_rate: u32,
         tx_to_app: Sender<(MavHeader, MavMessage)>,
-        rx_from_app: Receiver<MavMessage>,
+        rx_from_app: TokioReceiver<MavMessage>,
         nsh_tx_to_app: Sender<NshResponseData>,
         nsh_rx_from_app: Receiver<NshRequest>,
     ) -> Result<(), AsyncIoError> {
@@ -254,9 +278,32 @@ impl MavlinkIo {
         Ok(())
     }
 
-    /// Send a message to the flight controller
+        /// Send a message to the flight controller, blocking if the queue is full.
+    ///
+    /// Only safe from a thread that may block. From an async task use
+    /// [`try_send`](Self::try_send): this parks the calling worker until the
+    /// writer drains, and the writer's own `WRITE_TIMEOUT` is two seconds, so a
+    /// stalled serial port takes a runtime thread with it.
     pub fn send(&self, message: MavMessage) -> Result<(), AsyncIoError> {
-        self.tx.send(message).map_err(|_| AsyncIoError::ChannelSend)
+        self.tx
+            .blocking_send(message)
+            .map_err(|_| AsyncIoError::ChannelSend)
+    }
+
+    /// Send without blocking; report whether the queue had room.
+    ///
+    /// A full queue means the writer is not keeping up, and the honest
+    /// response is to drop the message and say so. Blocking instead moves the
+    /// backlog into the runtime, where it stops unrelated tasks — the comment
+    /// on the reader task above records starved workers causing WebSocket
+    /// handshake timeouts on real hardware, which is the same failure reached
+    /// by a different path.
+    pub fn try_send(&self, message: MavMessage) -> Result<(), TrySendError> {
+        match self.tx.try_send(message) {
+            Ok(()) => Ok(()),
+            Err(tokio_mpsc::error::TrySendError::Full(_)) => Err(TrySendError::Full),
+            Err(tokio_mpsc::error::TrySendError::Closed(_)) => Err(TrySendError::Disconnected),
+        }
     }
 
     /// Try to receive a message from the flight controller (non-blocking)
@@ -405,12 +452,15 @@ impl MavlinkIo {
 
     async fn writer_task(
         mut writer: tokio::io::WriteHalf<SerialStream>,
-        rx: Receiver<MavMessage>,
+        mut rx: TokioReceiver<MavMessage>,
         nsh_rx: Receiver<NshRequest>,
         shutdown: Arc<AtomicBool>,
     ) {
         info!("Writer task started");
         let mut sequence: u8 = 0;
+        // One buffer for the life of the writer task; see the note at the
+        // message-write site below.
+        let mut buf: Vec<u8> = Vec::with_capacity(300);
         let mut last_heartbeat = tokio::time::Instant::now();
         let heartbeat_interval = std::time::Duration::from_secs(1);
 
@@ -475,7 +525,7 @@ impl MavlinkIo {
                         };
                         sequence = sequence.wrapping_add(1);
 
-                        let mut buf = Vec::new();
+                        buf.clear();
                         if let Err(e) = mavlink::write_v2_msg(&mut buf, header, &message) {
                             error!(error = %e, "Failed to serialize SERIAL_CONTROL message");
                             continue;
@@ -505,9 +555,21 @@ impl MavlinkIo {
                 }
             }
 
-            // Check for regular MAVLink messages
-            match rx.try_recv() {
-                Ok(message) => {
+            // Wait for the next outbound MAVLink message rather than polling
+            // for it.
+            //
+            // This was `try_recv` followed by a 1 ms sleep when empty, which at
+            // the arrival rate meant the queue was usually empty on inspection
+            // and the message that arrived a moment later waited out the sleep.
+            // That is up to 1 ms of added latency on a link whose control
+            // period is 2.5 ms, plus a thousand wakeups a second doing nothing.
+            //
+            // The timeout is only so the NSH branch above still gets serviced;
+            // NSH is an interactive shell, so a 5 ms polling interval there is
+            // imperceptible, while MAVLink is now delivered the moment it is
+            // queued.
+            match tokio::time::timeout(NSH_POLL_INTERVAL, rx.recv()).await {
+                Ok(Some(message)) => {
                     let header = MavHeader {
                         system_id: SYSTEM_ID,
                         component_id: COMPONENT_ID,
@@ -515,7 +577,12 @@ impl MavlinkIo {
                     };
                     sequence = sequence.wrapping_add(1);
 
-                    let mut buf = Vec::new();
+                    // Reused across messages rather than allocated per frame.
+                    // HIL_SENSOR alone is 400 a second, and a fresh zero-capacity
+                    // Vec reallocates several times on its way to a ~76-byte
+                    // frame — about 1,600 allocations a second on the daemon's
+                    // busiest path, for a buffer whose size never changes.
+                    buf.clear();
                     if let Err(e) = mavlink::write_v2_msg(&mut buf, header, &message) {
                         error!(error = %e, "Failed to serialize MAVLink message");
                         continue;
@@ -533,13 +600,13 @@ impl MavlinkIo {
                         }
                     }
                 }
-                Err(TryRecvError::Empty) => {
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                }
-                Err(TryRecvError::Disconnected) => {
+                Ok(None) => {
                     warn!("Send channel disconnected");
                     break;
                 }
+                // Nothing outbound within the interval — loop round so the NSH
+                // branch is checked again.
+                Err(_) => {}
             }
         }
 

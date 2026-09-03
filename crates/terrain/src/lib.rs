@@ -10,6 +10,7 @@
 //! Because the WebSocket is therefore a data ingress, every tile is validated
 //! at the boundary — see [`TerrainCache::insert_tiles`].
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::RwLock as SyncRwLock;
 use std::collections::HashMap;
 use tracing::{debug, warn};
@@ -147,6 +148,31 @@ fn tile_to_lon_lat(x: u32, y: u32, z: u32) -> (f64, f64) {
 pub struct TerrainCache {
     inner: SyncRwLock<TerrainCacheInner>,
     max_resident: usize,
+    /// Vehicle position in NED metres from the origin, for eviction ordering.
+    ///
+    /// Outside the lock deliberately. The 400 Hz loop writes this on every
+    /// tick, and taking the *exclusive* lock to do so put 400 writer
+    /// acquisitions a second in front of tile ingress — parking_lot queues
+    /// readers behind a waiting writer, so the loop's own sampler could be made
+    /// to wait for a write it had just requested itself.
+    ///
+    /// It orders eviction and derives which tiles to ask for. Neither needs to
+    /// be consistent with the tile map at an instant: a position one tick stale
+    /// picks the same tiles, because a tile spans hundreds of metres and the
+    /// vehicle moves centimetres per tick.
+    vehicle_north: AtomicU64,
+    vehicle_east: AtomicU64,
+}
+
+/// `f64` through `AtomicU64` — the pair is read and written independently, and
+/// a torn read between them is a position that never existed but is still
+/// within a tick's travel of one that did.
+fn store_f64(cell: &AtomicU64, value: f64) {
+    cell.store(value.to_bits(), Ordering::Relaxed);
+}
+
+fn load_f64(cell: &AtomicU64) -> f64 {
+    f64::from_bits(cell.load(Ordering::Relaxed))
 }
 
 struct TerrainCacheInner {
@@ -159,8 +185,6 @@ struct TerrainCacheInner {
     origin_lon: f64,
     origin_elevation: Option<f64>,
     has_origin: bool,
-    /// Vehicle position in NED metres from the origin, for eviction ordering.
-    vehicle_ned: (f64, f64),
 }
 
 impl TerrainCache {
@@ -177,9 +201,10 @@ impl TerrainCache {
                 origin_lon: 0.0,
                 origin_elevation: None,
                 has_origin: false,
-                vehicle_ned: (0.0, 0.0),
             }),
             max_resident: max_resident.max(1),
+            vehicle_north: AtomicU64::new(0.0f64.to_bits()),
+            vehicle_east: AtomicU64::new(0.0f64.to_bits()),
         }
     }
 
@@ -206,7 +231,8 @@ impl TerrainCache {
         inner.origin_lon = lon;
         inner.origin_elevation = elevation_msl;
         inner.has_origin = true;
-        inner.vehicle_ned = (0.0, 0.0);
+        store_f64(&self.vehicle_north, 0.0);
+        store_f64(&self.vehicle_east, 0.0);
     }
 
     /// Report where the vehicle is, in NED metres from the origin.
@@ -214,7 +240,8 @@ impl TerrainCache {
     /// Used only to order eviction, so the tile under the vehicle is the last
     /// thing dropped.
     pub fn set_vehicle_ned(&self, north: f64, east: f64) {
-        self.inner.write().vehicle_ned = (north, east);
+        store_f64(&self.vehicle_north, north);
+        store_f64(&self.vehicle_east, east);
     }
 
     /// Accept decoded elevation tiles.
@@ -288,7 +315,12 @@ impl TerrainCache {
             report.accepted += 1;
         }
 
-        report.evicted = evict_to_bound(&mut inner, self.max_resident);
+        report.evicted = evict_to_bound(
+            &mut inner,
+            self.max_resident,
+            load_f64(&self.vehicle_north),
+            load_f64(&self.vehicle_east),
+        );
 
         if report.accepted > 0 {
             debug!(
@@ -323,7 +355,7 @@ impl TerrainCache {
         if !inner.has_origin {
             return Vec::new();
         }
-        let (north, east) = inner.vehicle_ned;
+        let (north, east) = (load_f64(&self.vehicle_north), load_f64(&self.vehicle_east));
         let (lat, lon) = ned_to_lat_lon(north, east, inner.origin_lat, inner.origin_lon);
         let centre = TileCoord::from_lon_lat(lon, lat, z);
 
@@ -537,12 +569,19 @@ fn validate_tile(
 /// Drop the tiles furthest from the vehicle until the resident bound holds.
 /// The tile under the vehicle is by construction the nearest, so it is never
 /// the one dropped.
-fn evict_to_bound(inner: &mut TerrainCacheInner, max_resident: usize) -> usize {
+fn evict_to_bound(
+    inner: &mut TerrainCacheInner,
+    max_resident: usize,
+    // Passed in rather than read from `inner`: the vehicle position lives
+    // outside the lock now, so that the 400 Hz loop does not have to take the
+    // exclusive lock to update it.
+    north: f64,
+    east: f64,
+) -> usize {
     if inner.tiles.len() <= max_resident {
         return 0;
     }
     let Some(z) = inner.zoom else { return 0 };
-    let (north, east) = inner.vehicle_ned;
     let (lat, lon) = ned_to_lat_lon(north, east, inner.origin_lat, inner.origin_lon);
     let centre = TileCoord::from_lon_lat(lon, lat, z);
 

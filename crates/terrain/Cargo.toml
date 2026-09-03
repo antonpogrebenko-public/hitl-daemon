@@ -6,3 +6,11 @@ edition = "2021"
 [dependencies]
 parking_lot = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+# default-features = false drops criterion's plotting and rayon stack.
+criterion = { version = "0.5", default-features = false }
+
+[[bench]]
+name = "sampling"
+harness = false

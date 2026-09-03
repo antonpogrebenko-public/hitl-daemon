@@ -5,6 +5,57 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.0]
+
+### Changed
+
+- **Sensor sampling costs half what it did.** Picks up `hitl-sensors` 0.3.0.
+  Measured against a same-session control arm: one second of simulated sampling
+  at 400 Hz went from 223.79 us to 109.29 us, and a single IMU sample from
+  401.45 ns to 206.42 ns. Box-Muller was generating two normal variates per call
+  and discarding one, and `GaussMarkov` recomputed `alpha` and `noise_sigma`
+  from a `dt` that does not change between ticks.
+
+  The draw *order* changes as a result, so a seeded run no longer reproduces the
+  previous sequence value-for-value. The distributions are unchanged.
+
+- **Thin LTO on the release profile.** Disassembling the shipped binary showed
+  `GaussMarkov::step` called out of line six times per IMU sample, and
+  `max_motor_speed_from_voltage` likewise — the default `lto = false` with 16
+  codegen units gave the optimiser nothing to inline across the crate boundary.
+
+- **The simulation loop sleeps to a deadline instead of for a duration.**
+  `sleep_until(next_tick)` rather than `sleep(remaining)`, so scheduling jitter
+  on one tick no longer pushes the next one late.
+
+  Spin accuracy was left at the default deliberately. The review claimed
+  `spin_sleep` burned about 5 % of a core; measured, daemon total CPU is 1.4 %,
+  a same-session A/B of 125 us against 60 us was identical, and the proposed
+  tuning made `max_latency` worse — 95 us to 160 us. Reverted; only the deadline
+  change was kept.
+
+- **Phase timings are accumulated in nanoseconds.** They were in microseconds,
+  which truncated the physics phase to 0 — a single RK4 step is 264 ns.
+
+- **The outbound MAVLink writer awaits a channel** instead of polling with a
+  1 ms sleep, and reuses one write buffer. A fourth blocking-send site was
+  fixed at the same time. The inbound half is unchanged and still polls; moving
+  it requires receiver ownership out of the shared `MavlinkIo` handle, which was
+  left rather than attempted blind.
+
+- **The terrain surface normal is only sampled when the vehicle is in ground
+  contact.** It was sampled every tick and used on a small fraction of them.
+
+### Fixed
+
+- **`read_available` in the NSH client could not terminate.** It looped while
+  `in_waiting > 0` with a 10 ms sleep inside the loop; at 57600 baud roughly 58
+  bytes arrive during each sleep, so against a streaming port the condition
+  never became false and the buffer grew at ~5.8 KB/s until the process was
+  killed. It is the first thing every invocation does through `wake_console`,
+  and `nsh/CLAUDE.md` documents the streaming-port state it hits. Now bounded by
+  a deadline and a byte cap.
+
 ## [0.22.1]
 
 ### Fixed

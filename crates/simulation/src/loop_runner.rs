@@ -137,6 +137,56 @@ const BARO_FLAGS: HilSensorUpdatedFlags = HilSensorUpdatedFlags::HIL_SENSOR_UPDA
     .union(HilSensorUpdatedFlags::HIL_SENSOR_UPDATED_TEMPERATURE);
 
 /// Main simulation loop
+/// Per-phase tick timings, accumulated over the stats window.
+///
+/// The loop reported one aggregate latency, and an aggregate cannot say
+/// which phase spent it: a terrain sampler taking eight lock acquisitions
+/// and six coordinate resolutions per tick is invisible inside a total that
+/// is otherwise healthy. Each phase is accumulated separately and reported
+/// beside the total.
+///
+/// Nanoseconds, not microseconds. A whole RK4 step measures 264 ns on the
+/// development host, so a microsecond accumulator would truncate every
+/// physics tick to zero and report the phase as free.
+#[derive(Default, Clone, Copy)]
+struct PhaseAccumulator {
+    actuator_ns: u64,
+    terrain_ns: u64,
+    physics_ns: u64,
+    sensors_ns: u64,
+}
+
+impl PhaseAccumulator {
+    /// Mean nanoseconds per tick for each phase over the window.
+    fn per_tick(&self, ticks: u64) -> (u64, u64, u64, u64) {
+        let ticks = ticks.max(1);
+        (
+            self.actuator_ns / ticks,
+            self.terrain_ns / ticks,
+            self.physics_ns / ticks,
+            self.sensors_ns / ticks,
+        )
+    }
+
+    /// The phase that consumed most of the window, so an overrun report can
+    /// name something more useful than the total.
+    fn dominant(&self) -> &'static str {
+        let mut name = "actuator";
+        let mut best = self.actuator_ns;
+        for (candidate, value) in [
+            ("terrain", self.terrain_ns),
+            ("physics", self.physics_ns),
+            ("sensors", self.sensors_ns),
+        ] {
+            if value > best {
+                best = value;
+                name = candidate;
+            }
+        }
+        name
+    }
+}
+
 pub struct SimulationLoop {
     state: SimulationState,
     config: SimulationConfig,
@@ -150,6 +200,11 @@ pub struct SimulationLoop {
     /// Watch channel used by the TUI / web status widget to render live
     /// loop + drone state. `None` when nothing subscribes (tests, benches).
     stats_tx: Option<watch::Sender<SimulationStats>>,
+    /// Nanoseconds the last tick spent sampling terrain. Written by
+    /// `step_physics`, which is the only place that touches the terrain
+    /// cache, and read straight back out by the loop so the terrain cost is
+    /// reported apart from the integration it sits inside.
+    tick_terrain_ns: u64,
     /// Total ticks executed since startup — used to identify the first
     /// tick for sensor-value logging, not surfaced in `SimulationStats`
     /// because the cumulative HIL counts already convey progress.
@@ -215,6 +270,7 @@ impl SimulationLoop {
             config_rx,
             mav_tx,
             stats: SimulationStats::default(),
+            tick_terrain_ns: 0,
             stats_tx: None,
             total_ticks: 0,
             build_configured: false,
@@ -263,6 +319,7 @@ impl SimulationLoop {
         let mut window_ticks: u64 = 0;
         let mut window_latency_us: u64 = 0;
         let mut window_max_latency_us: u64 = 0;
+        let mut window_phases = PhaseAccumulator::default();
 
         // Last time we pushed a snapshot to `stats_tx`.
         let mut last_stats_publish = Instant::now();
@@ -270,6 +327,22 @@ impl SimulationLoop {
         // Absolute scheduling: advance next_tick by one period each iteration so overruns
         // don't accumulate (a single 8s spike won't cause 8s of catch-up busy-looping).
         let mut next_tick = Instant::now();
+
+        // `sleep_until`, not `sleep(next_tick - now)`.
+        //
+        // The free function recomputes its deadline from `Instant::now()`
+        // *inside* the call, so whatever time passed between reading `now` and
+        // entering it was added back on top of the interval. An absolute
+        // deadline cannot drift that way.
+        //
+        // The sleeper keeps its default spin accuracy. Tightening it to 60 µs
+        // was tried and reverted: the review costed the default's busy-spin at
+        // 5% of a core (125 µs x 400 Hz), but the daemon's *entire* CPU usage
+        // measures 1.4% of a core, and a same-session A/B of the two
+        // accuracies came back at 1.4% either way. There is no 5% to reclaim
+        // on this platform, and the tighter setting moved `max_latency_us`
+        // from about 95 µs to 160 µs — worse jitter for nothing.
+        let sleeper = spin_sleep::SpinSleeper::default();
 
         while self.state.is_running() {
             let tick_start = Instant::now();
@@ -297,14 +370,35 @@ impl SimulationLoop {
                 Err(TryRecvError::Disconnected) => break,
             }
 
+            // Phase boundaries. Three extra `Instant::now()` calls per tick,
+            // about 75 ns against a 2500 us budget — the price of being able
+            // to say which phase moved when one does.
+            let phase_start = Instant::now();
+
             // Process any pending actuator commands (non-blocking)
             self.process_actuator_commands();
+            let after_actuator = Instant::now();
 
-            // Step physics
+            // Step physics. Records its terrain sampling into
+            // `self.tick_terrain_ns` so that cost is reported separately from
+            // the integration it is nested inside.
+            self.tick_terrain_ns = 0;
             self.step_physics(dt);
+            let after_physics = Instant::now();
 
             // Sample sensors and send HIL messages
             self.sample_and_send_sensors(dt);
+            let after_sensors = Instant::now();
+
+            let terrain_ns = self.tick_terrain_ns;
+            window_phases.actuator_ns += (after_actuator - phase_start).as_nanos() as u64;
+            window_phases.terrain_ns += terrain_ns;
+            // Terrain is measured inside the physics span, so remove it rather
+            // than counting it twice. Saturating because the two readings come
+            // from separate clock samples and can disagree by a few ns.
+            window_phases.physics_ns += ((after_physics - after_actuator).as_nanos() as u64)
+                .saturating_sub(terrain_ns);
+            window_phases.sensors_ns += (after_sensors - after_physics).as_nanos() as u64;
 
             self.total_ticks += 1;
             window_ticks += 1;
@@ -324,6 +418,8 @@ impl SimulationLoop {
 
                 // Keep the formatted log line as `debug!` for users who tail
                 // logs at debug level. The TUI gets the same data via watch.
+                let (actuator_ns, terrain_ns, physics_ns, sensors_ns) =
+                    window_phases.per_tick(window_ticks);
                 debug!(
                     tick_rate_hz = self.stats.tick_rate_hz,
                     avg_latency_us = self.stats.avg_latency_us,
@@ -331,6 +427,13 @@ impl SimulationLoop {
                     hil_sensor = self.stats.hil_sensor_count,
                     hil_gps = self.stats.hil_gps_count,
                     actuators = self.stats.actuator_count,
+                    // Mean nanoseconds per tick, by phase. These sum to the
+                    // work portion of avg_latency_us; the remainder is the
+                    // config poll and the loop's own bookkeeping.
+                    actuator_ns,
+                    terrain_ns,
+                    physics_ns,
+                    sensors_ns,
                     "sim window stats"
                 );
 
@@ -338,6 +441,7 @@ impl SimulationLoop {
                 window_ticks = 0;
                 window_latency_us = 0;
                 window_max_latency_us = 0;
+                window_phases = PhaseAccumulator::default();
             }
 
             // Publish a live snapshot to the TUI / status subscribers.
@@ -350,13 +454,17 @@ impl SimulationLoop {
             next_tick += tick_duration;
             let now = Instant::now();
             if next_tick > now {
-                spin_sleep::sleep(next_tick - now);
+                sleeper.sleep_until(next_tick);
             } else {
                 // We're behind; reset deadline to now to avoid a burst of catch-up ticks.
                 next_tick = now;
                 trace!(
                     latency_us,
                     target_us = tick_duration.as_micros(),
+                    // Which phase is spending the window. An overrun report
+                    // that only gives a total cannot be acted on.
+                    dominant_phase = window_phases.dominant(),
+                    tick_terrain_ns = terrain_ns,
                     "Tick overrun — deadline reset"
                 );
             }
@@ -427,6 +535,12 @@ impl SimulationLoop {
         // debug-assert, permanently killing the simulation thread.
         let terrain = self.config.terrain.as_ref().filter(|t| t.is_loaded());
 
+        // Everything from here to the end of the ground-normal lookup is the
+        // terrain phase, timed and reported apart from the integration it sits
+        // inside. It takes one exclusive lock and seven shared ones per tick,
+        // and resolves the vehicle's coordinate to a tile six separate times.
+        let terrain_start = Instant::now();
+
         // Tell the cache where the vehicle is. It orders eviction by distance
         // from this point — so the tile underfoot is the last thing dropped —
         // and derives which tiles to ask the browser for.
@@ -444,14 +558,20 @@ impl SimulationLoop {
             None => Some(0.0),
         };
 
-        // Surface orientation under the drone. `None` (no terrain configured,
-        // or outside coverage) means level ground, matching `ground_z`.
-        let ground_normal: Option<[f32; 3]> = match terrain {
-            Some(terrain) => terrain
-                .sample_ground_normal_ned(state.quadrotor.position[0], state.quadrotor.position[1])
-                .or(Some(LEVEL_NORMAL_NED)),
-            None => Some(LEVEL_NORMAL_NED),
-        };
+        // The surface normal is NOT sampled here.
+        //
+        // It is read in exactly one place — the ground-contact branch below —
+        // and only when the vehicle is touching the ground, which is most of a
+        // flight's duration spent not being true. Sampling it costs five height
+        // lookups behind five more lock acquisitions: measured at 617 ns of the
+        // terrain phase's 753 ns, so four fifths of that phase was computed and
+        // discarded while airborne.
+        //
+        // It cannot simply be guarded by the contact test up here, because that
+        // test uses the position *after* this tick's integration and this point
+        // is before it. So it moves to where it is used.
+
+        self.tick_terrain_ns = terrain_start.elapsed().as_nanos() as u64;
 
         if ground_z.is_none()
             && self.last_terrain_miss_warning.elapsed() >= TERRAIN_MISS_WARN_INTERVAL
@@ -553,7 +673,18 @@ impl SimulationLoop {
             state.quadrotor.position[2] = ground_z;
 
             let gravity = self.config.physics.gravity;
-            let normal = ground_normal.unwrap_or(LEVEL_NORMAL_NED);
+            // Sampled here rather than every tick — see the note above.
+            let normal_start = Instant::now();
+            let normal = match terrain {
+                Some(terrain) => terrain
+                    .sample_ground_normal_ned(
+                        state.quadrotor.position[0],
+                        state.quadrotor.position[1],
+                    )
+                    .unwrap_or(LEVEL_NORMAL_NED),
+                None => LEVEL_NORMAL_NED,
+            };
+            self.tick_terrain_ns += normal_start.elapsed().as_nanos() as u64;
             // Decided up-front because the impact impulse must agree with it:
             // the accelerometer may not claim the drone stopped horizontally if
             // the contact model is about to let it slide.

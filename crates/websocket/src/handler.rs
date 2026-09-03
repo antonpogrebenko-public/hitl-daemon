@@ -274,7 +274,19 @@ impl ConnectionHandler {
                     })
                     .collect();
 
-                let report = cache.insert_tiles(tile_size, tiles);
+                // Off the runtime thread.
+                //
+                // Validation walks every sample of every tile — up to 4.19M
+                // `f32` at the 16 MiB frame cap, and around 590k for a typical
+                // nine-tile answer — and frames arrive as often as every 500 ms
+                // per connected client during a traverse. The 400 Hz loop has
+                // its own OS thread so this never stalled the simulation, but
+                // it is the largest single block of CPU on the tokio runtime,
+                // where it delays every other connection's work.
+                let cache = Arc::clone(cache);
+                let report = tokio::task::spawn_blocking(move || cache.insert_tiles(tile_size, tiles))
+                    .await
+                    .map_err(|e| format!("terrain ingest task failed: {e}"))?;
                 debug!(
                     client_id,
                     accepted = report.accepted,

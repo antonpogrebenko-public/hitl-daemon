@@ -1,6 +1,6 @@
 [package]
 name = "hitl-daemon"
-version = "0.22.1"
+version = "0.23.0"
 edition = "2021"
 description = "Hardware-in-the-loop simulator daemon for UAV testing"
 license = "MIT"
@@ -52,3 +52,14 @@ tower-http = { version = "0.5", features = ["cors"] }
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_json = "1.0"
+
+[profile.release]
+# Thin LTO so the small hot functions in hitl-physics and hitl-sensors can
+# inline across the crate boundary. Disassembling the shipped binary showed
+# `GaussMarkov::step` called out of line six times per IMU sample and
+# `max_motor_speed_from_voltage` likewise — the default `lto = false` with 16
+# codegen units is what kept them separate.
+#
+# Bit-identical for floating point: Rust enables neither FP contraction nor
+# fast-math, so LTO cannot change an f64 result.
+lto = "thin"
