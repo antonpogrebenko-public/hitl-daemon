@@ -1,7 +1,5 @@
 //! Tokio-based async reader/writer with channels
 
-use tokio::sync::mpsc as tokio_mpsc;
-use tokio::sync::mpsc::{Receiver as TokioReceiver, Sender as TokioSender};
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
 use mavlink::{ardupilotmega::MavMessage, MavHeader};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -9,6 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc as tokio_mpsc;
+use tokio::sync::mpsc::{Receiver as TokioReceiver, Sender as TokioSender};
 use tokio::task::JoinHandle;
 use tokio_serial::{SerialPortBuilderExt, SerialStream};
 use tracing::{debug, error, info, warn};
@@ -278,7 +278,7 @@ impl MavlinkIo {
         Ok(())
     }
 
-        /// Send a message to the flight controller, blocking if the queue is full.
+    /// Send a message to the flight controller, blocking if the queue is full.
     ///
     /// Only safe from a thread that may block. From an async task use
     /// [`try_send`](Self::try_send): this parks the calling worker until the
@@ -384,11 +384,18 @@ impl MavlinkIo {
                         Self::drain_to_next_frame(&mut parse_buffer, false);
                     }
 
-                    // Try to parse complete messages from the buffer
+                    // Try to parse complete messages from the buffer.
+                    //
+                    // `parsed` advances through the chunk instead of each message
+                    // draining the front of the buffer. `drain(..consumed)` moves
+                    // every remaining byte down by the size of the message just
+                    // taken, so a chunk carrying k messages memmoved the tail k
+                    // times; the single drain after this loop moves it once.
+                    let mut parsed = 0usize;
                     loop {
-                        match Self::try_parse_message(&parse_buffer) {
+                        match Self::try_parse_message(&parse_buffer[parsed..]) {
                             Some((header, message, consumed)) => {
-                                parse_buffer.drain(..consumed);
+                                parsed += consumed;
                                 packets_received.fetch_add(1, Ordering::Relaxed);
                                 parse_successes.fetch_add(1, Ordering::Relaxed);
 
@@ -425,6 +432,16 @@ impl MavlinkIo {
                                 }
                             }
                             None => {
+                                // Retire what parsed before dealing with the
+                                // remainder: `drain_to_next_frame` scans from the
+                                // front of the buffer, so it has to see a buffer
+                                // whose front is the unparsed bytes and not the
+                                // messages already handed to the application.
+                                if parsed > 0 {
+                                    parse_buffer.drain(..parsed);
+                                    parsed = 0;
+                                }
+
                                 // No valid frame found — if buffer has data but starts
                                 // with a non-STX byte, skip to the next potential frame.
                                 // skip_first=true because byte 0 is confirmed non-STX and
@@ -436,6 +453,14 @@ impl MavlinkIo {
                                 break;
                             }
                         }
+                    }
+
+                    // One memmove for the whole chunk. Reached only when the loop
+                    // broke on a partial frame with nothing to resynchronise, since
+                    // the `None` arm above retires `parsed` before it touches the
+                    // buffer and resets the counter.
+                    if parsed > 0 {
+                        parse_buffer.drain(..parsed);
                     }
                 }
                 Err(e) => {
@@ -742,5 +767,91 @@ mod tests {
         let (io, _tx_to_app, _rx_from_app, _nsh_tx_to_app, _nsh_rx_from_app) = MavlinkIo::new();
         assert!(io.reader_handle.is_none());
         assert!(io.writer_handle.is_none());
+    }
+
+    /// `n` concatenated v2 frames, as one serial read would deliver them.
+    fn frames(n: usize) -> Vec<u8> {
+        let mut sequence = 0u8;
+        let mut buf = Vec::new();
+        for _ in 0..n {
+            buf.extend_from_slice(&MavlinkIo::serialize_heartbeat(&mut sequence).unwrap());
+        }
+        buf
+    }
+
+    /// The reader's loop: parse at an advancing offset rather than draining
+    /// each message off the front.
+    fn parse_all(buffer: &[u8]) -> (usize, usize) {
+        let mut parsed = 0usize;
+        let mut count = 0usize;
+        while let Some((_, _, consumed)) = MavlinkIo::try_parse_message(&buffer[parsed..]) {
+            parsed += consumed;
+            count += 1;
+        }
+        (count, parsed)
+    }
+
+    #[test]
+    fn every_message_in_a_chunk_is_parsed() {
+        // The property the cursor rests on: parsing at an advancing offset must
+        // find the same messages that draining the front found, and consume the
+        // buffer exactly.
+        let buffer = frames(5);
+        let (count, parsed) = parse_all(&buffer);
+        assert_eq!(count, 5, "all five frames parse from one chunk");
+        assert_eq!(parsed, buffer.len(), "the chunk is consumed exactly");
+    }
+
+    #[test]
+    fn a_trailing_partial_frame_is_left_for_the_next_chunk() {
+        // The case that made the per-message drain look necessary. What must
+        // survive is the tail: the reader drains `parsed` and keeps the rest,
+        // so the next read appends to a partial frame rather than a mangled one.
+        let whole = frames(3);
+        let one = frames(1).len();
+        let truncated = &whole[..whole.len() - 4];
+
+        let (count, parsed) = parse_all(truncated);
+        assert_eq!(count, 2, "two complete frames, the third is short");
+        assert_eq!(parsed, one * 2, "only the complete frames are consumed");
+
+        // What the reader keeps, and what it must be.
+        let remainder = &truncated[parsed..];
+        assert_eq!(remainder.len(), one - 4);
+        assert_eq!(
+            remainder[0], MAVLINK_V2_STX,
+            "the tail still starts a frame"
+        );
+    }
+
+    #[test]
+    fn draining_once_leaves_what_draining_per_message_left() {
+        // Equivalence with the behaviour this replaced, asserted rather than
+        // assumed: the buffer after one drain of `parsed` is byte-identical to
+        // the buffer after draining each message as it was parsed.
+        let whole = frames(4);
+        let truncated = whole[..whole.len() - 6].to_vec();
+
+        let mut per_message = truncated.clone();
+        loop {
+            match MavlinkIo::try_parse_message(&per_message) {
+                Some((_, _, consumed)) => {
+                    per_message.drain(..consumed);
+                }
+                None => break,
+            }
+        }
+
+        let mut cursored = truncated.clone();
+        let (_, parsed) = parse_all(&cursored);
+        cursored.drain(..parsed);
+
+        assert_eq!(cursored, per_message);
+    }
+
+    #[test]
+    fn an_empty_or_short_buffer_parses_nothing() {
+        assert_eq!(parse_all(&[]).0, 0);
+        assert_eq!(parse_all(&[0xFD, 0x00, 0x00]).0, 0);
     }
 }

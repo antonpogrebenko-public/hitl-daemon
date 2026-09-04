@@ -5,6 +5,29 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.2]
+
+### Changed
+
+- **The serial reader memmoves a read chunk once instead of once per message.**
+  Each parsed message did `parse_buffer.drain(..consumed)`, which moves every
+  remaining byte down by the size of the message just taken -- so a chunk
+  carrying k messages moved its tail k times. The reader now parses at an
+  advancing offset and drains once per chunk.
+
+  Four tests cover the loop, which previously had none: every message in a chunk
+  parses, a trailing partial frame survives for the next read with its start byte
+  intact, and the buffer left behind is byte-identical to what per-message
+  draining left. A deliberate off-by-one in the cursor fails three of them.
+
+  **The other half of the original finding was not taken.** Reusing one
+  `PeekReader` across the messages in a chunk would depend on `read_v2_msg`
+  always leaving the reader's internal cursor level with its read-ahead top --
+  an invariant the crate documents nowhere, and getting it wrong desynchronises
+  the stream rather than failing loudly. The re-zeroed 280-byte buffer that
+  motivated it is allocated inside the mavlink crate's own `fetch`, not here, so
+  reusing the reader would not have removed it either.
+
 ## [0.23.1]
 
 ### Fixed
