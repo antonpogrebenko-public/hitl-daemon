@@ -1302,8 +1302,10 @@ impl TerrainNeed {
 /// Header of a `TerrainTiles` frame, describing the payloads that follow it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TerrainTilesHeader {
-    /// Origin these tiles are anchored to. A frame anchored to a stale origin
-    /// is dropped rather than mixed with the current one.
+    /// Origin these tiles are anchored to. A frame anchored to an origin the
+    /// daemon has since left is rejected rather than mixed with the current
+    /// one -- see `TerrainCache::is_anchored_to`, which the ingress consults
+    /// before inserting anything.
     pub origin: FlightLocation,
     /// Samples per tile edge. Checked against the payload length so a mismatch
     /// is caught at the boundary rather than read as garbage heights.

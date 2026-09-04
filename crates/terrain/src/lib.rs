@@ -10,9 +10,9 @@
 //! Because the WebSocket is therefore a data ingress, every tile is validated
 //! at the boundary — see [`TerrainCache::insert_tiles`].
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::RwLock as SyncRwLock;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, warn};
 
 /// Samples per tile edge. Part of the tile contract shared with the store, the
@@ -187,6 +187,15 @@ struct TerrainCacheInner {
     has_origin: bool,
 }
 
+/// How far two origins may differ and still count as the same one.
+///
+/// One definition, used twice: `set_origin` discards resident tiles when the
+/// origin moves further than this, and `is_anchored_to` rejects an ingress
+/// frame anchored further than this from the current origin. Two thresholds
+/// that disagreed would leave a band in which the cache clears its tiles and
+/// then accepts replacements anchored to the origin it just left.
+const SAME_ORIGIN_METERS: f64 = 1.0;
+
 impl TerrainCache {
     pub fn new() -> Self {
         Self::with_capacity(DEFAULT_MAX_RESIDENT_TILES)
@@ -215,8 +224,8 @@ impl TerrainCache {
     /// would compute contact against terrain anchored somewhere else.
     pub fn set_origin(&self, lat: f64, lon: f64, elevation_msl: Option<f64>) {
         let mut inner = self.inner.write();
-        let moved =
-            inner.has_origin && distance_m(inner.origin_lat, inner.origin_lon, lat, lon) > 1.0;
+        let moved = inner.has_origin
+            && distance_m(inner.origin_lat, inner.origin_lon, lat, lon) > SAME_ORIGIN_METERS;
         if moved {
             debug!(
                 from = ?(inner.origin_lat, inner.origin_lon),
@@ -233,6 +242,24 @@ impl TerrainCache {
         inner.has_origin = true;
         store_f64(&self.vehicle_north, 0.0);
         store_f64(&self.vehicle_east, 0.0);
+    }
+
+    /// Whether this cache is currently anchored to `lat`/`lon`.
+    ///
+    /// The ingress asks before accepting a frame. Tiles arrive with the origin
+    /// the sender believed was current, and a re-anchor clears the resident set
+    /// precisely because tiles describe ground relative to an origin -- so a
+    /// frame already in flight when the origin moved would otherwise refill the
+    /// cache with the tiles the re-anchor just discarded, and ground contact
+    /// would be computed against terrain anchored somewhere else.
+    ///
+    /// An unanchored cache answers `false`: it has no origin to agree with, and
+    /// accepting tiles before a datum exists would make `sample_ground_ned`
+    /// return heights against an origin chosen later.
+    pub fn is_anchored_to(&self, lat: f64, lon: f64) -> bool {
+        let inner = self.inner.read();
+        inner.has_origin
+            && distance_m(inner.origin_lat, inner.origin_lon, lat, lon) <= SAME_ORIGIN_METERS
     }
 
     /// Report where the vehicle is, in NED metres from the origin.
@@ -1224,6 +1251,74 @@ mod streaming_lifecycle_tests {
 
         c.set_origin(LAT + 0.000_001, LON, Some(1655.0));
         assert_eq!(c.resident_tiles(), before);
+    }
+
+    #[test]
+    fn an_unanchored_cache_agrees_with_no_origin() {
+        // Accepting tiles before a datum exists would have them sampled against
+        // an origin chosen afterwards.
+        // Not the `cache` helper, which anchors on construction.
+        let c = TerrainCache::with_capacity(64);
+        assert!(!c.is_anchored_to(LAT, LON));
+    }
+
+    #[test]
+    fn a_frame_anchored_to_a_superseded_origin_is_not_accepted() {
+        // The race the header has always documented: tiles are in flight when
+        // the origin moves, and the re-anchor that just cleared the resident
+        // set would otherwise be undone by the frame that follows it.
+        let c = cache(64);
+        c.set_origin(LAT, LON, Some(1655.0));
+        assert!(c.is_anchored_to(LAT, LON));
+
+        c.set_origin(51.5, -0.12, Some(35.0));
+
+        assert!(
+            !c.is_anchored_to(LAT, LON),
+            "a frame carrying the old origin must not be accepted after a re-anchor"
+        );
+        assert!(c.is_anchored_to(51.5, -0.12));
+    }
+
+    #[test]
+    fn origin_jitter_still_counts_as_the_same_origin() {
+        // The same tolerance `set_origin` uses to decide the tiles may stay.
+        // If these two disagreed there would be a band in which the cache keeps
+        // its tiles and then rejects the frames that refresh them, or clears
+        // them and accepts frames anchored to the origin it just left.
+        let c = cache(64);
+        c.set_origin(LAT, LON, Some(1655.0));
+        assert!(c.is_anchored_to(LAT + 0.000_001, LON));
+    }
+
+    #[test]
+    fn the_ingress_guard_and_the_tile_discard_share_one_threshold() {
+        // Asserted against behaviour rather than against the constant, so a
+        // second threshold introduced elsewhere fails here.
+        // Metres north to degrees of latitude: distance_m computes
+        // dn = dlat_rad * R_EARTH, so this is its exact inverse.
+        let just_outside = SAME_ORIGIN_METERS * 2.0;
+        let dlat = (just_outside / R_EARTH).to_degrees();
+
+        let c = cache(64);
+        let centre = TileCoord::from_lon_lat(LON, LAT, Z);
+        c.set_origin(LAT, LON, Some(1655.0));
+        c.insert_tiles(TILE_SIZE as u32, ring(centre, 1));
+        assert!(c.resident_tiles() > 0);
+
+        let moved_lat = LAT + dlat;
+        c.set_origin(moved_lat, LON, Some(1655.0));
+
+        // Tiles discarded, and the old origin now rejected: the two agree.
+        assert_eq!(
+            c.resident_tiles(),
+            0,
+            "a move past the threshold discards tiles"
+        );
+        assert!(
+            !c.is_anchored_to(LAT, LON),
+            "the same move must also reject frames carrying the old origin"
+        );
     }
 
     #[test]

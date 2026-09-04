@@ -253,6 +253,31 @@ impl ConnectionHandler {
                     return Err("Terrain ingress is not configured on this daemon".to_string());
                 };
 
+                // The guard `TerrainTilesHeader.origin` has always documented,
+                // and which until now nothing performed.
+                //
+                // A re-anchor clears the resident tiles, because they describe
+                // ground relative to an origin. A frame already in flight when
+                // that happened carries the origin the sender still believed was
+                // current, and accepting it refills the cache with exactly the
+                // tiles the re-anchor discarded -- after which ground contact is
+                // computed against terrain anchored somewhere else, which is the
+                // divergence between drawn and simulated ground this whole path
+                // exists to prevent.
+                //
+                // Rejected rather than dropped quietly: the browser owns the
+                // fetch and will re-send for the new origin, but a client that
+                // never learns its frames are being discarded would sit in a
+                // loop supplying terrain that is thrown away every time.
+                let origin = frame.header.origin;
+                if !cache.is_anchored_to(origin.lat, origin.lon) {
+                    return Err(format!(
+                        "Terrain frame anchored to {:.6},{:.6}, which is not the origin \
+                         this daemon is anchored to; re-send for the current origin",
+                        origin.lat, origin.lon
+                    ));
+                }
+
                 let tile_size = frame.header.tile_size;
                 let approximate = &frame.header.approximate;
                 let tiles: Vec<(terrain::TileCoord, Vec<f32>, bool)> = frame
@@ -284,9 +309,10 @@ impl ConnectionHandler {
                 // it is the largest single block of CPU on the tokio runtime,
                 // where it delays every other connection's work.
                 let cache = Arc::clone(cache);
-                let report = tokio::task::spawn_blocking(move || cache.insert_tiles(tile_size, tiles))
-                    .await
-                    .map_err(|e| format!("terrain ingest task failed: {e}"))?;
+                let report =
+                    tokio::task::spawn_blocking(move || cache.insert_tiles(tile_size, tiles))
+                        .await
+                        .map_err(|e| format!("terrain ingest task failed: {e}"))?;
                 debug!(
                     client_id,
                     accepted = report.accepted,

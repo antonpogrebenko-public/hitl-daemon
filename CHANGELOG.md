@@ -5,6 +5,38 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.1]
+
+### Fixed
+
+- **The terrain ingress now performs the staleness check its own protocol
+  documented.** `TerrainTilesHeader.origin` has always said "a frame anchored to
+  a stale origin is dropped rather than mixed with the current one", and nothing
+  read the field -- not `TerrainTiles::from_frame`, not the handler.
+
+  The race is real rather than theoretical. `TerrainCache::set_origin` discards
+  the resident tiles when the origin moves, precisely because tiles describe
+  ground relative to an origin. A frame already in flight when that happened
+  carries the origin the browser still believed was current, and accepting it
+  refilled the cache with the tiles the re-anchor had just thrown away -- after
+  which ground contact was computed against terrain anchored somewhere else,
+  which is the divergence between drawn and simulated ground this path exists to
+  prevent.
+
+  The check lives in `TerrainCache::is_anchored_to`, next to the discard it has
+  to agree with, and both now read one `SAME_ORIGIN_METERS`. Two thresholds that
+  disagreed would leave a band in which the cache clears its tiles and then
+  accepts replacements anchored to the origin it just left; a test asserts the
+  two behaviours agree rather than asserting the constant.
+
+  A stale frame is rejected with a message rather than dropped quietly. The
+  browser owns the fetch and will re-send for the new origin, but a client that
+  never learned its frames were being discarded would loop supplying terrain
+  that is thrown away every time.
+
+  An unanchored cache rejects everything: accepting tiles before a datum exists
+  would have them sampled against an origin chosen afterwards.
+
 ## [0.23.0]
 
 ### Changed
