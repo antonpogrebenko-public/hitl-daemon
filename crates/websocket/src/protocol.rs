@@ -1400,22 +1400,59 @@ impl TerrainTiles {
             )));
         }
 
-        let body = &data[header_end..];
         let expected = header
             .coords
             .len()
             .checked_mul(bytes_per_tile)
             .ok_or_else(|| invalid("TerrainTiles: payload size overflows".to_string()))?;
-        if body.len() != expected {
+
+        // Two payload placements are accepted: immediately after the header, and
+        // at the next 4-byte boundary after it.
+        //
+        // The sender writes f32 samples, and a browser can only use
+        // `Float32Array.prototype.set` -- one memcpy -- when the payload begins
+        // at a multiple of four. Unaligned, it must fall back to a
+        // `DataView.setFloat32` per sample, which is 589,824 calls for the nine
+        // tiles of a single push. Padding the header to the boundary is what
+        // lets the fast path exist.
+        //
+        // Accepting both is what makes that change deployable at all. A daemon
+        // is installed on someone's machine and updates on their schedule, so a
+        // browser that padded unconditionally would take terrain away from every
+        // daemon older than the change. This lands first, is released, and only
+        // then does the sender start padding.
+        //
+        // The two are told apart by length, not by a flag: padding is 0-3 bytes,
+        // so at most one placement can leave exactly `expected` bytes behind.
+        // When the header already ends on a boundary the two are the same offset
+        // and the first test takes it.
+        //
+        // The padding bytes themselves are not inspected. They carry nothing, and
+        // rejecting a frame over filler would be refusing a well-formed payload
+        // for the sake of bytes with no meaning.
+        let pad = (4 - (header_end % 4)) % 4;
+        let padded_start = header_end
+            .checked_add(pad)
+            .ok_or_else(|| invalid("TerrainTiles: padded offset overflows".to_string()))?;
+
+        let body_start = if data.len().saturating_sub(header_end) == expected {
+            header_end
+        } else if data.len().saturating_sub(padded_start) == expected {
+            padded_start
+        } else {
             return Err(invalid(format!(
-                "TerrainTiles: {} payload bytes for {} tiles of {}x{} (expected {})",
-                body.len(),
+                "TerrainTiles: {} payload bytes for {} tiles of {}x{} (expected {} at offset {} \
+                 unpadded, or {} padded to the 4-byte boundary)",
+                data.len().saturating_sub(header_end),
                 header.coords.len(),
                 tile_size,
                 tile_size,
-                expected
+                expected,
+                header_end,
+                padded_start
             )));
-        }
+        };
+        let body = &data[body_start..];
 
         let tiles = body
             .chunks_exact(bytes_per_tile)
@@ -2306,6 +2343,87 @@ mod terrain_transport_tests {
         // Heights survive bit-exact: these are the numbers the physics collides
         // against and the viewer draws, so any lossy step here is a divergence.
         assert_eq!(decoded.tiles[1][5], 105.0);
+    }
+
+    /// The padded form a browser sends once it can use `Float32Array.set`:
+    /// the payload starts at the next 4-byte boundary after the header.
+    fn to_bytes_padded(f: &TerrainTiles) -> Vec<u8> {
+        let header = serde_json::to_vec(&f.header).unwrap();
+        let mut buf = vec![MSG_TYPE_TERRAIN_TILES];
+        buf.extend_from_slice(&(header.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&header);
+        let pad = (4 - (buf.len() % 4)) % 4;
+        buf.extend(std::iter::repeat(0u8).take(pad));
+        for tile in &f.tiles {
+            for h in tile {
+                buf.extend_from_slice(&h.to_le_bytes());
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn a_padded_payload_decodes_to_the_same_tiles() {
+        // The change this exists to make deployable. A browser cannot use
+        // `Float32Array.set` unless the payload begins on a 4-byte boundary, and
+        // without it pays a `DataView.setFloat32` per sample -- 589,824 of them
+        // for one nine-tile push.
+        let original = frame(vec![coord(3401, 6202), coord(3402, 6202)]);
+        let decoded = TerrainTiles::from_bytes(&to_bytes_padded(&original)).expect("decodes");
+        assert_eq!(decoded.header, original.header);
+        assert_eq!(decoded.tiles, original.tiles);
+        assert_eq!(decoded.tiles[1][5], 105.0, "heights survive bit-exact");
+    }
+
+    #[test]
+    fn the_unpadded_form_still_decodes() {
+        // Consumer-first ordering: this daemon has to keep reading what every
+        // already-installed browser sends, or the release takes terrain away
+        // from anyone who has not updated both halves at once.
+        let original = frame(vec![coord(1, 2)]);
+        let bytes = original.to_bytes();
+        let pad = (4 - (bytes.len() - original.tiles.len() * T * T * 4) % 4) % 4;
+        assert_ne!(pad, 0, "fixture must exercise a header that needs padding");
+
+        let decoded = TerrainTiles::from_bytes(&bytes).expect("decodes");
+        assert_eq!(decoded.tiles, original.tiles);
+    }
+
+    #[test]
+    fn a_payload_of_the_wrong_size_is_still_rejected() {
+        // Accepting two placements must not become accepting any length: the
+        // padded branch is reachable only for 1-3 extra bytes.
+        let original = frame(vec![coord(1, 2)]);
+        let mut bytes = original.to_bytes();
+        bytes.extend_from_slice(&[0u8; 8]);
+        assert!(
+            TerrainTiles::from_bytes(&bytes).is_err(),
+            "eight trailing bytes is not padding"
+        );
+
+        let mut short = original.to_bytes();
+        short.truncate(short.len() - 4);
+        assert!(
+            TerrainTiles::from_bytes(&short).is_err(),
+            "a short payload is rejected"
+        );
+    }
+
+    #[test]
+    fn padding_bytes_are_not_inspected() {
+        // They carry nothing. Refusing a well-formed payload over filler would
+        // be rejecting the tiles for the sake of bytes with no meaning.
+        let original = frame(vec![coord(7, 8)]);
+        let mut bytes = to_bytes_padded(&original);
+        let header_len = u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as usize;
+        let header_end = 5 + header_len;
+        let pad = (4 - (header_end % 4)) % 4;
+        assert_ne!(pad, 0, "fixture must exercise real padding");
+        for i in 0..pad {
+            bytes[header_end + i] = 0xAB;
+        }
+        let decoded = TerrainTiles::from_bytes(&bytes).expect("decodes despite non-zero padding");
+        assert_eq!(decoded.tiles, original.tiles);
     }
 
     #[test]

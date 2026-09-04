@@ -5,6 +5,35 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.3]
+
+### Changed
+
+- **The terrain tile decoder accepts a payload padded to a 4-byte boundary, as
+  well as one packed immediately after the header.** This is the first half of a
+  two-sided change and does nothing on its own; the browser still sends the
+  unpadded form.
+
+  It exists so the browser can eventually use `Float32Array.prototype.set` --
+  one memcpy per tile -- where it currently writes `DataView.setFloat32` per
+  sample, 589,824 calls for the nine tiles of a single push. That fast path is
+  only available when the payload begins at a multiple of four, which the header
+  does not naturally guarantee.
+
+  It lands here first because a daemon is installed on someone's machine and
+  updates on their schedule. A browser that started padding unconditionally
+  would take terrain away from every daemon older than the change, so the reader
+  has to tolerate both forms before the writer picks one.
+
+  The forms are told apart by length rather than a flag: padding is 0-3 bytes,
+  so at most one placement leaves exactly the expected payload behind, and when
+  the header already ends on a boundary the two are the same offset. A wrong
+  size is still rejected -- eight trailing bytes is not padding. The padding
+  bytes are not inspected, since they carry nothing.
+
+  Four tests, including that the unpadded form still decodes and that disabling
+  the padded branch fails the padded one.
+
 ## [0.23.2]
 
 ### Changed
