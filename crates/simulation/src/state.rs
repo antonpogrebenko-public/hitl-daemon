@@ -70,7 +70,28 @@ pub struct SimulationStateInner {
     pub battery: BatteryState,
     /// Sensor suite
     pub sensors: Sensors,
-    /// Simulation time in microseconds
+    /// Simulation time in microseconds — the mirror of
+    /// [`crate::timebase::Timebase::sim_time_us`], written once per loop
+    /// iteration.
+    ///
+    /// Microseconds of WALL time since the loop epoch, NOT a count of physics
+    /// steps. It is monotone non-decreasing for the life of the session:
+    /// neither [`SimulationStateInner::reset`] nor
+    /// [`SimulationState::reconfigure`] rewinds it.
+    ///
+    /// | Consumer | Reads | Why |
+    /// |---|---|---|
+    /// | `HIL_SENSOR.time_usec` (`loop_runner::build_hil_sensor`) | this | Inert in PX4 on NuttX — `MavlinkReceiver::handle_message_hil_sensor` restamps with `hrt_absolute_time()` — but it must stay monotone and wall-referenced. |
+    /// | `HIL_GPS.time_usec` (`loop_runner::build_hil_gps`) | `integrated_us = sim − discarded` | Deliberate divergence. The ULog cross-check `(hrt elapsed) − (time_utc_usec elapsed)` then equals the daemon's discarded time exactly: 0 on a healthy run, the fault magnitude on a bad one. |
+    /// | `hitl-sensors` GPS rate limiter and delay buffer | this | Neither `last_update_time` nor `last_output_time` rewinds, so a backward jump silences GPS permanently and PX4 reports "ekf2 missing data". |
+    /// | Browser `StateUpdate.timestamp_us` (`src/main.rs`) | this | Session-monotone, so an RTL reset no longer rewinds the viewer's clock. |
+    /// | TUI `sim_time_s` | this | Reads as a stopwatch instead of understating elapsed time by the drift. |
+    ///
+    /// Monotonicity is load-bearing rather than tidy. Today's rewind was benign
+    /// only by accident: `reset()` rebuilds `Sensors::with_config`, and
+    /// `hitl-sensors/src/gps.rs` initialises both limiter fields to `-1000.0`,
+    /// so the limiter re-locks immediately against the larger time. A rewind
+    /// with *retained* sensor state would silence GPS for the session.
     pub sim_time_us: u64,
     /// Current motor commands (normalized 0-1)
     pub motor_commands: [f32; 4],
@@ -137,7 +158,11 @@ impl SimulationStateInner {
         self.quadrotor = QuadrotorState::default();
         self.battery = BatteryState::fully_charged(&config.battery);
         self.sensors = Sensors::with_config(config.sensors.clone());
-        self.sim_time_us = 0;
+        // `sim_time_us` is deliberately NOT cleared. It is the session's
+        // timebase, shared with the GPS rate limiter, PX4 and the browser, and
+        // it must be monotone for the life of the loop — see the field's own
+        // documentation. Zeroing it here also let a session that lost wall time
+        // hide that by changing the build.
         self.motor_commands = [0.0; 4];
         self.armed = false;
         self.flight_mode = 0;
@@ -338,6 +363,50 @@ mod tests {
         let live = sim_state.config();
         assert_eq!(live.battery.cell_count, 6);
         assert!((live.battery.capacity_mah - 2000.0).abs() < 0.1);
+    }
+
+    /// `reconfigure` must not rewind the simulation clock.
+    ///
+    /// `sim_time_us` is the timebase every downstream consumer shares: PX4
+    /// reads it as `HIL_SENSOR.time_usec`, `hitl-sensors`' GPS rate limiter
+    /// holds `last_update_time` / `last_output_time` in it, and the browser
+    /// stamps `StateUpdate.timestamp_us` from it. A rewind silences the GPS
+    /// limiter for the rest of the session — "ekf2 missing data" on the FC —
+    /// and it lets a session that lost 4.9 s of wall time hide the fact by
+    /// changing the build.
+    ///
+    /// Today's rewind is benign only by accident: `reset()` rebuilds
+    /// `Sensors::with_config`, and `hitl-sensors/src/gps.rs` initialises both
+    /// limiter fields to `-1000.0`, so the limiter re-locks against the larger
+    /// time. A rewind with *retained* sensor state would not recover.
+    #[test]
+    fn reconfigure_does_not_rewind_the_simulation_clock() {
+        let state = SimulationState::new(SimulationConfig::default());
+        // 63 s: the length of the 2026-09-05 session.
+        state.write().sim_time_us = 63_000_000;
+
+        state.reconfigure(SimulationConfig::default());
+
+        assert!(
+            state.sim_time_us() >= 63_000_000,
+            "the simulation clock must be monotone across a reconfigure; \
+             rewinding it to {} silences the GPS rate limiter and erases the \
+             session's pacing history",
+            state.sim_time_us()
+        );
+    }
+
+    /// The same clock, through the plain `reset()` the WebSocket RTL command
+    /// reaches (`src/main.rs`). Monotonicity is a property of the session, not
+    /// of one entry point.
+    #[test]
+    fn reset_does_not_rewind_the_simulation_clock() {
+        let state = SimulationState::new(SimulationConfig::default());
+        state.write().sim_time_us = 63_000_000;
+
+        state.reset();
+
+        assert!(state.sim_time_us() >= 63_000_000);
     }
 
     #[test]

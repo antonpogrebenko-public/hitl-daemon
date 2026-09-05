@@ -96,8 +96,10 @@ impl Default for DaemonStatus {
 /// Live snapshot of simulation state, published by the sim loop and read by
 /// the TUI header (and anything else that wants a low-rate metrics view).
 ///
-/// The window-based loop stats (`tick_rate_hz`, `*_latency_us`) are rolled
-/// up every 5 s; the rest update at the publish cadence (~2 Hz). Everything
+/// `tick_rate_hz` and the timebase group roll up every 1 s — the same window
+/// the health verdict is computed from, so the number and the verdict beside
+/// it can never disagree. `*_latency_us` still roll up every 5 s; the rest
+/// update at the publish cadence (~2 Hz). Everything
 /// here used to be logged at `info!` every 5 s — moving it to a watch
 /// channel keeps the log stream clean and lets the TUI show live values
 /// instead of waiting for the next print.
@@ -132,6 +134,163 @@ pub struct SimulationStats {
     pub build_configured: bool,
     pub mass_kg: f32,
     pub thrust_to_weight: f32,
+
+    // ── Timebase (added 0.3.0) ───────────────────────────────────────
+    //
+    // Every field here is `#[serde(default)]` so a snapshot produced before
+    // this group existed still deserialises. `TimebaseHealth` derives
+    // `Default` for the same reason: `SimulationStats` derives `Default`, and
+    // every construction site in the workspace relies on it.
+    //
+    // READ `steps_per_sec` AND `tick_rate_hz` TOGETHER to see whether the
+    // CLOCK is still correct while the loop is behind. During the 2026-09-05
+    // incident that pair reads 400 and 341, which excludes the physics and
+    // terrain code from the first line anyone looks at.
+    //
+    // That pair does NOT say compute-bound versus descheduled, and must not be
+    // read as if it did: sub-stepping pins the clock to the wall, so
+    // `steps_per_sec` sits at the target on any host that is not discarding
+    // time, and discarded time forces `Faulted` on its own. The pair that
+    // separates the two populations is `wake_late_avg_us` against
+    // `deadline_overrun_us` — lateness with no overrun means the host will not
+    // schedule the thread, overrun with no lateness means the iteration's own
+    // work does not fit in the period.
+    /// Wall time the simulation clock is behind, microseconds. Positive means
+    /// the clock is behind the wall.
+    ///
+    /// Computed directly as `wall − sim` at the end of each health window, not
+    /// accumulated from deadline resets: an accumulator is one window out of
+    /// phase with the fault it describes, and reported `drift_us=0` on the
+    /// window that lost the time.
+    #[serde(default)]
+    pub timebase_drift_us: i32,
+    /// Wall time the session could not simulate at all. Non-zero means the
+    /// session is compromised, not merely slow.
+    #[serde(default)]
+    pub timebase_discarded_ms: u32,
+    /// Intervals longer than PX4's `imu_max_dt` that the loop had to declare
+    /// lost rather than replay.
+    #[serde(default)]
+    pub timebase_gap_count: u32,
+    /// Largest single such interval.
+    #[serde(default)]
+    pub timebase_max_gap_ms: u32,
+    /// Physics sub-steps executed beyond one per loop iteration.
+    #[serde(default)]
+    pub catchup_steps: u64,
+    /// Physics sub-steps per second over the window. Compare against
+    /// `tick_rate_hz`.
+    #[serde(default)]
+    pub steps_per_sec: f32,
+    /// Mean time between a tick's scheduled deadline and the thread actually
+    /// waking, over the window.
+    ///
+    /// Fed ONLY by iterations that actually slept. An iteration whose own work
+    /// overran the deadline never slept, so its lateness is work time, not
+    /// wake latency; folding it in here would make a purely compute-bound loop
+    /// indistinguishable from a descheduled one. That population is reported
+    /// as `deadline_overrun_us` — NOT as `timebase_drift_us`, which is
+    /// `wall − sim` read off the clock and which wall-anchoring holds near
+    /// `−(step − work)` on a compute-bound host exactly as on a healthy one.
+    #[serde(default)]
+    pub wake_late_avg_us: u32,
+    /// Wall time the loop was already past its deadline by when it reached the
+    /// sleep, summed over the window.
+    ///
+    /// The other half of the diagnosis, and the half that used to be
+    /// unreadable: it was accumulated per iteration and never left the loop.
+    /// Non-zero here with `wake_late_avg_us` at zero means the iteration's own
+    /// work does not fit in the period; the reverse means the host will not
+    /// schedule the thread on time.
+    ///
+    /// Owed, not lost. The deadline is `epoch + sim_us` and nothing re-bases
+    /// it, so the interval is paid off as sub-steps on the following
+    /// iterations — which is why a large figure here can sit beside a drift of
+    /// almost zero.
+    #[serde(default)]
+    pub deadline_overrun_us: u32,
+    /// Worst such time across the whole session.
+    ///
+    /// Session-scoped, like `wake_late_p99_us` beside it: a window max sitting
+    /// under a session p99 reads as a broken metric.
+    #[serde(default)]
+    pub wake_late_max_us: u32,
+    /// 99th percentile of wake lateness across the whole session.
+    ///
+    /// A mean hides the tail that matters: on 2026-09-05 one late wake-up in
+    /// six was enough to poison the EKF, and the mean stayed unremarkable.
+    /// `--selftest-timebase` reports this figure, so it has to leave the loop.
+    #[serde(default)]
+    pub wake_late_p99_us: u32,
+    /// Latched on the first gap and never cleared for the life of the
+    /// session. A session that lost wall time must not be able to hide it by
+    /// reconfiguring the build.
+    #[serde(default)]
+    pub session_invalid: bool,
+    /// Verdict for the most recent health window.
+    #[serde(default)]
+    pub timebase_health: TimebaseHealth,
+    /// Worst verdict any health window produced this session.
+    ///
+    /// `timebase_health` describes the last second only, so a host that
+    /// stalled and recovered reports `Ok` at the end of a run that deleted
+    /// seconds of simulation. Anything grading a whole session — most
+    /// importantly `--selftest-timebase` — must read this instead.
+    #[serde(default)]
+    pub timebase_worst_health: TimebaseHealth,
+    /// The loop's fixed physics sub-step, microseconds. `1_000_000 /
+    /// --tick-rate`; 2500 at the 400 Hz default.
+    ///
+    /// Published because it is the unit every drift figure is quantised in:
+    /// a correctly paced loop rests at `drift ≈ −(step − work)`, so a reader
+    /// grading drift against a hardcoded 2500 marks a perfectly healthy
+    /// `--tick-rate 250` run (which rests near −3300 µs) as a caution for the
+    /// whole session. `0` means no health window has closed yet; grade against
+    /// the 400 Hz default in that case.
+    #[serde(default)]
+    pub timebase_step_us: u32,
+    /// Lowest realised fraction of the target iteration rate observed in any
+    /// health window this session.
+    ///
+    /// `0.0` means no window has closed yet, which is not the same as a stalled
+    /// loop; check `tick_rate_hz` before reading it.
+    #[serde(default)]
+    pub timebase_min_realised: f32,
+    /// What the host did with the request to schedule the simulation thread as
+    /// a periodic real-time task — `rtsched::Promotion::token()`, or
+    /// `"revoked"` once the kernel has taken a granted contract back.
+    ///
+    /// Empty means the field was never populated (an old snapshot, or a
+    /// construction site that does not run a loop). `"unavailable:..."` is a
+    /// NORMAL value, not a fault: on Linux, `SCHED_FIFO` needs `CAP_SYS_NICE`
+    /// and the shipped artefact is an unprivileged musl binary, so refusal is
+    /// the ordinary path there.
+    ///
+    /// `"revoked"` is the one value worth reacting to. macOS silently drops a
+    /// thread's time-constraint contract when it chronically overruns its
+    /// declared budget, and a real-time guarantee that quietly stopped
+    /// applying is this incident's exact shape a second time.
+    ///
+    /// This is EXPOSURE REDUCTION, not the timebase fix. `granted:...` here is
+    /// not evidence the loop is keeping cadence — `timebase_health` is.
+    #[serde(default)]
+    pub realtime_policy: String,
+}
+
+/// Timebase verdict for one observation window.
+///
+/// `#[repr(u8)]` so it can be carried in a single byte if a future wire
+/// format wants it; today it travels as JSON in `SimulationStats`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum TimebaseHealth {
+    /// Keeping cadence, nothing lost.
+    #[default]
+    Ok = 0,
+    /// Behind cadence but still simulating every microsecond of wall time.
+    Degraded = 1,
+    /// Either far behind cadence, or wall time has been lost outright.
+    Faulted = 2,
 }
 
 /// Actuator outputs from the flight controller
@@ -482,6 +641,73 @@ impl OutgoingMessage {
 mod tests {
     use super::*;
     use mavlink::ardupilotmega::MavModeFlag;
+
+    /// A `SimulationStats` snapshot as it was serialised before the timebase
+    /// group existed. Kept verbatim rather than generated, so the test still
+    /// describes the old shape after the struct moves on again.
+    const PRE_TIMEBASE_SNAPSHOT: &str = r#"{
+        "tick_rate_hz": 341.2,
+        "avg_latency_us": 95,
+        "max_latency_us": 160,
+        "hil_sensor_count": 21479,
+        "hil_gps_count": 537,
+        "actuator_count": 21470,
+        "sensor_drops": 0,
+        "sim_time_s": 53.6975,
+        "position_ned": [1.0, 2.0, -3.0],
+        "attitude_rpy_deg": [0.0, 0.0, 90.0],
+        "armed": true,
+        "flight_mode": 4,
+        "motor_rpms": [12000.0, 12010.0, 11990.0, 12005.0],
+        "battery_voltage": 15.2,
+        "battery_percent": 61.0,
+        "build_configured": true,
+        "mass_kg": 0.65,
+        "thrust_to_weight": 4.2
+    }"#;
+
+    #[test]
+    fn simulation_stats_deserialises_a_pre_0_3_0_snapshot_with_timebase_defaults() {
+        let stats: SimulationStats = serde_json::from_str(PRE_TIMEBASE_SNAPSHOT)
+            .expect("a snapshot from before the timebase group must still load");
+
+        // The old fields survive unchanged.
+        assert_eq!(stats.hil_sensor_count, 21_479);
+        assert!(stats.armed);
+
+        // The new ones default rather than failing the whole parse. Without
+        // this test the `#[serde(default)]` attributes are decoration that
+        // rots the first time someone reorders the struct.
+        assert_eq!(stats.timebase_drift_us, 0);
+        assert_eq!(stats.timebase_discarded_ms, 0);
+        assert_eq!(stats.timebase_gap_count, 0);
+        assert_eq!(stats.timebase_max_gap_ms, 0);
+        assert_eq!(stats.catchup_steps, 0);
+        assert_eq!(stats.steps_per_sec, 0.0);
+        assert_eq!(stats.wake_late_avg_us, 0);
+        assert_eq!(stats.wake_late_max_us, 0);
+        assert_eq!(stats.wake_late_p99_us, 0);
+        assert_eq!(
+            stats.timebase_step_us, 0,
+            "a snapshot from before the field existed states no step size, and \
+             a reader must treat 0 as 'unknown, assume the 400 Hz default' \
+             rather than as a zero-microsecond step"
+        );
+        assert!(!stats.session_invalid);
+        assert_eq!(
+            stats.realtime_policy, "",
+            "a snapshot from before the field existed states nothing about \
+             thread scheduling, and empty must read as 'not reported' rather \
+             than as a refusal"
+        );
+        assert_eq!(
+            stats.timebase_health,
+            TimebaseHealth::Ok,
+            "an old snapshot carries no verdict, and absence of a verdict is \
+             not a fault — defaulting it to anything else would paint every \
+             pre-upgrade reader red"
+        );
+    }
 
     #[test]
     fn test_default_actuator_outputs() {

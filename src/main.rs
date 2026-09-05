@@ -27,6 +27,7 @@ use websocket::{
 };
 
 mod terrain_pack;
+mod timebase_cli;
 mod tui;
 mod update;
 
@@ -61,8 +62,13 @@ struct Args {
     #[arg(long, default_value = "1655.0")]
     reference_alt: f64,
 
-    /// Simulation tick rate (Hz)
-    #[arg(long, default_value = "400")]
+    /// Simulation tick rate (Hz).
+    ///
+    /// Restricted to rates that divide 1000000 exactly (400, 250, 200, ...).
+    /// A rate that does not makes the loop's nanosecond sleep period and its
+    /// microsecond clock advance disagree, producing a permanent deficit that
+    /// looks exactly like a scheduling fault and is not one.
+    #[arg(long, default_value = "400", value_parser = timebase_cli::parse_tick_rate)]
     tick_rate: u32,
 
     /// GPS update rate (Hz)
@@ -95,6 +101,32 @@ struct Args {
     /// own. The previous version is kept alongside as `.previous`.
     #[arg(long)]
     update: bool,
+
+    /// Run the loop headless for this many seconds, print one line of JSON
+    /// describing how well this host paces it, and exit.
+    ///
+    /// No flight controller, no browser, no serial port: this implies
+    /// --sim-only. The JSON is the only thing on stdout; diagnostics go to
+    /// stderr, so it pipes into `jq`. Durations below 2 s are raised to 2, the
+    /// shortest run that can close a health window. Exits non-zero when the
+    /// session's worst window is anything but healthy, when the drift rate is
+    /// above threshold, or when the run measured nothing — hand this to anyone
+    /// reporting a simulation problem before looking at anything else.
+    #[arg(long, value_name = "SECS")]
+    selftest_timebase: Option<u64>,
+
+    /// Do not ask the host to schedule the simulation thread as a real-time
+    /// task.
+    ///
+    /// The promotion is exposure reduction, not the timebase fix, and it is not
+    /// proven to have any bearing on the 2026-09-05 incident: the arithmetic
+    /// there says late wake-ups, and a thread's scheduling class is fixed when
+    /// it is set, so it cannot produce a step change partway through a session.
+    /// This flag exists so that claim can be A/B tested with
+    /// `--selftest-timebase`, and as an escape hatch for anyone whose other
+    /// threads get starved by it.
+    #[arg(long)]
+    no_realtime: bool,
 }
 
 enum TracingMode {
@@ -104,7 +136,17 @@ enum TracingMode {
     Plain,
 }
 
-fn init_tracing(log_file: Option<&str>, tui_mode: bool) -> (Option<WorkerGuard>, TracingMode) {
+/// `diagnostics_to_stderr` moves the human-readable log off stdout.
+///
+/// `--selftest-timebase` documents its output as one machine-readable line;
+/// with the log layer on its default stdout writer, every INFO line — startup,
+/// config, first-tick sensor values, the post-mortem — was interleaved with
+/// the JSON and `hitl-daemon --selftest-timebase 5 | jq` failed.
+fn init_tracing(
+    log_file: Option<&str>,
+    tui_mode: bool,
+    diagnostics_to_stderr: bool,
+) -> (Option<WorkerGuard>, TracingMode) {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     if tui_mode {
@@ -135,7 +177,12 @@ fn init_tracing(log_file: Option<&str>, tui_mode: bool) -> (Option<WorkerGuard>,
             (None, TracingMode::Tui { log_rx })
         }
     } else {
-        let stdout_layer = tracing_subscriber::fmt::layer();
+        let writer = if diagnostics_to_stderr {
+            tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr)
+        } else {
+            tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stdout)
+        };
+        let stdout_layer = tracing_subscriber::fmt::layer().with_writer(writer);
         if let Some(path) = log_file {
             let file = std::fs::OpenOptions::new()
                 .create(true)
@@ -244,6 +291,7 @@ fn detect_or_use_port(specified_port: Option<String>) -> Option<String> {
 }
 
 /// Spawn the simulation loop in a dedicated thread
+#[allow(clippy::too_many_arguments)]
 fn spawn_simulation_thread(
     config: SimulationConfig,
     actuator_rx: Receiver<ActuatorOutputs>,
@@ -256,7 +304,9 @@ fn spawn_simulation_thread(
     )>,
     sim_stats_tx: tokio::sync::watch::Sender<protocol::SimulationStats>,
     origin: Arc<SharedOrigin>,
+    realtime: bool,
 ) -> (thread::JoinHandle<()>, SimulationState) {
+    let tick_rate_hz = config.tick_rate_hz;
     let mut sim_loop = SimulationLoop::new(config, actuator_rx, config_rx, mav_tx, origin)
         .with_stats_publisher(sim_stats_tx);
     let state = sim_loop.state_handle();
@@ -264,7 +314,16 @@ fn spawn_simulation_thread(
     let handle = thread::Builder::new()
         .name("simulation".to_string())
         .spawn(move || {
+            // FIRST statement in the closure, before anything else runs on this
+            // thread. Every mechanism `rtsched` uses is SELF-DIRECTED: the
+            // spawner cannot set a scheduling class on a thread it spawned, so
+            // this cannot be hoisted out to the call site no matter how much
+            // tidier that would read.
+            let promotion = timebase_cli::promote_sim_thread(tick_rate_hz, realtime);
+            sim_loop.set_realtime(&promotion);
+
             sim_loop.run();
+            rtsched::revert_current_thread();
             info!("Simulation thread exiting");
         })
         .expect("Failed to spawn simulation thread");
@@ -281,9 +340,13 @@ fn spawn_sim_only_actuator_thread(
     actuator_tx: Sender<ActuatorOutputs>,
     shutdown: Arc<AtomicBool>,
     sim_state: simulation::SimulationState,
+    tick_rate_hz: u32,
 ) -> thread::JoinHandle<()> {
-    // Ticks at 400 Hz (2500 µs each). 3 seconds = 1200 ticks.
-    const AUTO_RECHARGE_TICKS: u64 = 1200;
+    // Derived from the declared rate, not hardcoded at 400 Hz. This generator
+    // used to sleep 2500 us and stamp 2500 us per frame whatever `--tick-rate`
+    // said, so `--sim-only --tick-rate 200` fed the loop twice the frames it
+    // could consume, on timestamps advancing at twice its clock.
+    let cadence = timebase_cli::sim_only_cadence(tick_rate_hz);
 
     thread::Builder::new()
         .name("sim-actuator".to_string())
@@ -299,8 +362,8 @@ fn spawn_sim_only_actuator_thread(
                     // Track how long we have been depleted
                     let depleted_tick = *depleted_since.get_or_insert(tick);
 
-                    // Auto-recharge after AUTO_RECHARGE_TICKS ticks (~3 s)
-                    if tick - depleted_tick >= AUTO_RECHARGE_TICKS {
+                    // Auto-recharge after 3 s of wall time at the declared rate.
+                    if tick - depleted_tick >= cadence.auto_recharge_ticks {
                         info!(
                             "sim-only: battery depleted — auto-recharging for continued simulation"
                         );
@@ -310,7 +373,7 @@ fn spawn_sim_only_actuator_thread(
 
                     // Send zeroed, disarmed actuator while depleted
                     let actuator = ActuatorOutputs {
-                        timestamp_us: tick * 2500,
+                        timestamp_us: tick * cadence.step_us,
                         motors: [0.0; 4],
                         mode: protocol::FlightMode::Disarmed,
                         controls: [0.0; 16],
@@ -324,7 +387,7 @@ fn spawn_sim_only_actuator_thread(
 
                     // Generate hover throttle (~50%)
                     let actuator = ActuatorOutputs {
-                        timestamp_us: tick * 2500,
+                        timestamp_us: tick * cadence.step_us,
                         motors: [0.5, 0.5, 0.5, 0.5],
                         mode: protocol::FlightMode::HilArmed,
                         controls: [0.0; 16],
@@ -335,7 +398,7 @@ fn spawn_sim_only_actuator_thread(
                 }
 
                 tick += 1;
-                thread::sleep(Duration::from_micros(2500));
+                thread::sleep(cadence.step);
             }
 
             info!("Simulation-only actuator thread exiting");
@@ -412,14 +475,29 @@ async fn main() {
             }
         }
     }
-    let is_tty = atty::is(atty::Stream::Stdout);
-    let (_log_guard, tracing_mode) = init_tracing(args.log_file.as_deref(), is_tty);
+    // The selftest prints one machine-readable line to stdout, so it never
+    // takes over the terminal — its whole purpose is to be piped or pasted —
+    // and every diagnostic goes to stderr for the duration so stdout carries
+    // nothing but that line.
+    let selftest = args.selftest_timebase.is_some();
+    let is_tty = atty::is(atty::Stream::Stdout) && !selftest;
+    let (_log_guard, tracing_mode) = init_tracing(args.log_file.as_deref(), is_tty, selftest);
+
+    // One epoch for the whole process, so every timestamp the browser is sent
+    // shares a zero.
+    let daemon_start = std::time::Instant::now();
 
     info!(version = VERSION, "Starting HITL Daemon");
 
-    // Determine operating mode
-    // sim_only_mode is ONLY true when --sim-only flag is explicitly passed
-    let sim_only_mode = args.sim_only;
+    // Determine operating mode.
+    //
+    // `--selftest-timebase` implies sim-only. Without that, `detect_or_use_port`
+    // runs BEFORE the selftest branch and `detect_flight_controller` opens each
+    // candidate serial port for a 1.5 s heartbeat probe — so the one command
+    // handed to a user with a board plugged in would grab that board, flatly
+    // contradicting the flag's own documentation ("No flight controller, no
+    // browser, no serial port").
+    let sim_only_mode = args.sim_only || selftest;
     let initial_port = if sim_only_mode {
         info!("Running in simulation-only mode (no FC connection)");
         None
@@ -523,6 +601,19 @@ async fn main() {
         "HITL Daemon configuration"
     );
 
+    // Fitness check. Runs the real loop against the real config and nothing
+    // else, then exits — no serial port opened, no WebSocket bound, no FC
+    // touched.
+    if let Some(secs) = args.selftest_timebase {
+        let code = timebase_cli::run_selftest(sim_config, secs, !args.no_realtime).await;
+        // `std::process::exit` runs no destructors, so the non-blocking log
+        // appender's guard has to be dropped by hand or a `--log-file` run
+        // discards its buffered lines — including the post-mortem, which is
+        // the best forensic artefact the daemon produces.
+        drop(_log_guard);
+        std::process::exit(code);
+    }
+
     // Create channels
     // actuator_tx/rx: MAVLink receiver -> Simulation (HIL_ACTUATOR_CONTROLS)
     // sim_mav_tx/rx: Simulation -> MAVLink sender (HIL_SENSOR, HIL_GPS)
@@ -554,6 +645,17 @@ async fn main() {
     // Moves the per-window `info!` log out of the scrolling log area and
     // into the TUI header so the log stream stays readable.
     let (sim_stats_tx, sim_stats_rx) = watch::channel(protocol::SimulationStats::default());
+
+    // Taken before the sender is handed to the simulation thread. The
+    // annunciator that reads it is spawned further down, once the vehicle
+    // message channel exists.
+    let timebase_stats_rx = sim_stats_tx.subscribe();
+
+    // And again for the preflight arming gate, which reads the same published
+    // health. A second receiver rather than a shared one: `watch` receivers are
+    // independent and neither consumer should be able to affect the other's
+    // view.
+    let preflight_stats_rx = sim_stats_tx.subscribe();
 
     // Spawn TUI thread if in TUI mode
     let tui_handle = match tracing_mode {
@@ -599,6 +701,7 @@ async fn main() {
         build_config_rx,
         sim_stats_tx,
         flight_origin.clone(),
+        !args.no_realtime,
     );
 
     // Thread handles to join later
@@ -642,7 +745,43 @@ async fn main() {
             actuator_tx.clone(),
             shutdown.clone(),
             sim_state.clone(),
+            args.tick_rate,
         );
+        thread_handles.push(handle);
+
+        // Drain the outbound MAVLink channel, exactly as `--selftest-timebase`
+        // does (`timebase_cli::run_selftest`).
+        //
+        // Nothing else consumes `sim_mav_rx` in this mode — the only consumer
+        // is inside the `!sim_only_mode` reconnect task — so the bounded(512)
+        // channel fills in about 1.3 s and stays full for the rest of the run.
+        //
+        // That used to switch the timebase fix OFF here: a full channel made
+        // `channel_pressure()` report `High` forever, which clamped the
+        // catch-up allowance to one step. Measured over 75 s under load, an
+        // undrained `--sim-only` reported 17 ms of wall time discarded against
+        // ~0.1 ms with the channel draining, plus a CRITICAL "the flight
+        // controller is being fed more motion than was simulated" banner in a
+        // mode that has no flight controller. Backpressure no longer suppresses
+        // catch-up at all — the clamp and `channel_pressure()` are gone, see
+        // `Timebase::decide` — so this drain no longer decides whether the
+        // pacing is correct.
+        //
+        // It is kept because a permanently full outbound channel is a
+        // misleading thing to leave standing in a diagnostic mode: it silences
+        // the `HIL sensor channel full for >2s — FC likely disconnected` error
+        // that sim-only emitted every two seconds, and keeps `sensor_drops` and
+        // `channel_full_secs` — which the gap and fault lines print — reading
+        // as they would with a flight controller attached.
+        let drain_rx = sim_mav_rx.clone();
+        let handle = thread::Builder::new()
+            .name("sim-only-drain".to_string())
+            .spawn(move || {
+                // Ends when the simulation thread drops the sender, which is
+                // the only sender in this mode.
+                while drain_rx.recv().is_ok() {}
+            })
+            .expect("Failed to spawn sim-only MAVLink drain thread");
         thread_handles.push(handle);
     }
 
@@ -654,6 +793,14 @@ async fn main() {
 
     // Broadcast channel for vehicle messages (STATUSTEXT from PX4)
     let (vehicle_msg_tx, _) = tokio::sync::broadcast::channel::<VehicleMessage>(64);
+
+    // Put timebase faults in front of the person flying, through the overlay
+    // the browser already renders. No wire-format change, no web-side work.
+    let timebase_annunciator_handle = timebase_cli::spawn_timebase_annunciator(
+        timebase_stats_rx,
+        vehicle_msg_tx.clone(),
+        daemon_start,
+    );
 
     // Broadcast channel for terrain origin (GPS_GLOBAL_ORIGIN / HOME_POSITION / GLOBAL_POSITION_INT)
     let (terrain_origin_tx, _) = tokio::sync::broadcast::channel::<websocket::TerrainOrigin>(4);
@@ -699,13 +846,18 @@ async fn main() {
     let board_identity: Arc<tokio::sync::RwLock<Option<websocket::BoardIdentity>>> =
         Arc::new(tokio::sync::RwLock::new(None));
 
-    let preflight_handler = std::sync::Arc::new(websocket::PreflightHandler::with_identity(
-        build_config_mav_tx.clone(),
-        build_config_param_value_tx.clone(),
-        nsh_tx_for_config.clone(),
-        sim_state.clone(),
-        board_identity.clone(),
-    ));
+    let preflight_handler = std::sync::Arc::new(
+        websocket::PreflightHandler::with_identity(
+            build_config_mav_tx.clone(),
+            build_config_param_value_tx.clone(),
+            nsh_tx_for_config.clone(),
+            sim_state.clone(),
+            board_identity.clone(),
+        )
+        // Blocks the NEXT arming while the timebase is faulted. Never touches a
+        // flight in progress — see `timebase_arming_gate`.
+        .with_timebase_stats(preflight_stats_rx),
+    );
     let build_config_handler = std::sync::Arc::new(websocket::BuildConfigHandler::new(
         build_config_tx,
         nsh_tx_for_config,
@@ -1416,7 +1568,16 @@ async fn main() {
                         let port_path_recv = port_path.clone();
                         let sim_state_recv = sim_state_reconnect.clone();
                         let bootloader_suspected_recv = bootloader_suspected.clone();
+                        // Connection-scoped: the heartbeat timeout below is
+                        // measured from THIS connection's start.
                         let start_time = std::time::Instant::now();
+                        // Process-scoped, for `VehicleMessage.timestamp_ms`,
+                        // which is documented as milliseconds since daemon
+                        // start. Stamping it from the connection put two
+                        // epochs on one channel, so a daemon fault at t=600 s
+                        // sorted "before" a STATUSTEXT from an FC that
+                        // reconnected five seconds ago.
+                        let vehicle_msg_epoch = daemon_start;
                         receiver_handle = Some(tokio::spawn(async move {
                             // Dropped actuator frames, reported on a divider so a
                             // stalled simulation says so once a second rather than
@@ -1519,7 +1680,7 @@ async fn main() {
                                         if !text.is_empty() {
                                             let severity = status.severity as u8;
                                             let timestamp_ms =
-                                                start_time.elapsed().as_millis() as u32;
+                                                vehicle_msg_epoch.elapsed().as_millis() as u32;
                                             debug!(severity = severity, text = %text, "STATUSTEXT received");
                                             let _ = vehicle_msg_tx_recv.send(VehicleMessage {
                                                 severity,
@@ -1909,6 +2070,7 @@ async fn main() {
     drop(mav_io);
 
     // Cancel async tasks
+    timebase_annunciator_handle.abort();
     ws_handle.abort();
     ws_cmd_handle.abort();
     ws_state_handle.abort();

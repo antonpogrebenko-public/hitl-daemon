@@ -35,6 +35,28 @@ const BLOCKED_NSH_COMMANDS: &[&str] =
 const MIN_TAKEOFF_ALTITUDE: f32 = 1.0;
 const MAX_TAKEOFF_ALTITUDE: f32 = 100.0;
 
+/// Commands that START a flight, and are therefore subject to the timebase
+/// arming gate.
+///
+/// Deliberately narrow. `Land`, `Rtl`, `Disarm` and `EmergencyStop` are how a
+/// flight ENDS, and gating any of them would mean refusing to bring an aircraft
+/// down because the simulation is unwell — the exact opposite of what the gate
+/// is for. `SetMode` and `Recharge` start nothing.
+///
+/// `Takeoff` is included because PX4 arms as part of executing it, so gating
+/// `Arm` alone would leave the whole thing bypassable by one button.
+fn begins_a_flight(command_type: CommandType) -> bool {
+    match command_type {
+        CommandType::Arm | CommandType::Takeoff => true,
+        CommandType::Disarm
+        | CommandType::Land
+        | CommandType::Rtl
+        | CommandType::SetMode
+        | CommandType::EmergencyStop
+        | CommandType::Recharge => false,
+    }
+}
+
 /// Validated command ready for execution
 #[derive(Debug, Clone)]
 pub struct ValidatedCommand {
@@ -602,6 +624,38 @@ impl ConnectionHandler {
             });
         }
 
+        // Refuse a NEW arming while the simulation timebase is faulted.
+        //
+        // Never touches a flight in progress: `arming_refusal` returns `None`
+        // outright while a flight is in progress — ARMED AND AIRBORNE per PX4's
+        // own `MAV_LANDED_STATE`. An armed vehicle sitting on the ground is
+        // exactly the state a `Takeoff` would start a flight from, and IS
+        // refused; short-circuiting on the armed flag alone would have let one
+        // start on a faulted timebase. Cutting a HITL session off mid-flight
+        // latches PX4's 300 ms mag/baro and 500 ms accel/gyro voters on a real
+        // board this daemon left in HITL mode with its calibration zeroed, and
+        // the recovery path needs the session the interruption would have
+        // ended.
+        if begins_a_flight(cmd.command_type) {
+            if let Some(refusal) = self
+                .preflight
+                .as_ref()
+                .and_then(|preflight| preflight.arming_refusal())
+            {
+                warn!(
+                    client_id,
+                    command_id = cmd.command_id,
+                    ?cmd.command_type,
+                    "{refusal}"
+                );
+                return OutgoingMessage::CommandAck(CommandAck {
+                    command_id: cmd.command_id,
+                    success: false,
+                    error: Some(refusal),
+                });
+            }
+        }
+
         // Forward to simulation
         let validated = ValidatedCommand {
             command: cmd.clone(),
@@ -802,6 +856,263 @@ mod tests {
             set_mode_value: None,
         };
         assert!(handler.validate_command(&cmd).is_err());
+    }
+
+    /// Build a handler whose preflight gate sees the given timebase health.
+    async fn handler_with_timebase(
+        stats: ::protocol::SimulationStats,
+        armed: bool,
+    ) -> (ConnectionHandler, mpsc::Receiver<ValidatedCommand>) {
+        // MAV_LANDED_STATE_UNDEFINED. Every existing caller predates the
+        // landed-state distinction and wants the old behaviour, which is what
+        // UNDEFINED falls back to.
+        handler_with_timebase_and_landed_state(stats, armed, 0).await
+    }
+
+    async fn handler_with_timebase_and_landed_state(
+        stats: ::protocol::SimulationStats,
+        armed: bool,
+        landed_state: u8,
+    ) -> (ConnectionHandler, mpsc::Receiver<ValidatedCommand>) {
+        let (mut handler, cmd_rx) = create_test_handler().await;
+        let (stats_tx, stats_rx) = tokio::sync::watch::channel(stats);
+        // A watch receiver keeps returning the last published value after its
+        // sender is gone, which is exactly the fixed snapshot these tests want.
+        drop(stats_tx);
+
+        let sim_state = simulation::SimulationState::new(simulation::SimulationConfig::default());
+        sim_state.set_armed(armed);
+        sim_state.set_landed_state(landed_state);
+
+        handler.set_preflight_handler(Arc::new(
+            PreflightHandler::new(None, None, None, sim_state).with_timebase_stats(stats_rx),
+        ));
+        (handler, cmd_rx)
+    }
+
+    fn faulted_stats() -> ::protocol::SimulationStats {
+        ::protocol::SimulationStats {
+            tick_rate_hz: 341.2,
+            timebase_step_us: 2500,
+            timebase_worst_health: ::protocol::TimebaseHealth::Faulted,
+            session_invalid: true,
+            timebase_discarded_ms: 4900,
+            timebase_gap_count: 3,
+            ..Default::default()
+        }
+    }
+
+    fn arm_command() -> Command {
+        Command {
+            command_id: 7,
+            command_type: CommandType::Arm,
+            takeoff_altitude: None,
+            set_mode_value: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_faulted_timebase_refuses_a_new_arming() {
+        let (handler, mut cmd_rx) = handler_with_timebase(faulted_stats(), false).await;
+        let client_id = handler.allocate_client_id().await;
+
+        let response = handler.handle_command(client_id, arm_command()).await;
+        match response {
+            OutgoingMessage::CommandAck(ack) => {
+                assert!(!ack.success, "a faulted timebase must not arm");
+                let error = ack.error.expect("a refusal must say why");
+                assert!(
+                    error.contains("--selftest-timebase"),
+                    "the refusal must be actionable: {error}"
+                );
+            }
+            other => panic!("expected a CommandAck, got {other:?}"),
+        }
+
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "a refused arming must not also reach the simulation"
+        );
+    }
+
+    /// THE test that matters. Cutting HIL_SENSOR to an armed board latches
+    /// PX4's 300 ms mag/baro and 500 ms accel/gyro voters, on a board this
+    /// daemon left in HITL mode with its calibration zeroed.
+    #[tokio::test]
+    async fn a_faulted_timebase_never_interrupts_an_armed_session() {
+        let (handler, mut cmd_rx) = handler_with_timebase(faulted_stats(), true).await;
+        let client_id = handler.allocate_client_id().await;
+
+        // Every command an aircraft in the air might need, including the ones
+        // that bring it down.
+        for command_type in [
+            CommandType::Land,
+            CommandType::Rtl,
+            CommandType::Disarm,
+            CommandType::EmergencyStop,
+            CommandType::Arm,
+        ] {
+            let response = handler
+                .handle_command(
+                    client_id,
+                    Command {
+                        command_id: 1,
+                        command_type,
+                        takeoff_altitude: None,
+                        set_mode_value: None,
+                    },
+                )
+                .await;
+            match response {
+                OutgoingMessage::CommandAck(ack) => assert!(
+                    ack.success,
+                    "{command_type} was refused during an armed session: {:?}. The gate blocks \
+                     the NEXT arming; it must never take control away from a flight in progress",
+                    ack.error
+                ),
+                other => panic!("expected a CommandAck, got {other:?}"),
+            }
+            assert!(
+                cmd_rx.try_recv().is_ok(),
+                "{command_type} must reach the simulation during an armed session"
+            );
+        }
+    }
+
+    /// The hole `begins_a_flight(Takeoff)` was supposed to close and did not.
+    ///
+    /// `Takeoff` is only ever sent to a vehicle that is armed, or that arms as
+    /// part of executing it. While the gate short-circuited on `already_armed`,
+    /// an armed vehicle sitting on the ground with a faulted timebase would
+    /// accept `Takeoff` and start a flight — so listing `Takeoff` in
+    /// `begins_a_flight` bought nothing at all.
+    #[tokio::test]
+    async fn a_faulted_timebase_refuses_a_takeoff_from_the_ground() {
+        // Armed, MAV_LANDED_STATE_ON_GROUND. No flight to interrupt.
+        let (handler, mut cmd_rx) =
+            handler_with_timebase_and_landed_state(faulted_stats(), true, 1).await;
+        let client_id = handler.allocate_client_id().await;
+
+        let response = handler
+            .handle_command(
+                client_id,
+                Command {
+                    command_id: 3,
+                    command_type: CommandType::Takeoff,
+                    takeoff_altitude: Some(5.0),
+                    set_mode_value: None,
+                },
+            )
+            .await;
+        match response {
+            OutgoingMessage::CommandAck(ack) => assert!(
+                !ack.success,
+                "an armed vehicle ON THE GROUND has no flight in progress, so a Takeoff \
+                 that would start one on a faulted timebase must be refused"
+            ),
+            other => panic!("expected a CommandAck, got {other:?}"),
+        }
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "a refused takeoff must not also reach the simulation"
+        );
+    }
+
+    /// The other half of the same rule: once the aircraft is genuinely
+    /// airborne, `Takeoff` (a mode change PX4 accepts in flight) must not be
+    /// refused. Cutting a HITL session off mid-flight latches PX4's sensor
+    /// voters on a real board.
+    #[tokio::test]
+    async fn a_faulted_timebase_lets_a_takeoff_through_while_airborne() {
+        // Armed, MAV_LANDED_STATE_IN_AIR.
+        let (handler, mut cmd_rx) =
+            handler_with_timebase_and_landed_state(faulted_stats(), true, 2).await;
+        let client_id = handler.allocate_client_id().await;
+
+        let response = handler
+            .handle_command(
+                client_id,
+                Command {
+                    command_id: 4,
+                    command_type: CommandType::Takeoff,
+                    takeoff_altitude: Some(5.0),
+                    set_mode_value: None,
+                },
+            )
+            .await;
+        match response {
+            OutgoingMessage::CommandAck(ack) => assert!(
+                ack.success,
+                "the gate must never take control away from a flight in progress: {:?}",
+                ack.error
+            ),
+            other => panic!("expected a CommandAck, got {other:?}"),
+        }
+        assert!(cmd_rx.try_recv().is_ok());
+    }
+
+    /// A refusal that also blocked `Land` would mean refusing to bring an
+    /// aircraft down because the simulation is unwell.
+    #[tokio::test]
+    async fn the_gate_never_blocks_a_command_that_ends_a_flight() {
+        for command_type in [
+            CommandType::Land,
+            CommandType::Rtl,
+            CommandType::Disarm,
+            CommandType::EmergencyStop,
+            CommandType::SetMode,
+            CommandType::Recharge,
+        ] {
+            assert!(
+                !begins_a_flight(command_type),
+                "{command_type} does not start a flight and must never be gated on timebase \
+                 health — refusing it would strand an aircraft in the air"
+            );
+        }
+
+        // Both halves of "starting a flight". Gating `Arm` alone leaves the
+        // whole thing bypassable, because PX4 arms as part of a takeoff.
+        assert!(begins_a_flight(CommandType::Arm));
+        assert!(begins_a_flight(CommandType::Takeoff));
+    }
+
+    #[tokio::test]
+    async fn a_healthy_timebase_arms_normally() {
+        let healthy = ::protocol::SimulationStats {
+            tick_rate_hz: 400.0,
+            timebase_step_us: 2500,
+            ..Default::default()
+        };
+        let (handler, mut cmd_rx) = handler_with_timebase(healthy, false).await;
+        let client_id = handler.allocate_client_id().await;
+
+        let response = handler.handle_command(client_id, arm_command()).await;
+        match response {
+            OutgoingMessage::CommandAck(ack) => {
+                assert!(ack.success, "a healthy timebase must arm: {:?}", ack.error)
+            }
+            other => panic!("expected a CommandAck, got {other:?}"),
+        }
+        assert!(cmd_rx.try_recv().is_ok());
+    }
+
+    /// A daemon with no preflight handler (or one with no view of the loop)
+    /// must not refuse: an unknown timebase is not a faulted one.
+    #[tokio::test]
+    async fn a_handler_with_no_view_of_the_loop_abstains() {
+        let (handler, mut cmd_rx) = create_test_handler().await;
+        let client_id = handler.allocate_client_id().await;
+
+        let response = handler.handle_command(client_id, arm_command()).await;
+        match response {
+            OutgoingMessage::CommandAck(ack) => assert!(
+                ack.success,
+                "absence of a measurement is not a fault: {:?}",
+                ack.error
+            ),
+            other => panic!("expected a CommandAck, got {other:?}"),
+        }
+        assert!(cmd_rx.try_recv().is_ok());
     }
 
     #[tokio::test]

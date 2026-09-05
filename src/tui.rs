@@ -5,7 +5,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
-use protocol::{DaemonState, DaemonStatus, SimulationStats};
+use protocol::{DaemonState, DaemonStatus, SimulationStats, TimebaseHealth};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Layout},
@@ -25,6 +25,64 @@ use tracing_subscriber::Layer;
 
 const MAX_LOG_LINES: usize = 200;
 const TUI_REFRESH_MS: u64 = 500;
+
+/// One tick at the default 400 Hz, microseconds.
+///
+/// A FALLBACK only, for a snapshot that carries no `timebase_step_us` — one
+/// published before a health window closed, or by a pre-0.3.0 daemon. The
+/// bands are drawn in units of the step the loop cannot subdivide, and that
+/// step is `1_000_000 / --tick-rate`, so hardcoding it here mis-grades every
+/// supported rate but 400 Hz.
+const DEFAULT_STEP_US: i32 = 2500;
+
+/// Drift, in steps, above which the timebase row goes from caution to alarm.
+const DRIFT_ALARM_STEPS: i32 = 4;
+
+/// Colour for the timebase row and the loop rate beside it.
+///
+/// The bands this replaces were hardcoded tick-rate thresholds — green at
+/// 380 Hz, yellow at 320 Hz — which rendered the 2026-09-05 session's 341 Hz
+/// as an acceptable YELLOW for the 27 s that ended in a destroyed aircraft.
+/// Rate alone cannot say whether the clock is still correct; drift and lost
+/// time can.
+///
+/// The bands are drawn in units of `step_us`, taken from the loop, NOT from a
+/// constant here. Wall-anchoring changed the sign and the scale of the healthy
+/// resting drift: a correctly paced loop always plans at least one step, so it
+/// rests at `−(step − work)`, which is −2 ms at 400 Hz but −3.3 ms at
+/// `--tick-rate 250` and −4.1 ms at 200 — both rates `validate_tick_rate`
+/// advertises, both measured healthy on every window, and both permanently
+/// YELLOW against a hardcoded 2500. That is the same "colour nobody trusts"
+/// this function was written to remove.
+fn timebase_colour(
+    health: TimebaseHealth,
+    drift_us: i32,
+    discarded_ms: u32,
+    step_us: u32,
+) -> Color {
+    // Lost wall time is sticky for the session and outranks everything else:
+    // a session that could not simulate part of its own flight does not go
+    // back to green because the rate recovered.
+    if discarded_ms > 0 || health == TimebaseHealth::Faulted {
+        return Color::Red;
+    }
+
+    // `0` means the loop has not published a step yet, not a zero-length step.
+    let step = if step_us == 0 {
+        i64::from(DEFAULT_STEP_US)
+    } else {
+        i64::from(step_us)
+    };
+
+    let drift = drift_us.unsigned_abs() as i64;
+    if drift < step && health == TimebaseHealth::Ok {
+        Color::Green
+    } else if drift < step * i64::from(DRIFT_ALARM_STEPS) {
+        Color::Yellow
+    } else {
+        Color::Red
+    }
+}
 
 /// Run the TUI on the current thread (blocking). Call from a dedicated OS thread.
 pub fn run_tui(
@@ -83,9 +141,14 @@ fn run_tui_inner(
         let sim = sim_stats_rx.borrow().clone();
 
         terminal.draw(|frame| {
-            // 8 content rows + 2 borders.
+            // 10 content rows + 2 borders.
+            //
+            // The status Paragraph holds ten lines. It was sized for nine, so
+            // the last one — the battery row — was clipped and never rendered;
+            // adding the Timebase row carried the off-by-one forward rather
+            // than fixing it.
             let chunks = Layout::vertical([
-                Constraint::Length(10),
+                Constraint::Length(12),
                 Constraint::Min(5),
                 Constraint::Length(1),
             ])
@@ -171,12 +234,15 @@ fn run_tui_inner(
             );
 
             // ── Loop performance ──────────────────────────────────────
-            let tick_color = if sim.tick_rate_hz >= 380.0 {
-                Color::Green
-            } else if sim.tick_rate_hz >= 320.0 {
-                Color::Yellow
-            } else if sim.tick_rate_hz > 0.0 {
-                Color::Red
+            // DarkGray only means "no window has rolled up yet"; every other
+            // colour comes from the timebase, not from the rate alone.
+            let tick_color = if sim.tick_rate_hz > 0.0 {
+                timebase_colour(
+                    sim.timebase_health,
+                    sim.timebase_drift_us,
+                    sim.timebase_discarded_ms,
+                    sim.timebase_step_us,
+                )
             } else {
                 Color::DarkGray
             };
@@ -199,6 +265,43 @@ fn run_tui_inner(
             let line_drops = row(
                 cell("Drops", sim.sensor_drops.to_string()),
                 cell("Uptime", format!("{} s", status.uptime_secs)),
+            );
+
+            // ── Timebase ──────────────────────────────────────────────
+            // The Pacing cell carries the pair that separates the two ways of
+            // being behind: wake lateness with no overrun is a host that will
+            // not schedule the thread on time, overrun with no wake lateness is
+            // an iteration whose own work does not fit in the period.
+            //
+            // It used to carry `steps/s`, with the rule "read it against `Loop`
+            // above: both low is compute-bound, only `Loop` low is
+            // wake-latency-bound". That rule cannot fire after wall-anchoring —
+            // sub-stepping pins the clock to the wall, so `steps/s` sits at the
+            // target on any host that is not discarding time, and discarded
+            // time shows in `lost ms` on this same row and forces a fault by
+            // itself.
+            let tb_text = format!(
+                "drift {:+} µs · lost {} ms · gaps {}",
+                sim.timebase_drift_us, sim.timebase_discarded_ms, sim.timebase_gap_count
+            );
+            let tb_text_len = tb_text.chars().count();
+            let tb_span = Span::styled(tb_text, Style::default().fg(tick_color));
+            let line_timebase = row_styled(
+                "Timebase",
+                tb_span,
+                tb_text_len,
+                cell(
+                    "Pacing",
+                    // Milliseconds for the overrun because it is a WINDOW SUM
+                    // over ~400 iterations, not a per-iteration figure like the
+                    // wake mean beside it. In microseconds a bad second reads
+                    // as seven digits and truncates against VALUE_W.
+                    format!(
+                        "wake {} µs · over {:.1} ms",
+                        sim.wake_late_avg_us,
+                        f64::from(sim.deadline_overrun_us) / 1000.0
+                    ),
+                ),
             );
 
             // ── Drone state ───────────────────────────────────────────
@@ -321,6 +424,7 @@ fn run_tui_inner(
                 line_port,
                 line_loop,
                 line_drops,
+                line_timebase,
                 line_arm,
                 line_pos,
                 line_motors,
@@ -445,5 +549,60 @@ impl tracing::field::Visit for MessageVisitor<'_> {
             }
             let _ = write!(self.0, "{}={}", field.name(), value);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timebase_colour_is_red_at_the_incident_rate() {
+        assert_eq!(
+            timebase_colour(TimebaseHealth::Faulted, 148_300, 0, 2500),
+            Color::Red,
+            "the old bands were `>= 380.0` green and `>= 320.0` yellow, so the \
+             2026-09-05 session's 341 Hz rendered YELLOW for the 27 s that ended \
+             in a destroyed aircraft"
+        );
+
+        assert_eq!(
+            timebase_colour(TimebaseHealth::Ok, 900, 0, 2500),
+            Color::Green,
+            "less than one step of drift is the quantum the loop cannot \
+             subdivide, not a fault — a metric that is never green is never read"
+        );
+
+        assert_eq!(
+            timebase_colour(TimebaseHealth::Ok, 0, 1, 2500),
+            Color::Red,
+            "lost wall time is sticky for the session: a perfect rate does not \
+             give back the flight seconds that were never simulated"
+        );
+
+        assert_eq!(
+            timebase_colour(TimebaseHealth::Degraded, 100, 0, 2500),
+            Color::Yellow,
+            "behind cadence but losing nothing is exactly what caution is for"
+        );
+
+        assert_eq!(
+            timebase_colour(TimebaseHealth::Ok, -4062, 0, 5000),
+            Color::Green,
+            "a MEASURED, fully healthy `--tick-rate 200` run: health ok on \
+             every window, discarded 0, min realised 0.99998, resting drift \
+             −4062 µs. Wall-anchoring makes the healthy resting drift \
+             −(step − work), so it SCALES with the step; graded against a \
+             hardcoded 2500 this and `--tick-rate 250` (−3283 µs) were \
+             permanently yellow — a caution on two rates `validate_tick_rate` \
+             advertises"
+        );
+
+        assert_eq!(
+            timebase_colour(TimebaseHealth::Ok, -3000, 0, 2500),
+            Color::Yellow,
+            "drift is signed, and a clock running AHEAD of the wall is just as \
+             wrong as one running behind"
+        );
     }
 }

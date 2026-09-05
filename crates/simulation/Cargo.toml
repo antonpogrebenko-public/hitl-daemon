@@ -1,6 +1,6 @@
 [package]
 name = "simulation"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "HITL simulation loop integrating physics and sensors"
 
@@ -8,6 +8,10 @@ description = "HITL simulation loop integrating physics and sensors"
 hitl-physics = { path = "../../../hitl-physics" }
 hitl-sensors = { path = "../../../hitl-sensors" }
 protocol = { path = "../protocol" }
+# Thread-scheduling promotion. The loop re-reads its own contract on every
+# stats window because macOS revokes one SILENTLY, and an unnoticed revocation
+# is this incident's shape a second time.
+rtsched = { path = "../rtsched" }
 terrain = { path = "../terrain" }
 mavlink = { workspace = true }
 nalgebra = { workspace = true }

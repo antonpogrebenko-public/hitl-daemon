@@ -118,8 +118,164 @@ use mavlink::ardupilotmega::{MavMessage, MavParamType, PARAM_SET_DATA};
 use simulation::SimulationState;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tracing::warn;
+
+/// MAV_LANDED_STATE, as PX4 reports it in `EXTENDED_SYS_STATE`.
+///
+/// Named rather than written as bare integers at the comparison, because the
+/// difference between "armed" and "airborne" is the whole of
+/// [`flight_in_progress`].
+const MAV_LANDED_STATE_ON_GROUND: u8 = 1;
+const MAV_LANDED_STATE_IN_AIR: u8 = 2;
+const MAV_LANDED_STATE_TAKEOFF: u8 = 3;
+const MAV_LANDED_STATE_LANDING: u8 = 4;
+
+/// Is the aircraft in the middle of a flight the gate must not interrupt?
+///
+/// Armed is NOT the same question. A vehicle can be armed and sitting on the
+/// ground — motors spinning at idle, the pilot about to push the stick — and
+/// that is the state a `Takeoff` starts a flight from. Short-circuiting the
+/// gate on `armed` alone let exactly that vehicle begin a flight on a faulted
+/// timebase, because `Takeoff` is only ever reached while the aircraft is
+/// already armed or arms as part of executing it.
+///
+/// The landed state is PX4's OWN land-detector verdict, forwarded from
+/// `EXTENDED_SYS_STATE`; the simulation never infers it (see
+/// `SimulationState::landed_state`).
+///
+/// `UNDEFINED` — and any value PX4 adds later — falls back to plain `armed`.
+/// That direction is deliberate: a session with no `EXTENDED_SYS_STATE` at all
+/// (`--sim-only`, an old firmware, a board that has not reported yet) must keep
+/// the never-interrupt-a-flight guarantee, and the cost of being wrong that way
+/// is one un-refused arming, against an interrupted flight the other way.
+pub fn flight_in_progress(armed: bool, landed_state: u8) -> bool {
+    if !armed {
+        return false;
+    }
+    match landed_state {
+        MAV_LANDED_STATE_IN_AIR | MAV_LANDED_STATE_TAKEOFF | MAV_LANDED_STATE_LANDING => true,
+        MAV_LANDED_STATE_ON_GROUND => false,
+        _ => true,
+    }
+}
+
+/// Refuse a NEW arming while the session's simulation timebase is faulted.
+///
+/// This is the only enforcement point the timebase work has for the structured
+/// command path. Everything else it does is a metric, a log line or a banner,
+/// and on 2026-09-05 the person flying had a YELLOW tick-rate readout in front
+/// of them for 27 seconds and flew anyway. A refusal is the one affordance that
+/// stops the same rig being re-flown five minutes later.
+///
+/// # What it does NOT cover
+///
+/// Arming from RC or QGroundControl never reaches this daemon, and the
+/// browser's NSH console reaches PX4's own `commander arm` without passing
+/// through `begins_a_flight`. That is an accepted power-user bypass, not an
+/// oversight: the NSH console exists to send arbitrary shell commands to the
+/// flight controller, its safety list (`BLOCKED_NSH_COMMANDS`) blocks only
+/// commands that can brick or wipe a board, and refusing on a substring match
+/// is brittle in both directions. Someone typing `commander arm` into a
+/// firmware console has stepped outside the UI this gate is part of.
+///
+/// # It must never interrupt a flight in progress
+///
+/// `flight_in_progress` short-circuits to `Ok` before anything else is read,
+/// and that ordering is the whole safety argument. Cutting a HITL session off
+/// mid-flight is not a safe default here: this daemon deliberately leaves the
+/// flight controller in HITL mode with `CAL_ACC0`/`CAL_GYRO0` zeroed, and
+/// starving PX4 of `HIL_SENSOR` latches its 300 ms mag/baro and 500 ms
+/// accel/gyro voters — putting a REAL board into a sensor-failure state whose
+/// only recovery is the restore panel, which needs the very session the
+/// interruption ended. Refusing the next arming costs a user one click.
+/// Interrupting this one costs them an airworthy board.
+///
+/// The predicate is [`flight_in_progress`], not `is_armed()`: an armed vehicle
+/// ON THE GROUND has no flight to interrupt, and is exactly the state a
+/// `Takeoff` would have started one from.
+///
+/// # What counts as faulted
+///
+/// `session_invalid` (wall time the loop could not simulate at all) or a
+/// `timebase_worst_health` of `Faulted` (the session's WORST window, not the
+/// last one). `Degraded` deliberately does not refuse: it means the loop is
+/// behind cadence but has still simulated every microsecond of wall time, which
+/// is a caution, and grounding a working setup over a caution is how a gate
+/// gets disabled.
+///
+/// # Clearing rule
+///
+/// Never, for the life of the daemon process. Both inputs are already
+/// session-scoped latches by their own contract — `session_invalid` is
+/// documented as "never cleared for the session" precisely so a `ConfigureBuild`
+/// cannot launder a compromised session — and a gate that cleared itself after
+/// N healthy seconds would hand back the aircraft to a host that had already
+/// demonstrated it cannot pace the loop. The refusal text says so, and names
+/// restarting the daemon as the way out.
+pub fn timebase_arming_gate(
+    stats: &protocol::SimulationStats,
+    flight_in_progress: bool,
+) -> Result<(), String> {
+    if flight_in_progress {
+        return Ok(());
+    }
+
+    let lost_time = stats.session_invalid || stats.timebase_discarded_ms > 0;
+    let faulted = stats.timebase_worst_health == protocol::TimebaseHealth::Faulted;
+    if !lost_time && !faulted {
+        return Ok(());
+    }
+
+    // The measured rate belongs in the message. "Timebase faulted" alone is a
+    // refusal the user can do nothing with; "341 Hz against a target of 400"
+    // is a refusal they can go and fix.
+    //
+    // The WORST window's rate, not the live one. `session_invalid` and
+    // `timebase_worst_health` are both session latches, so by the time a user
+    // reads this the loop has usually recovered and `tick_rate_hz` reads 400 —
+    // a refusal that says "Measured 400 Hz against a target of 400 Hz" names a
+    // healthy rate as the reason it will not arm, which is unanswerable.
+    let target_hz = if stats.timebase_step_us > 0 {
+        1_000_000.0 / f64::from(stats.timebase_step_us)
+    } else {
+        // No health window has closed, so the step is unknown; the 400 Hz
+        // default is the only figure available to compare against.
+        400.0
+    };
+    let worst_hz = if stats.timebase_min_realised > 0.0 {
+        f64::from(stats.timebase_min_realised) * target_hz
+    } else {
+        // No window has closed yet, so the session has no worst figure and the
+        // live rate is the only measurement there is.
+        f64::from(stats.tick_rate_hz)
+    };
+    let mut reason = format!(
+        "Arming refused: this daemon's simulation timebase is faulted, so the flight \
+         controller's estimator would be fed motion that does not match the simulated \
+         aircraft. The worst second of this session ran at {worst_hz:.0} Hz against a target \
+         of {target_hz:.0} Hz (it is running at {:.0} Hz now)",
+        stats.tick_rate_hz,
+    );
+    if stats.session_invalid || stats.timebase_gap_count > 0 {
+        // Always stated when the session latched, never gated on
+        // `discarded_ms > 0`. That gate hid the only clause explaining the
+        // refusal in the most common case: a marginal ~20 ms host stall that
+        // catch-up almost covers latches `session_invalid` while discarding
+        // under a millisecond, which integer-divides to 0 ms.
+        reason.push_str(&format!(
+            ", across {} gap(s) in the wall clock, the largest {} ms, of which {} ms could not \
+             be simulated at all",
+            stats.timebase_gap_count, stats.timebase_max_gap_ms, stats.timebase_discarded_ms
+        ));
+    }
+    reason.push_str(
+        ". Run `hitl-daemon --selftest-timebase 30` to check this host, close the browser's \
+         terrain view, and plug the machine into mains power. This does not clear until the \
+         daemon is restarted.",
+    );
+    Err(reason)
+}
 
 /// PX4 SYS_AUTOSTART id for "Generic Quadcopter X" — the fixed target this
 /// feature applies. No per-build airframe selection.
@@ -394,6 +550,12 @@ pub struct PreflightHandler {
     /// stream, and mirroring into both would deliver every frame twice to
     /// whoever asked.
     provisioning_tx: broadcast::Sender<OutgoingMessage>,
+    /// The simulation loop's published health, for [`Self::arming_refusal`].
+    ///
+    /// `None` in tests and anywhere no loop is running, in which case the gate
+    /// abstains rather than guessing — an unknown timebase is not a faulted
+    /// one.
+    timebase_stats: Option<watch::Receiver<protocol::SimulationStats>>,
 }
 
 impl PreflightHandler {
@@ -437,7 +599,41 @@ impl PreflightHandler {
                 let (tx, _) = broadcast::channel(64);
                 tx
             },
+            timebase_stats: None,
         }
+    }
+
+    /// Give the arming gate a view of the simulation loop's published health.
+    ///
+    /// Without this the gate abstains: a handler with no view of the loop
+    /// cannot tell a healthy session from a faulted one, and refusing on the
+    /// strength of no information would ground every setup.
+    pub fn with_timebase_stats(
+        mut self,
+        stats: watch::Receiver<protocol::SimulationStats>,
+    ) -> Self {
+        self.timebase_stats = Some(stats);
+        self
+    }
+
+    /// Why a NEW arming should be refused right now, if it should.
+    ///
+    /// See [`timebase_arming_gate`] for the policy — in particular that a
+    /// flight already in progress always passes, and that being ARMED is not
+    /// the same thing as being in flight.
+    pub fn arming_refusal(&self) -> Option<String> {
+        let stats = self.timebase_stats.as_ref()?;
+
+        // Read the state BEFORE borrowing the watch, and never hold both at
+        // once. The simulation loop publishes into this watch while holding a
+        // read guard on the state lock (`publish_stats`), so taking them in the
+        // other order here is a lock-ordering inversion: a writer queued on the
+        // state lock would block this thread's read, that writer waits on the
+        // loop's read guard, and the loop's guard is not released until its
+        // watch write completes — which is waiting on the borrow held here.
+        let in_flight =
+            flight_in_progress(self.sim_state.is_armed(), self.sim_state.landed_state());
+        timebase_arming_gate(&stats.borrow(), in_flight).err()
     }
 
     /// Subscribe to provisioning and restore progress.
@@ -2749,5 +2945,259 @@ mod param_save_tests {
         // PX4 commits each dirty parameter as its own flash write, and
         // provisioning dirties ~21. Sized for that, not for a single write.
         assert!(PARAM_SAVE_SETTLE_DELAY >= Duration::from_millis(1500));
+    }
+}
+
+#[cfg(test)]
+mod arming_gate_tests {
+    use super::*;
+    use protocol::{SimulationStats, TimebaseHealth};
+
+    /// A session that lost 4.9 s of wall time over 63 s at 341 Hz — the
+    /// 2026-09-05 shape, as the loop would now report it.
+    fn incident_stats() -> SimulationStats {
+        SimulationStats {
+            tick_rate_hz: 341.2,
+            timebase_step_us: 2500,
+            timebase_worst_health: TimebaseHealth::Faulted,
+            timebase_health: TimebaseHealth::Faulted,
+            timebase_min_realised: 0.8525,
+            session_invalid: true,
+            timebase_discarded_ms: 4900,
+            timebase_gap_count: 3,
+            ..Default::default()
+        }
+    }
+
+    fn healthy_stats() -> SimulationStats {
+        SimulationStats {
+            tick_rate_hz: 400.0,
+            timebase_step_us: 2500,
+            timebase_worst_health: TimebaseHealth::Ok,
+            timebase_health: TimebaseHealth::Ok,
+            timebase_min_realised: 1.0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_faulted_timebase_refuses_a_new_arming() {
+        let refusal = timebase_arming_gate(&incident_stats(), false)
+            .expect_err("a session that lost 4.9 s of wall time must not start a new flight");
+
+        assert!(
+            refusal.contains("341"),
+            "the refusal must name the measured rate, or the user has nothing to act on: \
+             {refusal}"
+        );
+        assert!(
+            refusal.contains("400"),
+            "and the target it is being compared against: {refusal}"
+        );
+        assert!(
+            refusal.contains("--selftest-timebase"),
+            "the refusal must name the command that diagnoses the host: {refusal}"
+        );
+        assert!(
+            refusal.contains("4900") && refusal.contains("ms"),
+            "lost wall time is the difference between 'slow' and 'compromised' and belongs \
+             in the message: {refusal}"
+        );
+        assert!(
+            refusal.contains("restart"),
+            "the gate never clears on its own, so the message has to say how to get out of \
+             it: {refusal}"
+        );
+    }
+
+    /// THE test that matters.
+    ///
+    /// Cutting a HITL session off mid-flight latches PX4's 300 ms mag/baro and
+    /// 500 ms accel/gyro voters on a real board this daemon deliberately left
+    /// in HITL mode with its calibration offsets zeroed. The recovery path is
+    /// the restore panel, which needs the session the interruption would have
+    /// ended.
+    #[test]
+    fn a_faulted_timebase_never_interrupts_a_flight_in_progress() {
+        assert_eq!(
+            timebase_arming_gate(&incident_stats(), true),
+            Ok(()),
+            "a flight in progress must pass the gate no matter how bad the timebase is: \
+             the gate blocks the NEXT arming, it never takes the aircraft away mid-flight"
+        );
+    }
+
+    /// The hole the `already_armed` short-circuit left.
+    ///
+    /// A vehicle can be armed and sitting on the ground, which is the state a
+    /// `Takeoff` starts a flight from. Short-circuiting on `armed` alone let
+    /// that vehicle begin a flight on a faulted timebase, and `Takeoff` is
+    /// only ever reached from a state in which `Arm` would already have been
+    /// refused — so gating `Takeoff` bought nothing at all.
+    #[test]
+    fn armed_on_the_ground_is_not_a_flight_in_progress() {
+        assert!(
+            !flight_in_progress(true, MAV_LANDED_STATE_ON_GROUND),
+            "an armed vehicle on the ground has no flight to interrupt"
+        );
+        assert!(
+            timebase_arming_gate(&incident_stats(), false).is_err(),
+            "and must therefore still be refused"
+        );
+    }
+
+    #[test]
+    fn every_airborne_landed_state_is_a_flight_in_progress() {
+        for landed_state in [
+            MAV_LANDED_STATE_IN_AIR,
+            MAV_LANDED_STATE_TAKEOFF,
+            MAV_LANDED_STATE_LANDING,
+        ] {
+            assert!(
+                flight_in_progress(true, landed_state),
+                "MAV_LANDED_STATE {landed_state} is a flight the gate must not interrupt"
+            );
+        }
+    }
+
+    /// The never-interrupt guarantee has to survive a session with no
+    /// `EXTENDED_SYS_STATE` at all — `--sim-only`, an old firmware, or a board
+    /// that has simply not reported yet. UNDEFINED (and any value PX4 adds
+    /// later) falls back to plain `armed`.
+    #[test]
+    fn an_unreported_landed_state_falls_back_to_armed() {
+        assert!(
+            flight_in_progress(true, 0),
+            "UNDEFINED must not be read as 'on the ground': a daemon that never receives \
+             EXTENDED_SYS_STATE would then interrupt every flight it gated"
+        );
+        assert!(
+            flight_in_progress(true, 99),
+            "an unrecognised MAV_LANDED_STATE must fail toward not interrupting a flight"
+        );
+    }
+
+    #[test]
+    fn a_disarmed_vehicle_is_never_a_flight_in_progress() {
+        for landed_state in [0, 1, 2, 3, 4, 99] {
+            assert!(
+                !flight_in_progress(false, landed_state),
+                "a disarmed vehicle cannot be flying, whatever landed_state {landed_state} says"
+            );
+        }
+    }
+
+    /// A marginal stall latches the session while discarding under a
+    /// millisecond, which integer-divides to `timebase_discarded_ms == 0`.
+    /// Gating the gap clause on `discarded_ms > 0` then dropped the only
+    /// sentence that explained the refusal.
+    #[test]
+    fn a_marginal_gap_still_explains_itself() {
+        let marginal = SimulationStats {
+            session_invalid: true,
+            timebase_gap_count: 1,
+            timebase_max_gap_ms: 20,
+            timebase_discarded_ms: 0,
+            ..healthy_stats()
+        };
+        let refusal = timebase_arming_gate(&marginal, false)
+            .expect_err("a session that latched session_invalid must be refused");
+        assert!(
+            refusal.contains("gap"),
+            "a refusal with no discarded milliseconds must still say what happened: {refusal}"
+        );
+        assert!(
+            refusal.contains("20 ms"),
+            "and name the largest gap, which is the number that caused it: {refusal}"
+        );
+    }
+
+    /// Both latches are session-scoped, so by the time a user reads the
+    /// refusal the loop has usually recovered. Quoting the live rate then
+    /// produced "Measured 400 Hz against a target of 400 Hz" as the stated
+    /// reason for refusing — a healthy number the user cannot act on.
+    #[test]
+    fn the_refusal_quotes_the_window_that_caused_it_not_the_live_rate() {
+        let recovered = SimulationStats {
+            tick_rate_hz: 400.0,
+            timebase_health: TimebaseHealth::Ok,
+            timebase_worst_health: TimebaseHealth::Faulted,
+            timebase_min_realised: 0.8525,
+            ..healthy_stats()
+        };
+        let refusal = timebase_arming_gate(&recovered, false)
+            .expect_err("the session's worst window was Faulted");
+        assert!(
+            refusal.contains("341"),
+            "the refusal must name the worst window's rate, not the healthy live one: \
+             {refusal}"
+        );
+    }
+
+    #[test]
+    fn a_healthy_timebase_arms() {
+        assert_eq!(timebase_arming_gate(&healthy_stats(), false), Ok(()));
+    }
+
+    /// A false positive grounds a working setup, and a gate that grounds
+    /// working setups gets switched off. `Degraded` means the loop is behind
+    /// cadence but has still simulated every microsecond of wall time.
+    #[test]
+    fn a_degraded_timebase_is_a_caution_and_still_arms() {
+        let degraded = SimulationStats {
+            tick_rate_hz: 384.0,
+            timebase_worst_health: TimebaseHealth::Degraded,
+            timebase_health: TimebaseHealth::Degraded,
+            timebase_min_realised: 0.96,
+            ..healthy_stats()
+        };
+        assert_eq!(
+            timebase_arming_gate(&degraded, false),
+            Ok(()),
+            "Degraded is behind cadence but losing nothing; refusing here would ground \
+             hosts that are simulating correctly"
+        );
+    }
+
+    /// `timebase_health` describes the last second only. A host that stalled
+    /// and recovered reports `Ok` there at the end of a run that deleted
+    /// seconds of simulation, so the gate must read the session's worst window.
+    #[test]
+    fn a_session_that_stalled_and_recovered_is_still_refused() {
+        let recovered = SimulationStats {
+            timebase_health: TimebaseHealth::Ok,
+            timebase_worst_health: TimebaseHealth::Faulted,
+            ..healthy_stats()
+        };
+        assert!(
+            timebase_arming_gate(&recovered, false).is_err(),
+            "the last second being healthy is not evidence the session is"
+        );
+    }
+
+    /// Discarded time on its own is disqualifying, whatever the rate says.
+    #[test]
+    fn wall_time_that_was_never_simulated_refuses_on_its_own() {
+        let lost = SimulationStats {
+            timebase_discarded_ms: 276,
+            timebase_gap_count: 1,
+            ..healthy_stats()
+        };
+        assert!(
+            timebase_arming_gate(&lost, false).is_err(),
+            "a session with wall time it never simulated is compromised, not merely slow"
+        );
+    }
+
+    /// A default-constructed snapshot is what every subscriber holds before the
+    /// loop's first publish. Refusing on it would block arming for the first
+    /// half-second of every session.
+    #[test]
+    fn a_snapshot_from_before_the_first_publish_does_not_refuse() {
+        assert_eq!(
+            timebase_arming_gate(&SimulationStats::default(), false),
+            Ok(()),
+            "absence of a measurement is not a fault"
+        );
     }
 }

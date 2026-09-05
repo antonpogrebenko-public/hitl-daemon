@@ -5,6 +5,397 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.0]
+
+### Fixed
+
+- **The simulation clock is anchored to wall time.** A HITL session on
+  2026-09-05 destroyed the simulated aircraft. The 400 Hz loop settled at
+  ~341 Hz and never recovered: the deadline was re-based to `now` on every late
+  iteration, so lateness was deleted rather than owed, and the sim clock fell
+  behind wall time at 148.3 ms/s for the roughly 33 s the loop was degraded --
+  4.9 s of skew in a 63 s session, which reported 58.1 s of simulation.
+
+  That is not a cosmetic counter. PX4 on real hardware IGNORES
+  `HIL_SENSOR.time_usec`: `MavlinkReceiver::handle_message_hil_sensor` stamps
+  every sample with its own `hrt_absolute_time()` and integrates each emitted
+  rate over the WALL interval between arrivals (~2.93 ms), while the daemon had
+  advanced physics only 2.5 ms for that sample. The EKF therefore
+  over-integrated IMU motion by ~17% against a GPS track derived from true
+  (slower) simulated motion. It is a continuous poison that exists with ZERO
+  dropped messages and is invisible to every gap-based guard: the estimate
+  diverged to 42 m and 21.5 m/s while still reporting position valid with an
+  eph of 1.86 m.
+
+  The loop now sleeps to `epoch + sim_us` and sub-steps at a fixed 2.5 ms dt
+  against that wall-anchored deadline, emitting ONE `HIL_SENSOR` per iteration
+  carrying the MEAN specific force and angular rate over `n x 2.5 ms`, so PX4's
+  integral over the interval between arrivals equals the interval actually
+  simulated. Fixed dt, never a variable step sized to the deficit: the motor
+  mode has tau = 0.025 s, so a 296.7 ms step gives |lambda.h| = 11.9 and an RK4
+  amplification around 610 -- the integrator would detonate on precisely the
+  stall it has to survive.
+
+  `n == 1` is the identity case and is pinned byte for byte by
+  `single_step_emission_is_unchanged_byte_for_byte` against a golden captured
+  from the pre-change binary. The healthy path does not move, with one
+  deliberate exception named under `Changed` below: the ground-impact impulse
+  now spans 40 emissions rather than 39, because 40 x 2.5 ms is exactly the
+  100 ms it declares.
+
+  `hitl-physics` and `hitl-sensors` are untouched; their versions do not move
+  and the zero-I/O WASM boundary is intact.
+
+### Added
+
+- **The split clock, and the ULog cross-check it buys.** Two monotone counters.
+  `sim_us` is wall-anchored and drives the sleep deadline,
+  `HIL_SENSOR.time_usec`, the GPS rate limiter and the browser's state frame.
+  `integrated_us = sim_us - discarded_us` is the time actually simulated and
+  drives `HIL_GPS.time_usec` alone.
+
+  The divergence is deliberate. After the fix,
+  `(FC hrt elapsed) - (sensor_gps.time_utc_usec elapsed)` read from the ULog
+  equals the daemon's reported `timebase_discarded_ms`: zero on a healthy run,
+  the fault magnitude on a bad one. Two independent measurements agreeing is
+  what makes the new metric believable on its first real incident -- put that in
+  the runbook, not only here. PX4 uses neither stamp for timing (the PPS path is
+  gated off with no PPS hardware), and both stay monotone, which the GPS rate
+  limiter and delay buffer require: a backward jump would silence GPS for the
+  session.
+
+- **A timebase group in `SimulationStats`, graded every second.** `drift_us`,
+  `discarded_ms`, `gap_count`, `max_gap_ms`, `catchup_steps`, `steps_per_sec`,
+  `wake_late_avg/max/p99_us`, `deadline_overrun_us`, `step_us`,
+  `session_invalid`, `health` and `worst_health`. Every field is
+  `#[serde(default)]`, so a pre-0.3.0 snapshot still deserialises.
+
+  Read `steps_per_sec` and `tick_rate_hz` TOGETHER to see whether the CLOCK is
+  still correct while the loop is behind. During the incident that pair reads
+  400 and 341, which excludes the physics and terrain code from the first line
+  anyone looks at.
+
+  That pair does NOT say compute-bound versus descheduled, and an earlier draft
+  of these notes claimed it did. It cannot: sub-stepping pins the clock to the
+  wall, so `steps_per_sec` sits at the target on any host that is not
+  discarding time, and discarded time forces `Faulted` by itself -- so "both
+  low" collapses to "there were gaps". The pair that separates the two
+  populations is `wake_late_avg_us` against `deadline_overrun_us`: wake
+  lateness with no overrun is a host that will not schedule the thread, overrun
+  with no wake lateness is an iteration whose own work does not fit in the
+  period. `deadline_overrun_us` was measured every iteration from the start and
+  read by nothing, so the discriminator never left the loop.
+
+- **`--selftest-timebase <secs>`** -- runs the loop headless with no flight
+  controller and no browser and prints one line of JSON (achieved rate,
+  `drift_us_at_end`, wake p99/max/avg, `deadline_overrun_us`, discarded ms,
+  worst health). The pre-flight fitness check, and the one command to hand a
+  user reporting a problem.
+
+  The clock offset is published as `drift_us_at_end` and NOT as a rate. An
+  earlier draft divided that instantaneous `wall - sim` offset by the run
+  length and called it `drift_ms_per_s`, which measures nothing per second:
+  wall-anchoring bounds the offset at `GAP_THRESHOLD_US`, so two identical
+  hosts reported different figures purely as a function of the N passed on the
+  command line. The 10 ms/s comparison survives as an internal backstop on the
+  `Timebase` invariant and is no longer a published field.
+
+- **A `DAEMON TIMEBASE` annunciator to the browser** on each health transition,
+  through the existing `VehicleMessage` path. No wire-format change and
+  `th3seus-web` is untouched.
+
+- **A preflight gate that refuses the NEXT arming while the timebase is
+  faulted.** On 2026-09-05 the person flying had a yellow tick-rate readout in
+  front of them for 27 seconds and flew anyway. Every other thing this release
+  adds is a metric, a log line or a banner; this is the only one that stops the
+  same rig being re-flown five minutes later.
+
+  **It never interrupts a flight in progress**, and that is a safety
+  requirement, not a convenience. Starving PX4 of `HIL_SENSOR` latches its
+  300 ms mag/baro and 500 ms accel/gyro voters on a board this daemon
+  deliberately leaves in HITL mode with `CAL_ACC0`/`CAL_GYRO0` zeroed — the
+  recovery path is the restore panel, which needs the very session the
+  interruption would have ended. `timebase_arming_gate` short-circuits before
+  reading anything else on a FLIGHT IN PROGRESS -- armed AND a
+  `MAV_LANDED_STATE` of `IN_AIR`/`TAKEOFF`/`LANDING`, taken from PX4's own
+  `EXTENDED_SYS_STATE` -- and only `Arm` and `Takeoff` are gated: `Land`,
+  `RTL`, `Disarm` and `EmergencyStop` are how a flight ENDS and are never
+  refused.
+
+  Armed is NOT the same question as airborne, and the difference is what makes
+  gating `Takeoff` worth anything: a vehicle armed and sitting on the ground is
+  exactly what a `Takeoff` starts a flight from, and short-circuiting on the
+  armed flag alone would have let it start one on a faulted timebase.
+  `UNDEFINED` -- a session with no `EXTENDED_SYS_STATE` at all, such as
+  `--sim-only` -- falls back to the armed flag, so the never-interrupt
+  guarantee survives a board that has not reported.
+
+  It covers the structured command path only. Arming from RC or QGroundControl
+  never reaches this daemon, and the browser's NSH console reaches PX4's own
+  `commander arm` without passing through it. That is an accepted power-user
+  bypass: the NSH console exists to send arbitrary firmware commands, and
+  refusing on a substring match is brittle in both directions.
+
+  It fires on lost wall time (`session_invalid` / `discarded_ms > 0`) or a
+  `timebase_worst_health` of `Faulted` — the session's WORST window, so a host
+  that stalled and recovered is still refused. `Degraded` deliberately does not
+  refuse: behind cadence while still simulating every microsecond is a caution,
+  and a gate that grounds working setups is a gate that gets switched off. It
+  does not clear until the daemon is restarted, and the refusal says so, names
+  the measured rate against the target, and names `--selftest-timebase`.
+
+- **`rtsched`, a new workspace member (0.1.0) that asks the host to schedule the
+  simulation thread as a periodic real-time task.** macOS: user-interactive QoS
+  plus a mach `THREAD_TIME_CONSTRAINT_POLICY` contract. Linux: `SCHED_FIFO` at
+  priority 10. Windows: `THREAD_PRIORITY_TIME_CRITICAL` plus an MMCSS "Pro
+  Audio" registration, and explicitly NOT `timeBeginPeriod`, which `spin_sleep`
+  already calls. Everything else: nothing, reported as such.
+
+  **This is exposure reduction. It is NOT the timebase fix, and it is not shown
+  to have prevented the incident.** The 2026-09-05 shortfall was ~435 us per
+  iteration against ~95 us of measured work — late wake-ups, not slow compute —
+  and a scheduling class fixed when the thread starts cannot produce a step
+  change at t=36 s that then never recovers. The leading suspect there remains
+  Selective Forced Idle on a fanless Mac14,2.
+
+  On the QoS half, note what is NOT claimed, because an earlier draft claimed
+  it. SFI is QoS-tiered, but on macOS this crate does not raise the tier: the
+  mach time-constraint contract SUPERSEDES the QoS class and leaves the thread
+  at `QOS_CLASS_UNSPECIFIED`. Measured on the incident machine (Mac14,2,
+  macOS 27.0) -- `pthread_set_qos_class_self_np(USER_INTERACTIVE)` returns 0
+  and the class reads back 0x21; the following `thread_policy_set` returns
+  KERN_SUCCESS and the class reads back 0x00. Reversing the order does not help
+  either: with the contract in force the QoS request is refused. So what ships
+  on macOS is a periodic real-time declaration, and any SFI argument has to be
+  made about `TH_MODE_REALTIME` rather than about the tier. The QoS request is
+  still made because it is what the thread is left holding when the contract
+  itself is REFUSED, which is the one case where the tier is the only
+  mitigation in force.
+
+  The DIRECTION was measured on the incident's own machine (Mac14,2 / Apple M2,
+  debug build): wake lateness falls by roughly an order of magnitude, mean and
+  p99 both, with the promotion. Deliberately no precise digits here -- three
+  runs of the same A/B on the same machine produced three different sets, the
+  figures depend entirely on what else the machine was doing, and a number in a
+  changelog that nobody can reproduce is worse than no number. That is a real
+  effect on the exact quantity that was wrong, and it is still not evidence
+  about the incident: a short sample says nothing about a step change that never
+  recovered. Run the A/B on YOUR host with `--selftest-timebase 120` and
+  `--selftest-timebase 120 --no-realtime` and compare `wake_late_p99_us`; that
+  pair is the measurement, not this paragraph.
+
+  Two things it does NOT do, on purpose. There is no adaptive spin margin:
+  burning up to 30% of a core to fight lateness on a fanless chassis feeds the
+  thermal throttle that is the leading suspected trigger, and a forced-idle
+  thread cannot spin at all. And there is no CPU pinning: mach affinity tags are
+  an x86-era facility arm64 does not honour.
+
+  No new packages. `libc` and `windows-sys` were already resolved nodes in
+  `Cargo.lock` (via tokio/mio/serialport and via spin_sleep). Two of the three
+  windows-sys features are ones spin_sleep already enables; the third,
+  `Win32_System_WindowsProgramming`, buys exactly one constant --
+  `THREAD_PRIORITY_ERROR_RETURN`, which lives in a different header from the
+  priority values it is compared against and is MAXLONG rather than the
+  negative sentinel a reader would guess. The mach entry points are declared by
+  hand because `libc` marks every one of them deprecated.
+
+  The macOS promotion reads its contract back IMMEDIATELY, not only on the 5 s
+  window: `KERN_SUCCESS` from `thread_policy_set` says the kernel accepted the
+  request, not that the policy took, and a sandbox or device-management profile
+  can accept and ignore it. A contract that did not apply reports
+  `unavailable:mach-time-constraint-not-applied:0` rather than `granted:`, so
+  the A/B cannot silently compare two identical arms. A grant whose QoS half is not
+  in force reports `granted:mach-time-constraint-noqos`, and the mechanism is
+  chosen from a READ-BACK of the thread's QoS class rather than from the return
+  code of the call that asked for it. Choosing it from the return code made the
+  `-noqos` variant unreachable -- that call always succeeds -- so every macOS
+  session published the full-grant token on a thread sitting at
+  `QOS_CLASS_UNSPECIFIED`. Because the contract supersedes the tier, `-noqos`
+  is now the ORDINARY macOS outcome rather than an exotic one; the point of the
+  token is that it never claims a half that is not in force.
+
+  Note for anyone extending the macOS read-back: XNU does not echo the contract
+  verbatim. It raises `computation` to a 500 us floor (measured on a Mac14,2
+  across seven period/computation pairs), while `period` and `constraint` come
+  back exactly as given -- so `verify` compares those two and ignores
+  computation. Comparing all three reports every 400 Hz session as revoked.
+
+- **`realtime_policy` in `SimulationStats`, and `rt_outcome` in the
+  `--selftest-timebase` JSON.** `granted:<mechanism>`,
+  `unavailable:<mechanism>:<errno>`, `unsupported`, `disabled`
+  (`--no-realtime`) or `revoked`. `disabled` is deliberately not `unsupported`:
+  on macOS the latter would send a reader hunting a broken FFI binding for a
+  flag the operator passed.
+
+  `unavailable` is a NORMAL value. On Linux `SCHED_FIFO` needs `CAP_SYS_NICE`
+  and the shipped artefact is an unprivileged musl binary, so refusal is the
+  ordinary path there — logged once at `info!` with the `setcap` remedy, never
+  at `warn!`, never repeated, never fatal.
+
+  `revoked` is the value worth reacting to. macOS is believed to withdraw a
+  time-constraint contract SILENTLY once a thread chronically overruns its
+  declared budget, so the loop re-reads the contract on every 5 s stats window
+  and reports the withdrawal once. A real-time guarantee that quietly stopped
+  applying is this incident's shape a second time.
+
+  It does NOT single out compute. A catch-up iteration runs up to
+  `MAX_CATCHUP_STEPS` physics sub-steps against a computation budget sized for
+  one, so sustained LATE WAKE-UPS overrun the declaration just as surely as slow
+  work does -- and that is the scenario this whole release is about. Read
+  `deadline_overrun_us`, `catchup_steps` and `wake_late_p99_us` together before
+  concluding anything from it.
+
+  And `revoked` has TWO causes that the one token cannot separate: the kernel
+  DEMOTED the thread to the default policy, or the contract in force no longer
+  matches the period and constraint that were declared -- a REPLACEMENT, which
+  is neither a demotion nor an overrun. The warning names both. `Intact` is
+  likewise evidence the contract was not replaced, not proof the kernel is
+  still honouring it.
+
+### Changed
+
+- **`--tick-rate` validates its argument.** Only rates dividing both the
+  microsecond and the nanosecond grid exactly are accepted (400, 250, 200, ...).
+  `--tick-rate 0` used to panic on a divide; 333 Hz gave 3_003_003 ns of wall
+  period against 3_003_000 us of sim advance, a phantom ~1 ppm deficit the new
+  metric would have blamed on the scheduler.
+
+- **The TUI's loop-rate bands are drawn from drift and lost time, not from the
+  rate.** The old hardcoded 380/320 Hz thresholds rendered the incident's
+  341 Hz as an acceptable YELLOW for the 27 s that ended in a destroyed
+  aircraft. The bands are now units of the loop's own published step, so a
+  healthy `--tick-rate 250` or `200` run is green rather than permanently
+  cautioned.
+
+- **The ground-impact impulse expires on 100 ms of SIM time, not 40
+  iterations**, so a catch-up cannot compress the only signal that tells the
+  EKF what removed the vehicle's velocity (37 m of underground dead-reckoning
+  at a 6.4 m/s impact without it). It therefore now spans 40 emissions at one
+  sub-step per iteration where the old counter spanned 39 -- the one place the
+  healthy path moves, and 40 x 2.5 ms is exactly the 100 ms declared.
+
+- **Nothing suppresses catch-up any more.** The planner had two clamps that cut
+  the sub-step allowance to one, and both are gone: they reintroduced, on their
+  own schedule, exactly the wall-versus-sim divergence this release exists to
+  remove.
+
+  *Backpressure.* The clamp fired while the outbound MAVLink channel was over
+  half full, on the stated grounds that catch-up is upstream work which turns a
+  scheduling problem into a downstream backlog. It is not:
+  `sample_and_send_sensors` is called exactly ONCE per iteration whatever the
+  sub-step count and `step_physics` sends nothing, so catch-up adds zero
+  outbound messages; `HIL_GPS` is rate-limited on the sim clock, so catch-up
+  brings its cadence up to the configured rate and never past it; and because
+  the clock can never lead the wall by more than one step, the sub-step RATE is
+  bounded by `1 / step_us` however the steps are distributed. What the clamp
+  did buy was a deficit growing unpaid at the loop's own lateness until it
+  crossed `GAP_THRESHOLD_US`, at which point a host that had lost nothing it
+  could replay latched `session_invalid` and had its next arming refused with a
+  message about mains power. An FC reboot stops draining `mav_tx` for 20-60 s,
+  which is enough on a marginally late host.
+
+  *The ground-impact impulse.* The clamp fired for the 100 ms of the landing
+  impulse, on the stated grounds that compressing it into one averaged sample
+  destroys the event. It cannot: `ground_override` SUBSTITUTES a constant for
+  the whole emission while the impulse is live and never sees the sub-step
+  mean, so the emitted accelerations are bit-identical at one sub-step or
+  eight. Only the emission INTERVAL changes -- and PX4 integrates each sample
+  over the wall interval between arrivals, so the clamp stretched the impulse's
+  wall span by the loop's lateness ratio: 40 emissions at the recorded 2935 us
+  incident cadence span 117.4 ms of wall against 100 ms of declared impulse,
+  handing the EKF 1.174x the velocity the ground actually removed. That is the
+  same over-integration mechanism and the same magnitude as the injury this
+  release repairs, injected at touchdown.
+
+  `ChannelPressure` and `SimulationLoop::channel_pressure()` are deleted with
+  them; `Timebase::plan` now takes wall time and nothing else. Backpressure is
+  still reported -- `sensor_drops` and `channel_full_secs` are in every gap and
+  fault line.
+
+- **`--tick-rate` has an upper bound of 1000 Hz.** Only the lower end was
+  validated. The catch-up budget is derived as `GAP_THRESHOLD_US / step_us`, so
+  `--tick-rate 100000` -- an exact divisor of both grids, and accepted -- gave a
+  10 us step and a 2000-step allowance: one iteration running 2000 RK4
+  sub-steps and 2000 state-write-lock acquisitions. Even a plausible typo like
+  `--tick-rate 2000` bought a 40-step allowance, ~3.8 ms of physics against a
+  500 us period, which is a permanently gapping daemon rather than a rejected
+  argument. The refusal names the sub-step count the rate would buy.
+
+- **A recovery banner can no longer contradict the arming gate.** The browser
+  annunciator graded the LAST health window while `timebase_arming_gate` refuses
+  on three SESSION latches, so after a single gap the person flying was told
+  "recovered from Faulted -- loop at 400 Hz" and their very next arming was
+  still refused with "this does not clear until the daemon is restarted". A
+  session carrying any of those latches now annunciates at WARNING, names the
+  wall time it lost, and says the gate is still shut. A session that never
+  latched anything still gets the plain INFO recovery.
+
+- **The catch-up cap is derived from the step size, not from the 400 Hz
+  constant.** `MAX_CATCHUP_STEPS` (8) is exactly `GAP_THRESHOLD_US` at a
+  2500 us step and nowhere else, and it bounds the allowance from ABOVE as well
+  as below: at `--tick-rate 800` it absorbed 10 ms of a 20 ms stall and declared
+  the other 10 ms lost -- latching `session_invalid` and refusing the next
+  arming on a host that lost nothing. At 400 Hz the derived cap is the same 8
+  and nothing moves.
+
+- **Mag and baro run on a 20 000 us sim-time schedule, not `total_ticks % 8`.**
+  Their stamps already come from the sim clock, so a tick divider decouples
+  cadence from stamp under sub-stepping. Side effect worth knowing: from the
+  second update on, the grid fires one iteration earlier per 20 ms than the old
+  divider did. Cadence stays inside PX4's 300 ms voter
+  (`VehicleMagnetometer.cpp:46` / `VehicleAirData.cpp:47`) by a wide margin --
+  those were the exact alarms the FC raised on 2026-09-05, as a CONSEQUENCE of
+  the stall and not a hardware fault.
+
+- **`--sim-only` drains its own outbound MAVLink channel.** Nothing consumed
+  `sim_mav_rx` in that mode, so the bounded(512) channel filled in about 1.3 s
+  and stayed full for the rest of the run: a standing `HIL sensor channel full
+  for >2s` error every two seconds, and -- while backpressure still suppressed
+  catch-up -- the fix switched OFF in the mode most likely to be used to check
+  it, reporting 17 ms of wall time discarded over a 75 s loaded run plus a
+  CRITICAL banner in a mode that has no flight controller. Backpressure no
+  longer suppresses anything (see below), so the drain now buys the quiet log
+  rather than the correct pacing; it is kept because a permanently full
+  outbound channel is a misleading thing to leave in a diagnostic mode.
+  `--selftest-timebase` already did this; now `--sim-only` does too.
+
+- **`--sim-only`'s synthetic actuator generator follows `--tick-rate`.**
+  BEHAVIOUR CHANGE for anyone already running a non-400 Hz rate. It had 2500 us
+  hardcoded in four places and ignored the flag entirely, so
+  `--sim-only --tick-rate 200` fed a 400 Hz stream into a 200 Hz loop: twice the
+  frames the loop could consume, on timestamps advancing at twice its clock. The
+  battery auto-recharge is now 3 s of wall time at whatever rate is declared,
+  rather than 1200 iterations. At the 400 Hz default nothing moves.
+
+- **`--no-realtime`** turns the thread promotion off. It exists so the claim
+  above can be A/B tested rather than believed, and as an escape hatch for
+  anyone whose other threads get starved by it.
+
+- **`VehicleMessage.timestamp_ms` is milliseconds since DAEMON start for every
+  producer**, including the PX4 `STATUSTEXT` relay, which previously stamped
+  from the current FC connection's start. This crosses the wire to the browser
+  overlay. Two epochs on one channel meant a daemon fault at t=600 s sorted
+  before a `STATUSTEXT` from a five-second-old connection.
+
+- **A `ConfigureBuild` no longer rewinds the simulation clock or launders a
+  compromised session.** `sim_time_us` is session-monotone across a
+  reconfigure, and the timebase group -- discarded time, gap count, session
+  validity, health -- survives the stats reset.
+
+### Notes
+
+- Nothing halts and nothing stops feeding sensors, ever. Cutting HIL_SENSOR to
+  a real board latches PX4's 300 ms mag/baro and 500 ms accel/gyro voters, on a
+  board this daemon deliberately leaves in HITL mode with `CAL_ACC0`/`CAL_GYRO0`
+  zeroed -- a halt would compromise the very restore path that makes the board
+  airworthy again. Regime C absorbs 20 ms (PX4's own `imu_max_dt`, i.e.
+  `2 x EKF2_PREDICT_US`), declares the rest lost, and says so loudly.
+- Crate versions in this release: `hitl-daemon` 0.24.0, `protocol` 0.3.0,
+  `simulation` 0.5.0, `websocket` 0.3.1, `rtsched` 0.1.0 (new). `terrain`
+  (0.6.1) and `mavlink-io` (0.1.0) are untouched, and so are `hitl-physics`
+  (0.13.1) and `hitl-sensors` (0.3.0) — the sub-stepping change deliberately
+  needs nothing from either, so the zero-I/O WASM boundary does not move.
+
 ## [0.23.3]
 
 ### Changed
