@@ -1,0 +1,36 @@
+[package]
+name = "rtsched"
+version = "0.1.0"
+edition = "2021"
+description = "Scheduling-class promotion for the HITL simulation thread"
+license = "MIT"
+
+# Raw platform FFI only. `libc` 0.2.184 and `windows-sys` 0.61.2 are both
+# already resolved nodes in this workspace's `Cargo.lock` (libc via
+# tokio/mio/serialport, windows-sys via spin_sleep), so this crate adds ZERO
+# packages to the build.
+#
+# `Win32_Foundation` and `Win32_System_Threading` are ones spin_sleep already
+# enables. `Win32_System_WindowsProgramming` is the ONE feature this crate adds,
+# and it buys exactly one constant: `THREAD_PRIORITY_ERROR_RETURN`, which
+# Windows puts in a different header from the priority values it is compared
+# against. Hand-writing that literal instead is what produced the bug this
+# feature exists to make unrepeatable — the sentinel is MAXLONG (2147483647),
+# not the `i32::MIN` a reader guesses, so the failed-read guard silently never
+# fired and every failed `GetThreadPriority` reported a REVOKED real-time
+# contract. windows-sys is bindings-only, so the added feature compiles a
+# constants module and links nothing.
+#
+# `thread-priority` was considered and rejected: it carries no macOS QoS or
+# time-constraint code at all, which is the only platform this incident
+# happened on. `core_affinity` / `affinity` were rejected because mach affinity
+# tags are an x86-era facility arm64 does not honour.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+] }
