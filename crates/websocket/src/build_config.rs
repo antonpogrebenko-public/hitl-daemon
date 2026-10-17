@@ -98,6 +98,58 @@ struct LastVerifiedParams {
 const BATTERY_FIT_MIN_MAH: f64 = 1100.0;
 const BATTERY_FIT_MAX_MAH: f64 = 4500.0;
 
+/// Which current-limit inputs were read from the component catalogue rather
+/// than defaulted or derived.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct LimitProvenance {
+    pub c_rating_from_spec: bool,
+    pub esc_continuous_from_spec: bool,
+    pub esc_burst_from_spec: bool,
+}
+
+/// The current limits the physics applies, with the ones that are estimates
+/// named. Mirrors the `AppliedConfig` fields of the same names.
+#[derive(Debug, Clone)]
+pub(crate) struct CurrentLimits {
+    pub battery_c_rating: f64,
+    pub battery_max_current_a: f64,
+    pub esc_continuous_current_a: f64,
+    pub esc_burst_current_a: f64,
+    pub max_current_per_motor_a: f64,
+    pub estimated_limits: Vec<String>,
+}
+
+/// Read the limits from the same spec and physics `to_physics_config()`
+/// produced, so the reported figures are the ones the simulation enforces.
+pub(crate) fn current_limits(
+    spec: &BuildSpec,
+    physics: &PhysicsConfig,
+    prov: LimitProvenance,
+) -> CurrentLimits {
+    let mut estimated_limits = Vec::new();
+    if !prov.c_rating_from_spec {
+        estimated_limits.push("battery_c_rating".to_string());
+        estimated_limits.push("battery_max_current_a".to_string());
+    }
+    if !prov.esc_continuous_from_spec {
+        estimated_limits.push("esc_continuous_current_a".to_string());
+    }
+    if !prov.esc_burst_from_spec {
+        estimated_limits.push("esc_burst_current_a".to_string());
+    }
+    if !estimated_limits.is_empty() {
+        estimated_limits.push("max_current_per_motor_a".to_string());
+    }
+    CurrentLimits {
+        battery_c_rating: spec.battery.c_rating,
+        battery_max_current_a: spec.battery.capacity_mah / 1000.0 * spec.battery.c_rating,
+        esc_continuous_current_a: physics.esc.continuous_amps,
+        esc_burst_current_a: physics.esc.burst_amps,
+        max_current_per_motor_a: physics.max_current_per_motor_a,
+        estimated_limits,
+    }
+}
+
 impl BuildConfigHandler {
     pub fn new(
         config_tx: Sender<(PhysicsConfig, BatteryConfig, hitl_sensors::SensorsConfig)>,
@@ -372,6 +424,8 @@ impl BuildConfigHandler {
         // Components whose mass this build could not measure. Reported to the
         // user so an estimate is never presented as a specification.
         let mut estimated_masses: Vec<String> = Vec::new();
+        // Which current limits came from the catalogue, for the same reason.
+        let mut limit_prov = LimitProvenance::default();
 
         match prop_weight_g {
             Some(w) => spec.propellers.weight_g = Some(w),
@@ -421,9 +475,11 @@ impl BuildConfigHandler {
                         specs.get("continuousCurrentA").and_then(|v| v.as_f64())
                     {
                         spec.escs.continuous_amps = continuous;
+                        limit_prov.esc_continuous_from_spec = true;
                     }
                     if let Some(burst) = specs.get("burstCurrentA").and_then(|v| v.as_f64()) {
                         spec.escs.burst_amps = Some(burst);
+                        limit_prov.esc_burst_from_spec = true;
                     }
                     if let Some(weight) = specs.get("weightG").and_then(|v| v.as_f64()) {
                         spec.escs.weight_g = Some(weight);
@@ -489,6 +545,7 @@ impl BuildConfigHandler {
                         .filter(|c| *c > 0.0)
                     {
                         spec.battery.c_rating = c;
+                        limit_prov.c_rating_from_spec = true;
                     }
                     info!(
                         slug = %battery_slug,
@@ -680,6 +737,7 @@ impl BuildConfigHandler {
         // is None and verified_params is 0 because acks haven't returned yet.
         // The sim loop has NOT been touched, so the user's current flight (if
         // any) keeps running on the previous config.
+        let limits = current_limits(&spec, &physics, limit_prov);
         let configuring_view = AppliedConfig {
             mass_kg: physics.mass_kg,
             kt: physics.kt,
@@ -697,6 +755,12 @@ impl BuildConfigHandler {
             estimated_masses: estimated_masses.clone(),
             applied_pids: None,
             verified_params: 0,
+            battery_c_rating: limits.battery_c_rating,
+            battery_max_current_a: limits.battery_max_current_a,
+            esc_continuous_current_a: limits.esc_continuous_current_a,
+            esc_burst_current_a: limits.esc_burst_current_a,
+            max_current_per_motor_a: limits.max_current_per_motor_a,
+            estimated_limits: limits.estimated_limits,
         };
         if progress_tx
             .send(OutgoingMessage::ConfigResult(ConfigResult {
@@ -1448,8 +1512,152 @@ fn build_sensors_config(
 mod tests {
     use super::*;
     use crossbeam_channel::bounded;
+    use hitl_physics::build::{BatterySpec, EscSpec};
     use hitl_physics::px4_pids::REF_PIDS;
     use mavlink::ardupilotmega::MavMessage;
+
+    /// A 1500 mAh pack and an ESC with the given ratings, plus the physics
+    /// `to_physics_config()` derives from them.
+    fn limits_spec(continuous: f64, burst: Option<f64>, c: f64) -> (BuildSpec, PhysicsConfig) {
+        let base = BuildSpec::default();
+        let spec = BuildSpec {
+            battery: BatterySpec {
+                capacity_mah: 1500.0,
+                c_rating: c,
+                ..base.battery.clone()
+            },
+            escs: EscSpec {
+                continuous_amps: continuous,
+                burst_amps: burst,
+                ..base.escs.clone()
+            },
+            ..base
+        };
+        let physics = spec.to_physics_config();
+        (spec, physics)
+    }
+
+    const ALL_FROM_SPEC: LimitProvenance = LimitProvenance {
+        c_rating_from_spec: true,
+        esc_continuous_from_spec: true,
+        esc_burst_from_spec: true,
+    };
+
+    #[test]
+    fn current_limits_from_specs() {
+        let (spec, physics) = limits_spec(50.0, Some(60.0), 100.0);
+        let l = current_limits(&spec, &physics, ALL_FROM_SPEC);
+        assert_eq!(l.battery_max_current_a, 150.0);
+        assert_eq!(
+            (l.esc_continuous_current_a, l.esc_burst_current_a),
+            (50.0, 60.0)
+        );
+        assert_eq!(l.max_current_per_motor_a, 37.5);
+        assert!(l.estimated_limits.is_empty());
+    }
+
+    #[test]
+    fn current_limits_flag_derived_burst() {
+        let (spec, physics) = limits_spec(50.0, None, 100.0);
+        let l = current_limits(
+            &spec,
+            &physics,
+            LimitProvenance {
+                esc_burst_from_spec: false,
+                ..ALL_FROM_SPEC
+            },
+        );
+        assert_eq!(l.esc_burst_current_a, 60.0);
+        assert!(l
+            .estimated_limits
+            .contains(&"esc_burst_current_a".to_string()));
+        assert!(l
+            .estimated_limits
+            .contains(&"max_current_per_motor_a".to_string()));
+    }
+
+    #[test]
+    fn current_limits_flag_default_c_rating() {
+        let (spec, physics) = limits_spec(50.0, Some(60.0), BuildSpec::default().battery.c_rating);
+        let l = current_limits(
+            &spec,
+            &physics,
+            LimitProvenance {
+                c_rating_from_spec: false,
+                ..ALL_FROM_SPEC
+            },
+        );
+        assert_eq!(l.battery_c_rating, BuildSpec::default().battery.c_rating);
+        for name in [
+            "battery_c_rating",
+            "battery_max_current_a",
+            "max_current_per_motor_a",
+        ] {
+            assert!(l.estimated_limits.contains(&name.to_string()), "{name}");
+        }
+    }
+
+    #[test]
+    fn current_limits_flag_default_esc_continuous() {
+        let (spec, physics) = limits_spec(50.0, Some(60.0), 100.0);
+        let l = current_limits(
+            &spec,
+            &physics,
+            LimitProvenance {
+                esc_continuous_from_spec: false,
+                ..ALL_FROM_SPEC
+            },
+        );
+        assert!(l
+            .estimated_limits
+            .contains(&"esc_continuous_current_a".to_string()));
+    }
+
+    #[test]
+    fn applied_config_serializes_limit_fields_and_keeps_existing() {
+        let (spec, physics) = limits_spec(50.0, Some(60.0), 100.0);
+        let limits = current_limits(&spec, &physics, ALL_FROM_SPEC);
+        let cfg = AppliedConfig {
+            mass_kg: 0.8,
+            kt: 1e-6,
+            kq: 1e-8,
+            arm_length_m: 0.1,
+            max_thrust_per_motor_g: 700.0,
+            thrust_to_weight_ratio: 3.4,
+            motor_kv: 1950.0,
+            battery_voltage: 14.8,
+            max_motor_rpm: 28_860.0,
+            estimated_flight_time_min: 7.0,
+            hover_cmd: 0.5,
+            can_hover: true,
+            hover_required: 0.54,
+            estimated_masses: vec![],
+            applied_pids: None,
+            verified_params: 15,
+            battery_c_rating: limits.battery_c_rating,
+            battery_max_current_a: limits.battery_max_current_a,
+            esc_continuous_current_a: limits.esc_continuous_current_a,
+            esc_burst_current_a: limits.esc_burst_current_a,
+            max_current_per_motor_a: limits.max_current_per_motor_a,
+            estimated_limits: limits.estimated_limits,
+        };
+        let v = serde_json::to_value(&cfg).unwrap();
+        for k in [
+            "battery_c_rating",
+            "battery_max_current_a",
+            "esc_continuous_current_a",
+            "esc_burst_current_a",
+            "max_current_per_motor_a",
+            "estimated_limits",
+            "thrust_to_weight_ratio",
+            "max_motor_rpm",
+            "hover_required",
+            "estimated_masses",
+        ] {
+            assert!(v.get(k).is_some(), "{k}");
+        }
+        assert_eq!(v["battery_max_current_a"], 150.0);
+    }
 
     /// Spawn a fake PX4 ack responder: every PARAM_SET pulled from `mav_rx`
     /// is mirrored back on `param_value_tx` as a successful ack. Optionally

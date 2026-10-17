@@ -684,6 +684,21 @@ pub struct AppliedConfig {
     /// 15 on a fresh build (12 rate PIDs + `THR_MDL_FAC` + `MPC_THR_HOVER`
     /// + `MPC_THR_MIN`).
     pub verified_params: u32,
+    /// Pack C rating the physics used.
+    pub battery_c_rating: f64,
+    /// Total pack current limit: capacity in Ah × C rating.
+    pub battery_max_current_a: f64,
+    /// ESC continuous rating, per motor.
+    pub esc_continuous_current_a: f64,
+    /// ESC burst rating, per motor.
+    pub esc_burst_current_a: f64,
+    /// Per-motor cap the physics applies: the lower of the ESC burst rating and
+    /// the pack limit shared across four motors.
+    pub max_current_per_motor_a: f64,
+    /// Which of the limit fields above did not come from the selected
+    /// components' specifications (a default, or derived), so a client never
+    /// presents an estimate as a specification.
+    pub estimated_limits: Vec<String>,
 }
 
 /// Result of a `RequestPreflightCheck` — an instant, cache-only read of the
