@@ -132,14 +132,24 @@ pub struct SimulationStateInner {
     /// MAV_TYPE_QUADROTOR (any quad airframe variant, not tied to a specific
     /// SYS_AUTOSTART id).
     pub is_quadrotor: bool,
+    /// Terminal voltage the motors saw on the last physics tick (V). Equals the
+    /// open-circuit voltage whenever no current is drawn.
+    pub battery_terminal_voltage: f64,
+    /// Total motor current on the last physics tick (A). Zero while idle or
+    /// depleted.
+    pub battery_current_a: f64,
 }
 
 impl SimulationStateInner {
     /// Create new simulation state at rest on ground
     pub fn new(config: &SimulationConfig) -> Self {
+        let battery = BatteryState::fully_charged(&config.battery);
+        let battery_terminal_voltage = battery.voltage();
         Self {
             quadrotor: QuadrotorState::default(),
-            battery: BatteryState::fully_charged(&config.battery),
+            battery,
+            battery_terminal_voltage,
+            battery_current_a: 0.0,
             sensors: Sensors::with_config(config.sensors.clone()),
             sim_time_us: 0,
             motor_commands: [0.0; 4],
@@ -157,6 +167,8 @@ impl SimulationStateInner {
     pub fn reset(&mut self, config: &SimulationConfig) {
         self.quadrotor = QuadrotorState::default();
         self.battery = BatteryState::fully_charged(&config.battery);
+        self.battery_terminal_voltage = self.battery.voltage();
+        self.battery_current_a = 0.0;
         self.sensors = Sensors::with_config(config.sensors.clone());
         // `sim_time_us` is deliberately NOT cleared. It is the session's
         // timebase, shared with the GPS rate limiter, PX4 and the browser, and
@@ -307,6 +319,21 @@ impl SimulationState {
 mod tests {
     use super::*;
     use hitl_physics::BatteryConfig;
+
+    /// The first frame after a rebuild must not carry the previous build's load.
+    #[test]
+    fn reconfigure_resets_load_fields() {
+        let state = SimulationState::new(SimulationConfig::default());
+        {
+            let mut inner = state.write();
+            inner.battery_terminal_voltage = 99.0;
+            inner.battery_current_a = 1.0;
+        }
+        state.reconfigure(SimulationConfig::default());
+        let inner = state.read();
+        assert_eq!(inner.battery_current_a, 0.0);
+        assert_eq!(inner.battery_terminal_voltage, inner.battery.voltage());
+    }
 
     /// After `reconfigure` with a different battery spec, the inner battery
     /// state must reflect the NEW capacity and cell count — not the stale ones.

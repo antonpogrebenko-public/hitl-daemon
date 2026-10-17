@@ -453,8 +453,8 @@ fn create_state_update(sim_state: &SimulationState, packets_per_sec: u16) -> Sta
         flight_mode: state.flight_mode,
         packets_per_sec,
         landed_state: state.landed_state,
-        battery_terminal_voltage: None,
-        battery_current_a: None,
+        battery_terminal_voltage: Some(state.battery_terminal_voltage as f32),
+        battery_current_a: Some(state.battery_current_a as f32),
     }
 }
 
@@ -2095,4 +2095,22 @@ async fn main() {
     }
 
     info!("HITL Daemon shutdown complete");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_state_update_includes_load_fields() {
+        let sim = SimulationState::new(SimulationConfig::default());
+        {
+            let mut s = sim.write();
+            s.battery_terminal_voltage = 14.5;
+            s.battery_current_a = 33.0;
+        }
+        let update = create_state_update(&sim, 30);
+        assert_eq!(update.battery_terminal_voltage, Some(14.5));
+        assert_eq!(update.battery_current_a, Some(33.0));
+    }
 }

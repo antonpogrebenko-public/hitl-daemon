@@ -1785,6 +1785,12 @@ impl SimulationLoop {
         let on_ground = ground_z.is_some_and(|g| state.quadrotor.position[2] >= g);
         let motors_active = state.motor_commands.iter().any(|&c| c > 0.01);
 
+        // No draw unless the discharge branch below says otherwise; a value
+        // left over from the previous tick would report load the pack no
+        // longer carries.
+        state.battery_current_a = 0.0;
+        state.battery_terminal_voltage = state.battery.voltage();
+
         if motors_active || !on_ground {
             // Convert motor commands (0-1) to angular velocities using config-aware max speed.
             // Initial pass uses nominal voltage — needed to estimate current before we know sag.
@@ -1804,6 +1810,8 @@ impl SimulationLoop {
                 let v_terminal = state
                     .battery
                     .v_terminal(current, self.config.battery.internal_resistance_ohm);
+                state.battery_current_a = current;
+                state.battery_terminal_voltage = v_terminal;
                 let voltage_ratio = if v_nominal > 0.0 {
                     (v_terminal / v_nominal).clamp(0.0, 1.0)
                 } else {
@@ -3822,5 +3830,122 @@ bdb413ebaece2bde231fe3ea0664f4400000000d5dcce44d5c78740ff1f0000";
             },
             ..SimulationConfig::default()
         }
+    }
+
+    /// Pins what the loop computes before battery-load recording existed, so
+    /// storing the load values provably changes nothing the physics produces.
+    /// Constants were recorded on the unmodified tree (commit cace1d7).
+    #[test]
+    fn step_physics_results_unchanged_by_load_recording() {
+        let (mut sim, _ch) = test_loop(SimulationConfig::default());
+        {
+            let mut state = sim.state.write();
+            state.armed = true;
+            state.quadrotor.position = [0.0, 0.0, -50.0];
+            state.motor_commands = [0.62; 4];
+        }
+        for i in 0..800u64 {
+            sim.step_physics(DT, STEP_US * (i + 1));
+        }
+        let state = sim.state.read();
+        let p = state.quadrotor.position;
+        let q = state.quadrotor.quaternion;
+        assert!(p[0].abs() < 1e-9 && p[1].abs() < 1e-9);
+        assert!(
+            (p[2] - (-39.05807247809155)).abs() < 1e-9,
+            "down = {}",
+            p[2]
+        );
+        assert!((q.w - 1.0).abs() < 1e-9);
+        assert!(q.i.abs() < 1e-9 && q.j.abs() < 1e-9 && q.k.abs() < 1e-9);
+        assert_eq!(state.battery.percent(), 99);
+    }
+
+    /// Armed, airborne, all four motors at `command`.
+    fn armed_at(command: f32) -> (SimulationLoop, TestChannels) {
+        let (sim, ch) = test_loop(SimulationConfig::default());
+        {
+            let mut state = sim.state.write();
+            state.armed = true;
+            state.quadrotor.position = [0.0, 0.0, -50.0];
+            state.motor_commands = [command; 4];
+        }
+        (sim, ch)
+    }
+
+    #[test]
+    fn step_physics_records_load_when_motors_active() {
+        let (mut sim, _ch) = armed_at(0.8);
+        sim.step_physics(DT, STEP_US);
+        let s = sim.state.read();
+        assert!(s.battery_current_a > 0.0);
+        assert!(s.battery_terminal_voltage < s.battery.voltage());
+        let r = sim.config.battery.internal_resistance_ohm;
+        let expected = s.battery.voltage() - s.battery_current_a * r;
+        assert!((expected - s.battery_terminal_voltage).abs() < 1e-9);
+    }
+
+    #[test]
+    fn step_physics_load_rises_with_throttle() {
+        let (mut lo, _a) = armed_at(0.5);
+        let (mut hi, _b) = armed_at(1.0);
+        lo.step_physics(DT, STEP_US);
+        hi.step_physics(DT, STEP_US);
+        let (lo_s, hi_s) = (lo.state.read(), hi.state.read());
+        assert!(hi_s.battery_current_a > lo_s.battery_current_a);
+        assert!(hi_s.battery_terminal_voltage < lo_s.battery_terminal_voltage);
+    }
+
+    /// A stale loaded value must not survive into an idle tick.
+    #[test]
+    fn step_physics_records_no_load_when_motors_idle() {
+        let (mut sim, _ch) = test_loop(SimulationConfig::default());
+        sim.state.write().battery_current_a = 99.0;
+        sim.step_physics(DT, STEP_US);
+        let s = sim.state.read();
+        assert_eq!(s.battery_current_a, 0.0);
+        assert_eq!(s.battery_terminal_voltage, s.battery.voltage());
+    }
+
+    #[test]
+    fn step_physics_records_no_load_when_depleted() {
+        let (mut sim, _ch) = armed_at(0.8);
+        {
+            let mut s = sim.state.write();
+            s.battery.discharge(10_000.0, 1_000.0);
+            assert!(s.battery.is_depleted());
+            s.battery_current_a = 99.0;
+        }
+        sim.step_physics(DT, STEP_US);
+        let s = sim.state.read();
+        assert_eq!(s.battery_current_a, 0.0);
+        assert_eq!(s.battery_terminal_voltage, s.battery.voltage());
+    }
+
+    #[test]
+    fn step_physics_load_values_are_finite() {
+        let base = SimulationConfig::default();
+        let config = SimulationConfig {
+            battery: BatteryConfig {
+                internal_resistance_ohm: 0.0,
+                ..base.battery.clone()
+            },
+            physics: PhysicsConfig {
+                battery_voltage: 0.0,
+                ..base.physics.clone()
+            },
+            ..base
+        };
+        let (mut sim, _ch) = test_loop(config);
+        {
+            let mut s = sim.state.write();
+            s.armed = true;
+            s.quadrotor.position = [0.0, 0.0, -50.0];
+            s.motor_commands = [0.8; 4];
+        }
+        sim.step_physics(DT, STEP_US);
+        let s = sim.state.read();
+        assert!(s.battery_current_a.is_finite());
+        assert!(s.battery_terminal_voltage.is_finite());
     }
 }
