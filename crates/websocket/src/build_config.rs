@@ -119,6 +119,43 @@ pub(crate) struct CurrentLimits {
     pub estimated_limits: Vec<String>,
 }
 
+/// Copy an ESC's catalogue ratings onto the build, recording which ones the
+/// catalogue supplied. A missing figure keeps the `BuildSpec` default, which is
+/// what the physics then enforces; provenance is what keeps that honest.
+pub(crate) fn apply_esc_catalogue(
+    spec: &mut BuildSpec,
+    specs: &serde_json::Value,
+    prov: &mut LimitProvenance,
+) {
+    if let Some(continuous) = specs.get("continuousCurrentA").and_then(|v| v.as_f64()) {
+        spec.escs.continuous_amps = continuous;
+        prov.esc_continuous_from_spec = true;
+    }
+    if let Some(burst) = specs.get("burstCurrentA").and_then(|v| v.as_f64()) {
+        spec.escs.burst_amps = Some(burst);
+        prov.esc_burst_from_spec = true;
+    }
+    if let Some(weight) = specs.get("weightG").and_then(|v| v.as_f64()) {
+        spec.escs.weight_g = Some(weight);
+    }
+}
+
+/// Copy a pack's catalogue C rating onto the build when it is a usable number.
+pub(crate) fn apply_battery_c_rating(
+    spec: &mut BuildSpec,
+    specs: &serde_json::Value,
+    prov: &mut LimitProvenance,
+) {
+    if let Some(c) = specs
+        .get("dischargeRateC")
+        .and_then(|v| v.as_f64())
+        .filter(|c| *c > 0.0)
+    {
+        spec.battery.c_rating = c;
+        prov.c_rating_from_spec = true;
+    }
+}
+
 /// Read the limits from the same spec and physics `to_physics_config()`
 /// produced, so the reported figures are the ones the simulation enforces.
 pub(crate) fn current_limits(
@@ -471,19 +508,7 @@ impl BuildConfigHandler {
         if let Some(ref esc_slug) = request.esc_slug {
             match self.fetch_component_specs(esc_slug).await {
                 Ok(specs) => {
-                    if let Some(continuous) =
-                        specs.get("continuousCurrentA").and_then(|v| v.as_f64())
-                    {
-                        spec.escs.continuous_amps = continuous;
-                        limit_prov.esc_continuous_from_spec = true;
-                    }
-                    if let Some(burst) = specs.get("burstCurrentA").and_then(|v| v.as_f64()) {
-                        spec.escs.burst_amps = Some(burst);
-                        limit_prov.esc_burst_from_spec = true;
-                    }
-                    if let Some(weight) = specs.get("weightG").and_then(|v| v.as_f64()) {
-                        spec.escs.weight_g = Some(weight);
-                    }
+                    apply_esc_catalogue(&mut spec, &specs, &mut limit_prov);
                     info!(slug = %esc_slug, continuous_amps = spec.escs.continuous_amps, "Loaded ESC specs");
                 }
                 Err(e) => {
@@ -539,14 +564,7 @@ impl BuildConfigHandler {
                     //
                     // Printed C-ratings are marketing, but the two sides have to
                     // read the same marketing.
-                    if let Some(c) = specs
-                        .get("dischargeRateC")
-                        .and_then(|v| v.as_f64())
-                        .filter(|c| *c > 0.0)
-                    {
-                        spec.battery.c_rating = c;
-                        limit_prov.c_rating_from_spec = true;
-                    }
+                    apply_battery_c_rating(&mut spec, &specs, &mut limit_prov);
                     info!(
                         slug = %battery_slug,
                         weight_g = spec.battery.weight_g,
@@ -1542,6 +1560,69 @@ mod tests {
         esc_continuous_from_spec: true,
         esc_burst_from_spec: true,
     };
+
+    /// The handler starts from `BuildSpec::default()`, whose burst rating is
+    /// set, so a catalogue entry without one keeps the default the physics
+    /// then enforces. It must be reported as that value, and flagged.
+    #[test]
+    fn esc_catalogue_without_burst_keeps_the_physics_default_and_flags_it() {
+        let mut spec = BuildSpec::default();
+        let mut prov = LimitProvenance::default();
+        apply_esc_catalogue(
+            &mut spec,
+            &serde_json::json!({ "continuousCurrentA": 50.0 }),
+            &mut prov,
+        );
+        assert_eq!(spec.escs.continuous_amps, 50.0);
+        assert_eq!(spec.escs.burst_amps, BuildSpec::default().escs.burst_amps);
+        assert!(prov.esc_continuous_from_spec && !prov.esc_burst_from_spec);
+        let physics = spec.to_physics_config();
+        let l = current_limits(&spec, &physics, prov);
+        assert_eq!(l.esc_burst_current_a, physics.esc.burst_amps);
+        assert!(l
+            .estimated_limits
+            .contains(&"esc_burst_current_a".to_string()));
+    }
+
+    #[test]
+    fn esc_catalogue_with_both_ratings_marks_both_from_spec() {
+        let mut spec = BuildSpec::default();
+        let mut prov = LimitProvenance::default();
+        apply_esc_catalogue(
+            &mut spec,
+            &serde_json::json!({ "continuousCurrentA": 50.0, "burstCurrentA": 60.0, "weightG": 12.0 }),
+            &mut prov,
+        );
+        assert_eq!(
+            (
+                spec.escs.continuous_amps,
+                spec.escs.burst_amps,
+                spec.escs.weight_g
+            ),
+            (50.0, Some(60.0), Some(12.0))
+        );
+        assert!(prov.esc_continuous_from_spec && prov.esc_burst_from_spec);
+    }
+
+    #[test]
+    fn battery_catalogue_c_rating_sets_provenance_only_when_positive() {
+        let mut spec = BuildSpec::default();
+        let mut prov = LimitProvenance::default();
+        apply_battery_c_rating(
+            &mut spec,
+            &serde_json::json!({ "dischargeRateC": 0.0 }),
+            &mut prov,
+        );
+        assert!(!prov.c_rating_from_spec);
+        assert_eq!(spec.battery.c_rating, BuildSpec::default().battery.c_rating);
+        apply_battery_c_rating(
+            &mut spec,
+            &serde_json::json!({ "dischargeRateC": 100.0 }),
+            &mut prov,
+        );
+        assert!(prov.c_rating_from_spec);
+        assert_eq!(spec.battery.c_rating, 100.0);
+    }
 
     #[test]
     fn current_limits_from_specs() {

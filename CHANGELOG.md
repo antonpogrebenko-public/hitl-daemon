@@ -5,6 +5,29 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.25.0]
+
+### Added
+
+- **The state frame carries the battery under load.** The physics loop already
+  computed the terminal voltage the motors see (`V_OCV - I*R`) and the total
+  motor current every tick, and threw both away; the browser could only show
+  open-circuit voltage, which never sags. Both are now kept on the simulation
+  state and appended to the 30 Hz state frame as `f32` LE at bytes `[87-90]`
+  (terminal voltage) and `[91-94]` (total current), making it 95 bytes. The
+  change is additive: bytes `[0-86]` are unchanged, `[77-80]` stays
+  open-circuit voltage, and readers still accept frames of at least 86 bytes.
+  A frame shorter than 95 bytes reports both values as unavailable, never 0.
+  Idle, depleted, freshly reset, reconfigured or recharged states report 0 A
+  and open-circuit voltage, so no stale load survives into a frame.
+- **`AppliedConfig` reports the current limits the physics enforces.** New
+  fields: `battery_c_rating`, `battery_max_current_a` (Ah x C),
+  `esc_continuous_current_a`, `esc_burst_current_a`, `max_current_per_motor_a`
+  (the lower of the ESC burst rating and the pack limit shared across four
+  motors), and `estimated_limits`, which names every value that did not come
+  from the selected components' catalogue entries. An ESC listed without a
+  burst rating keeps the build default the physics uses, and says so.
+
 ## [0.24.0]
 
 ### Fixed

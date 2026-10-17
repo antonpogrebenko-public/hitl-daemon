@@ -235,7 +235,7 @@ The impulse is derived from **NED** velocity and the accelerometer reads in the 
 
 - Port: 9876
 - Endpoint: `ws://localhost:9876/ws`
-- Binary protocol for telemetry (30 Hz) — includes battery voltage and percent
+- Binary protocol for telemetry (30 Hz) — includes battery open-circuit voltage and percent, plus loaded (terminal) voltage and total motor current at bytes 87-94 (95-byte frame; readers accept >= 86)
 - JSON for commands (NSH, ConfigureBuild, Recharge)
 - **Ping/pong**: 5s ping interval, 15s pong timeout — zombie connections are detected and dropped
 - `ConnectionStatus` message includes `bootloader_suspected: bool` field

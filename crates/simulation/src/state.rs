@@ -311,7 +311,12 @@ impl SimulationState {
 
     /// Recharge the battery to full
     pub fn recharge_battery(&self) {
-        self.inner.write().battery.recharge();
+        let mut inner = self.inner.write();
+        inner.battery.recharge();
+        // Until the next tick there is no draw; a loaded value from the drained
+        // pack beside the full pack's open-circuit voltage would read as sag.
+        inner.battery_terminal_voltage = inner.battery.voltage();
+        inner.battery_current_a = 0.0;
     }
 }
 
@@ -319,6 +324,24 @@ impl SimulationState {
 mod tests {
     use super::*;
     use hitl_physics::BatteryConfig;
+
+    /// A recharge between ticks must not leave the drained pack's loaded
+    /// voltage beside the full pack's open-circuit voltage: a client would read
+    /// the gap as sag.
+    #[test]
+    fn recharge_resets_load_fields() {
+        let state = SimulationState::new(SimulationConfig::default());
+        {
+            let mut inner = state.write();
+            inner.battery.discharge(10_000.0, 1_000.0);
+            inner.battery_terminal_voltage = inner.battery.voltage();
+            inner.battery_current_a = 40.0;
+        }
+        state.recharge_battery();
+        let inner = state.read();
+        assert_eq!(inner.battery_current_a, 0.0);
+        assert_eq!(inner.battery_terminal_voltage, inner.battery.voltage());
+    }
 
     /// The first frame after a rebuild must not carry the previous build's load.
     #[test]
