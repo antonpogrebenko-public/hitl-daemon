@@ -453,6 +453,8 @@ fn create_state_update(sim_state: &SimulationState, packets_per_sec: u16) -> Sta
         flight_mode: state.flight_mode,
         packets_per_sec,
         landed_state: state.landed_state,
+        battery_terminal_voltage: None,
+        battery_current_a: None,
     }
 }
 

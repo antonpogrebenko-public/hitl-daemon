@@ -17,11 +17,15 @@
 //! - `[84-85]`: packets_per_sec (u16 LE)
 //! - `[86]`: landed_state (u8, MAV_LANDED_STATE: 0=undefined, 1=on ground,
 //!   2=in air, 3=takeoff, 4=landing)
-//! - Total: 87 bytes
+//! - `[87-90]`: battery terminal voltage under load (f32 LE, V)
+//! - `[91-94]`: total motor current (f32 LE, A)
+//! - Total: 95 bytes
 //!
 //! Readers must accept frames of at least `STATE_UPDATE_MIN_SIZE` (86) bytes so
-//! a browser talking to an older daemon still parses; the missing trailing byte
-//! decodes as landed_state = 0 (undefined).
+//! a browser talking to an older daemon still parses. A field past the end of a
+//! shorter frame is unavailable: the missing landed_state byte decodes as 0
+//! (undefined), and the missing load fields decode as unknown, never as 0 V or
+//! 0 A. `[77-80]` stays open-circuit voltage; the loaded value is `[87-90]`.
 //!
 //! ## 0x02: Handshake ACK
 //! - `[0]`: 0x02 message type
@@ -84,7 +88,11 @@ pub const MSG_TYPE_TERRAIN_NEED: u8 = 0x0F;
 pub const MSG_TYPE_TERRAIN_TILES: u8 = 0x18;
 
 // State update size (current wire format)
-pub const STATE_UPDATE_SIZE: usize = 87;
+pub const STATE_UPDATE_SIZE: usize = 95;
+
+/// The frame before the battery-load fields were appended, and what is still
+/// sent for a state update that carries no load values.
+pub const STATE_UPDATE_LEGACY_SIZE: usize = 87;
 
 /// Smallest state frame a reader must still accept. Frames from daemons older
 /// than the landed_state field are 86 bytes; the absent byte decodes as 0
@@ -125,12 +133,20 @@ pub struct StateUpdate {
     pub packets_per_sec: u16,
     /// Flight controller's land detector verdict (MAV_LANDED_STATE).
     pub landed_state: u8,
+    /// Terminal voltage the motors saw on the last physics tick. `None` when
+    /// parsed from a frame that predates the field.
+    pub battery_terminal_voltage: Option<f32>,
+    /// Total motor current on the last physics tick. `None` when parsed from a
+    /// frame that predates the field.
+    pub battery_current_a: Option<f32>,
 }
 
 impl StateUpdate {
-    /// Serialize to binary format (87 bytes)
-    pub fn to_bytes(&self) -> [u8; STATE_UPDATE_SIZE] {
-        let mut buf = [0u8; STATE_UPDATE_SIZE];
+    /// Serialize to binary format: 95 bytes with both load fields, otherwise
+    /// the 87-byte legacy layout. Writing 0 for an absent value would tell the
+    /// browser the pack was under no load, so absent values are not written.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = vec![0u8; STATE_UPDATE_LEGACY_SIZE];
 
         buf[0] = MSG_TYPE_STATE_UPDATE;
         buf[1..9].copy_from_slice(&self.timestamp_us.to_le_bytes());
@@ -172,6 +188,13 @@ impl StateUpdate {
         buf[83] = self.flight_mode;
         buf[84..86].copy_from_slice(&self.packets_per_sec.to_le_bytes());
         buf[86] = self.landed_state;
+
+        if let (Some(voltage), Some(current)) =
+            (self.battery_terminal_voltage, self.battery_current_a)
+        {
+            buf.extend_from_slice(&voltage.to_le_bytes());
+            buf.extend_from_slice(&current.to_le_bytes());
+        }
 
         buf
     }
@@ -229,6 +252,15 @@ impl StateUpdate {
         // Absent on pre-landed_state daemons; 0 is MAV_LANDED_STATE_UNDEFINED,
         // which is exactly the right meaning for "this daemon cannot tell us".
         let landed_state = data.get(86).copied().unwrap_or(0);
+        // Absent on daemons that predate the battery-load fields: unknown, not 0.
+        let (battery_terminal_voltage, battery_current_a) = if data.len() >= STATE_UPDATE_SIZE {
+            (
+                Some(f32::from_le_bytes(data[87..91].try_into().unwrap())),
+                Some(f32::from_le_bytes(data[91..95].try_into().unwrap())),
+            )
+        } else {
+            (None, None)
+        };
 
         Ok(Self {
             timestamp_us,
@@ -243,6 +275,8 @@ impl StateUpdate {
             flight_mode,
             packets_per_sec,
             landed_state,
+            battery_terminal_voltage,
+            battery_current_a,
         })
     }
 }
@@ -1504,7 +1538,7 @@ pub enum OutgoingMessage {
 impl OutgoingMessage {
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
-            OutgoingMessage::StateUpdate(s) => s.to_bytes().to_vec(),
+            OutgoingMessage::StateUpdate(s) => s.to_bytes(),
             OutgoingMessage::HandshakeAck(h) => h.to_bytes(),
             OutgoingMessage::CommandAck(c) => c.to_bytes(),
             OutgoingMessage::NshResponse(n) => n.to_bytes(),
@@ -1609,6 +1643,95 @@ mod tests {
     }
 
     #[test]
+    fn state_update_roundtrip_carries_load_fields() {
+        let state = StateUpdate {
+            battery_terminal_voltage: Some(15.125),
+            battery_current_a: Some(42.5),
+            landed_state: 2,
+            battery_voltage: 16.2,
+            ..Default::default()
+        };
+        let bytes = state.to_bytes();
+        assert_eq!(bytes.len(), STATE_UPDATE_SIZE);
+        assert_eq!(&bytes[87..91], &15.125f32.to_le_bytes());
+        assert_eq!(&bytes[91..95], &42.5f32.to_le_bytes());
+        assert_eq!(bytes[86], 2);
+        let parsed = StateUpdate::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed.battery_terminal_voltage, Some(15.125));
+        assert_eq!(parsed.battery_current_a, Some(42.5));
+    }
+
+    #[test]
+    fn state_update_without_load_fields_serializes_legacy_layout() {
+        let bytes = StateUpdate {
+            landed_state: 4,
+            ..Default::default()
+        }
+        .to_bytes();
+        assert_eq!(bytes.len(), STATE_UPDATE_LEGACY_SIZE);
+        assert_eq!(bytes[86], 4);
+    }
+
+    /// Unavailable, not zero: a reader that sees 0 A would report a battery
+    /// under no load, which is a claim the old frame never made.
+    #[test]
+    fn state_update_parses_legacy_frames_without_load() {
+        let full = StateUpdate {
+            battery_terminal_voltage: Some(14.0),
+            battery_current_a: Some(10.0),
+            ..Default::default()
+        }
+        .to_bytes();
+        for len in [STATE_UPDATE_MIN_SIZE, STATE_UPDATE_LEGACY_SIZE] {
+            let parsed = StateUpdate::from_bytes(&full[..len]).unwrap();
+            assert_eq!(parsed.battery_terminal_voltage, None, "len {len}");
+            assert_eq!(parsed.battery_current_a, None, "len {len}");
+        }
+    }
+
+    #[test]
+    fn state_update_old_reader_offsets_unchanged() {
+        let state = StateUpdate {
+            timestamp_us: 7,
+            motor_rpms: [1.0, 2.0, 3.0, 4.0],
+            battery_voltage: 16.2,
+            battery_percent: 80,
+            armed: true,
+            flight_mode: 3,
+            packets_per_sec: 30,
+            landed_state: 2,
+            battery_terminal_voltage: Some(15.0),
+            battery_current_a: Some(30.0),
+            ..Default::default()
+        };
+        let bytes = state.to_bytes();
+        let old = StateUpdate::from_bytes(&bytes[..STATE_UPDATE_LEGACY_SIZE]).unwrap();
+        assert_eq!(
+            (
+                old.timestamp_us,
+                old.motor_rpms,
+                old.battery_percent,
+                old.armed,
+                old.flight_mode,
+                old.packets_per_sec,
+                old.landed_state
+            ),
+            (7, [1.0, 2.0, 3.0, 4.0], 80, true, 3, 30, 2)
+        );
+        assert!((old.battery_voltage - 16.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn outgoing_state_message_is_95_bytes() {
+        let msg = OutgoingMessage::StateUpdate(StateUpdate {
+            battery_terminal_voltage: Some(1.0),
+            battery_current_a: Some(2.0),
+            ..Default::default()
+        });
+        assert_eq!(msg.to_bytes().len(), STATE_UPDATE_SIZE);
+    }
+
+    #[test]
     fn test_state_update_roundtrip() {
         let state = StateUpdate {
             timestamp_us: 1234567890,
@@ -1623,6 +1746,8 @@ mod tests {
             flight_mode: 3,
             packets_per_sec: 349,
             landed_state: 2, // MAV_LANDED_STATE_IN_AIR
+            battery_terminal_voltage: Some(15.8),
+            battery_current_a: Some(12.0),
         };
 
         let bytes = state.to_bytes();
@@ -1643,6 +1768,11 @@ mod tests {
         assert_eq!(parsed.flight_mode, state.flight_mode);
         assert_eq!(parsed.landed_state, state.landed_state);
         assert_eq!(parsed.packets_per_sec, state.packets_per_sec);
+        assert_eq!(
+            parsed.battery_terminal_voltage,
+            state.battery_terminal_voltage
+        );
+        assert_eq!(parsed.battery_current_a, state.battery_current_a);
     }
 
     #[test]
