@@ -1704,36 +1704,83 @@ mod tests {
         }
     }
 
+    /// Pins the legacy byte map from the module header with raw slices, so a
+    /// shift applied to both `to_bytes` and `from_bytes` still fails here.
     #[test]
     fn state_update_old_reader_offsets_unchanged() {
         let state = StateUpdate {
-            timestamp_us: 7,
+            timestamp_us: 0x0102_0304_0506_0708,
+            position_ned: [1.5, 2.5, 3.5],
+            velocity_ned: [4.5, 5.5, 6.5],
+            quaternion_wxyz: [0.1, 0.2, 0.3, 0.4],
+            angular_velocity: [7.5, 8.5, 9.5],
             motor_rpms: [1.0, 2.0, 3.0, 4.0],
             battery_voltage: 16.2,
             battery_percent: 80,
             armed: true,
             flight_mode: 3,
-            packets_per_sec: 30,
+            packets_per_sec: 0x1234,
             landed_state: 2,
             battery_terminal_voltage: Some(15.0),
             battery_current_a: Some(30.0),
-            ..Default::default()
         };
         let bytes = state.to_bytes();
+
+        assert_eq!(bytes[0], MSG_TYPE_STATE_UPDATE);
+        assert_eq!(&bytes[1..9], &state.timestamp_us.to_le_bytes());
+        let groups: [(usize, &[f32]); 5] = [
+            (9, &state.position_ned),
+            (21, &state.velocity_ned),
+            (33, &state.quaternion_wxyz),
+            (49, &state.angular_velocity),
+            (61, &state.motor_rpms),
+        ];
+        for (start, values) in groups {
+            for (i, v) in values.iter().enumerate() {
+                let off = start + i * 4;
+                assert_eq!(&bytes[off..off + 4], &v.to_le_bytes(), "offset {off}");
+            }
+        }
+        assert_eq!(&bytes[77..81], &16.2f32.to_le_bytes());
+        assert_eq!(bytes[81], 80);
+        assert_eq!(bytes[82], 1);
+        assert_eq!(bytes[83], 3);
+        assert_eq!(&bytes[84..86], &0x1234u16.to_le_bytes());
+        assert_eq!(bytes[86], 2);
+        assert_eq!(&bytes[87..91], &15.0f32.to_le_bytes());
+        assert_eq!(&bytes[91..95], &30.0f32.to_le_bytes());
+
         let old = StateUpdate::from_bytes(&bytes[..STATE_UPDATE_LEGACY_SIZE]).unwrap();
         assert_eq!(
             (
                 old.timestamp_us,
+                old.position_ned,
+                old.velocity_ned,
+                old.quaternion_wxyz,
+                old.angular_velocity,
                 old.motor_rpms,
+                old.battery_voltage,
                 old.battery_percent,
                 old.armed,
                 old.flight_mode,
                 old.packets_per_sec,
                 old.landed_state
             ),
-            (7, [1.0, 2.0, 3.0, 4.0], 80, true, 3, 30, 2)
+            (
+                state.timestamp_us,
+                state.position_ned,
+                state.velocity_ned,
+                state.quaternion_wxyz,
+                state.angular_velocity,
+                state.motor_rpms,
+                16.2,
+                80,
+                true,
+                3,
+                0x1234,
+                2
+            )
         );
-        assert!((old.battery_voltage - 16.2).abs() < 1e-6);
     }
 
     #[test]

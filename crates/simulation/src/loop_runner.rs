@@ -3832,9 +3832,11 @@ bdb413ebaece2bde231fe3ea0664f4400000000d5dcce44d5c78740ff1f0000";
         }
     }
 
-    /// Pins what the loop computes before battery-load recording existed, so
-    /// storing the load values provably changes nothing the physics produces.
-    /// Constants were recorded on the unmodified tree (commit cace1d7).
+    /// Pins the full hitl-physics output as recorded on cace1d7, before
+    /// battery-load recording existed. The constant encodes the whole physics
+    /// model, so it must be re-recorded whenever hitl-physics is retuned; the
+    /// tuning-independent guarantee that recorded load never feeds back into
+    /// the physics lives in `step_physics_never_reads_recorded_load_fields`.
     #[test]
     fn step_physics_results_unchanged_by_load_recording() {
         let (mut sim, _ch) = test_loop(SimulationConfig::default());
@@ -3859,6 +3861,42 @@ bdb413ebaece2bde231fe3ea0664f4400000000d5dcce44d5c78740ff1f0000";
         assert!((q.w - 1.0).abs() < 1e-9);
         assert!(q.i.abs() < 1e-9 && q.j.abs() < 1e-9 && q.k.abs() < 1e-9);
         assert_eq!(state.battery.percent(), 99);
+    }
+
+    /// Tuning-independent: whatever the physics computes, it must compute the
+    /// same thing whether the recorded load fields hold sane values or junk.
+    #[test]
+    fn step_physics_never_reads_recorded_load_fields() {
+        let commands = [0.60, 0.62, 0.64, 0.61];
+        let make = || {
+            let (sim, ch) = test_loop(SimulationConfig::default());
+            {
+                let mut state = sim.state.write();
+                state.armed = true;
+                state.quadrotor.position = [0.0, 0.0, -50.0];
+                state.motor_commands = commands;
+            }
+            (sim, ch)
+        };
+        let (mut clean, _a) = make();
+        let (mut polluted, _b) = make();
+        for i in 0..300u64 {
+            {
+                let mut state = polluted.state.write();
+                state.battery_terminal_voltage = -1234.5;
+                state.battery_current_a = 9999.0;
+            }
+            clean.step_physics(DT, STEP_US * (i + 1));
+            polluted.step_physics(DT, STEP_US * (i + 1));
+        }
+        let (a, b) = (clean.state.read(), polluted.state.read());
+        assert_eq!(a.quadrotor.position, b.quadrotor.position);
+        assert_eq!(a.quadrotor.velocity, b.quadrotor.velocity);
+        assert_eq!(a.quadrotor.quaternion, b.quadrotor.quaternion);
+        assert_eq!(a.quadrotor.angular_velocity, b.quadrotor.angular_velocity);
+        assert_eq!(a.quadrotor.motor_speeds, b.quadrotor.motor_speeds);
+        assert_eq!(a.battery.charge_remaining_as, b.battery.charge_remaining_as);
+        assert!(a.battery.charge_remaining_as < a.battery.capacity_as);
     }
 
     /// Armed, airborne, all four motors at `command`.
@@ -3896,12 +3934,18 @@ bdb413ebaece2bde231fe3ea0664f4400000000d5dcce44d5c78740ff1f0000";
         assert!(hi_s.battery_terminal_voltage < lo_s.battery_terminal_voltage);
     }
 
-    /// A stale loaded value must not survive into an idle tick.
+    /// A loaded tick must not leak into the idle tick that follows it.
     #[test]
     fn step_physics_records_no_load_when_motors_idle() {
-        let (mut sim, _ch) = test_loop(SimulationConfig::default());
-        sim.state.write().battery_current_a = 99.0;
+        let (mut sim, _ch) = armed_at(0.8);
         sim.step_physics(DT, STEP_US);
+        {
+            let s = sim.state.read();
+            assert!(s.battery_current_a > 0.0);
+            assert!(s.battery_terminal_voltage < s.battery.voltage());
+        }
+        sim.state.write().motor_commands = [0.0; 4];
+        sim.step_physics(DT, STEP_US * 2);
         let s = sim.state.read();
         assert_eq!(s.battery_current_a, 0.0);
         assert_eq!(s.battery_terminal_voltage, s.battery.voltage());

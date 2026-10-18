@@ -343,18 +343,39 @@ mod tests {
         assert_eq!(inner.battery_terminal_voltage, inner.battery.voltage());
     }
 
-    /// The first frame after a rebuild must not carry the previous build's load.
+    /// The first frame after a rebuild must not carry the previous build's load,
+    /// and the terminal voltage must match the NEW pack, not the old one.
     #[test]
     fn reconfigure_resets_load_fields() {
         let state = SimulationState::new(SimulationConfig::default());
-        {
+        let old_ocv = {
             let mut inner = state.write();
             inner.battery_terminal_voltage = 99.0;
             inner.battery_current_a = 1.0;
-        }
-        state.reconfigure(SimulationConfig::default());
+            inner.battery.voltage()
+        };
+        let default_cells = SimulationConfig::default().battery.cell_count;
+        let new_config = SimulationConfig {
+            battery: BatteryConfig {
+                cell_count: default_cells + 2,
+                ..BatteryConfig::default()
+            },
+            ..SimulationConfig::default()
+        };
+        state.reconfigure(new_config);
         let inner = state.read();
+        assert_ne!(inner.battery.voltage(), old_ocv);
         assert_eq!(inner.battery_current_a, 0.0);
+        assert_eq!(inner.battery_terminal_voltage, inner.battery.voltage());
+    }
+
+    /// A freshly built state reports no load and a terminal voltage equal to
+    /// the open-circuit voltage.
+    #[test]
+    fn new_state_starts_with_no_load() {
+        let inner = SimulationStateInner::new(&SimulationConfig::default());
+        assert_eq!(inner.battery_current_a, 0.0);
+        assert!(inner.battery.voltage() > 0.0);
         assert_eq!(inner.battery_terminal_voltage, inner.battery.voltage());
     }
 

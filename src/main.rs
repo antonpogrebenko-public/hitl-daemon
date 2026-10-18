@@ -2109,8 +2109,12 @@ mod tests {
             s.battery_terminal_voltage = 14.5;
             s.battery_current_a = 33.0;
         }
+        let ocv = sim.read().battery.voltage() as f32;
         let update = create_state_update(&sim, 30);
         assert_eq!(update.battery_terminal_voltage, Some(14.5));
         assert_eq!(update.battery_current_a, Some(33.0));
+        // `battery_voltage` stays open-circuit; the loaded value has its own field.
+        assert_eq!(update.battery_voltage, ocv);
+        assert_ne!(update.battery_voltage, 14.5);
     }
 }

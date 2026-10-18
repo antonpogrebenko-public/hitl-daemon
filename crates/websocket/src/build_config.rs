@@ -1605,6 +1605,24 @@ mod tests {
     }
 
     #[test]
+    fn esc_catalogue_without_continuous_keeps_default_and_provenance_false() {
+        let mut spec = BuildSpec::default();
+        let mut prov = LimitProvenance::default();
+        apply_esc_catalogue(
+            &mut spec,
+            &serde_json::json!({ "burstCurrentA": 60.0 }),
+            &mut prov,
+        );
+        assert!(!prov.esc_continuous_from_spec);
+        assert!(prov.esc_burst_from_spec);
+        assert_eq!(
+            spec.escs.continuous_amps,
+            BuildSpec::default().escs.continuous_amps
+        );
+        assert_eq!(spec.escs.burst_amps, Some(60.0));
+    }
+
+    #[test]
     fn battery_catalogue_c_rating_sets_provenance_only_when_positive() {
         let mut spec = BuildSpec::default();
         let mut prov = LimitProvenance::default();
@@ -1637,6 +1655,9 @@ mod tests {
         assert!(l.estimated_limits.is_empty());
     }
 
+    // The handler starts from `BuildSpec::default()` (burst `Some(55)`), so
+    // `burst_amps == None` is unreachable today; this pins `current_limits`'
+    // behaviour should that change.
     #[test]
     fn current_limits_flag_derived_burst() {
         let (spec, physics) = limits_spec(50.0, None, 100.0);
@@ -1649,12 +1670,10 @@ mod tests {
             },
         );
         assert_eq!(l.esc_burst_current_a, 60.0);
-        assert!(l
-            .estimated_limits
-            .contains(&"esc_burst_current_a".to_string()));
-        assert!(l
-            .estimated_limits
-            .contains(&"max_current_per_motor_a".to_string()));
+        assert_eq!(
+            l.estimated_limits,
+            vec!["esc_burst_current_a", "max_current_per_motor_a"]
+        );
     }
 
     #[test]
@@ -1669,13 +1688,14 @@ mod tests {
             },
         );
         assert_eq!(l.battery_c_rating, BuildSpec::default().battery.c_rating);
-        for name in [
-            "battery_c_rating",
-            "battery_max_current_a",
-            "max_current_per_motor_a",
-        ] {
-            assert!(l.estimated_limits.contains(&name.to_string()), "{name}");
-        }
+        assert_eq!(
+            l.estimated_limits,
+            vec![
+                "battery_c_rating",
+                "battery_max_current_a",
+                "max_current_per_motor_a"
+            ]
+        );
     }
 
     #[test]
@@ -1724,6 +1744,17 @@ mod tests {
         };
         let v = serde_json::to_value(&cfg).unwrap();
         for k in [
+            "mass_kg",
+            "kt",
+            "kq",
+            "arm_length_m",
+            "max_thrust_per_motor_g",
+            "motor_kv",
+            "battery_voltage",
+            "estimated_flight_time_min",
+            "hover_cmd",
+            "can_hover",
+            "verified_params",
             "battery_c_rating",
             "battery_max_current_a",
             "esc_continuous_current_a",
@@ -1738,6 +1769,115 @@ mod tests {
             assert!(v.get(k).is_some(), "{k}");
         }
         assert_eq!(v["battery_max_current_a"], 150.0);
+        // `applied_pids` is skipped while `None`; the other pre-existing keys
+        // were asserted above.
+        assert!(v.get("applied_pids").is_none());
+    }
+
+    /// Serve `{"specs": <value>}` for `GET /api/components/<slug>` from a local
+    /// port, one connection at a time. Returns the base URL.
+    async fn spawn_catalogue(components: Vec<(&'static str, serde_json::Value)>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                let slug = path.rsplit('/').next().unwrap_or("");
+                let (status, body) = match components.iter().find(|(s, _)| *s == slug) {
+                    Some((_, specs)) => ("200 OK", serde_json::json!({ "specs": specs })),
+                    None => ("404 Not Found", serde_json::json!({})),
+                };
+                let body = body.to_string();
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        base
+    }
+
+    fn catalogue_request(with_battery: bool) -> ConfigureBuild {
+        let mut v = serde_json::json!({
+            "motor_slug": "motor",
+            "prop_diameter_inches": 5.0,
+            "frame_weight_g": 300.0,
+            "battery_capacity_mah": 1500.0,
+            "esc_slug": "esc",
+        });
+        if with_battery {
+            v["battery_slug"] = serde_json::json!("pack");
+        }
+        serde_json::from_value(v).expect("valid ConfigureBuild")
+    }
+
+    async fn configure(with_battery: bool) -> AppliedConfig {
+        let base = spawn_catalogue(vec![
+            ("motor", serde_json::json!({ "kvRating": 1950.0 })),
+            (
+                "esc",
+                serde_json::json!({ "continuousCurrentA": 50.0, "burstCurrentA": 60.0 }),
+            ),
+            ("pack", serde_json::json!({ "dischargeRateC": 100.0 })),
+        ])
+        .await;
+        // Keep the receiver alive: the handler fails the build if the
+        // simulation side of the channel is gone.
+        let (config_tx, _config_rx) =
+            bounded::<(PhysicsConfig, BatteryConfig, hitl_sensors::SensorsConfig)>(4);
+        let mut handler = BuildConfigHandler::new(
+            config_tx,
+            None,
+            None,
+            None,
+            None,
+            (40.0, -105.0, 1655.0),
+            None,
+        );
+        handler.api_url = base;
+        let (tx, _rx) = mpsc::channel(16);
+        let result = handler.handle(catalogue_request(with_battery), tx).await;
+        assert!(result.success, "configure failed: {:?}", result.error);
+        result.config.expect("config on success")
+    }
+
+    /// Drives the real handler against a stub catalogue: a fully specified
+    /// build reports the catalogue's limits and flags nothing as estimated.
+    #[tokio::test]
+    async fn handler_reports_catalogue_limits_for_a_fully_specified_build() {
+        let c = configure(true).await;
+        assert_eq!(c.battery_c_rating, 100.0);
+        assert_eq!(c.battery_max_current_a, 150.0);
+        assert_eq!(c.esc_continuous_current_a, 50.0);
+        assert_eq!(c.esc_burst_current_a, 60.0);
+        assert_eq!(c.max_current_per_motor_a, 37.5);
+        assert!(c.estimated_limits.is_empty(), "{:?}", c.estimated_limits);
+    }
+
+    /// Without a battery component the C rating is the default, so the pack
+    /// limits and the per-motor cap are reported as estimates.
+    #[tokio::test]
+    async fn handler_flags_default_c_rating_when_no_battery_component() {
+        let c = configure(false).await;
+        assert_eq!(c.battery_c_rating, BuildSpec::default().battery.c_rating);
+        assert_eq!(
+            c.estimated_limits,
+            vec![
+                "battery_c_rating",
+                "battery_max_current_a",
+                "max_current_per_motor_a"
+            ]
+        );
     }
 
     /// Spawn a fake PX4 ack responder: every PARAM_SET pulled from `mav_rx`
