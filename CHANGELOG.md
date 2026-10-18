@@ -20,13 +20,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A frame shorter than 95 bytes reports both values as unavailable, never 0.
   Idle, depleted, freshly reset, reconfigured or recharged states report 0 A
   and open-circuit voltage, so no stale load survives into a frame.
-- **`AppliedConfig` reports the current limits the physics enforces.** New
-  fields: `battery_c_rating`, `battery_max_current_a` (Ah x C),
+- **`AppliedConfig` reports the build's current ratings and the per-motor cap.**
+  New fields: `battery_c_rating`, `battery_max_current_a` (Ah x C),
   `esc_continuous_current_a`, `esc_burst_current_a`, `max_current_per_motor_a`
   (the lower of the ESC burst rating and the pack limit shared across four
   motors), and `estimated_limits`, which names every value that did not come
-  from the selected components' catalogue entries. An ESC listed without a
-  burst rating keeps the build default the physics uses, and says so.
+  from the selected components' catalogue entries. Only
+  `max_current_per_motor_a` is applied by the simulation;
+  `esc_continuous_current_a` is informational, since no continuous or thermal
+  ESC limit is modelled. `max_current_per_motor_a` is listed in
+  `estimated_limits` only when the C rating or the burst rating is an estimate,
+  because those are its only inputs. An ESC listed without a burst rating keeps
+  the build default the physics uses, and says so.
 
 ## [0.24.0]
 

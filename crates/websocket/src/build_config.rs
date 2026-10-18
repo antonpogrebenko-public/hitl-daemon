@@ -107,8 +107,11 @@ pub(crate) struct LimitProvenance {
     pub esc_burst_from_spec: bool,
 }
 
-/// The current limits the physics applies, with the ones that are estimates
-/// named. Mirrors the `AppliedConfig` fields of the same names.
+/// The build's current ratings and the per-motor cap, with the ones that are
+/// estimates named. Mirrors the `AppliedConfig` fields of the same names. Only
+/// `max_current_per_motor_a` is enforced by the simulation;
+/// `esc_continuous_current_a` is informational (hitl-physics models no
+/// continuous or thermal ESC limit).
 #[derive(Debug, Clone)]
 pub(crate) struct CurrentLimits {
     pub battery_c_rating: f64,
@@ -157,7 +160,9 @@ pub(crate) fn apply_battery_c_rating(
 }
 
 /// Read the limits from the same spec and physics `to_physics_config()`
-/// produced, so the reported figures are the ones the simulation enforces.
+/// produced, so the reported figures are the build's own. Of these only
+/// `max_current_per_motor_a` is applied by the simulation; the ESC continuous
+/// rating is reported for information.
 pub(crate) fn current_limits(
     spec: &BuildSpec,
     physics: &PhysicsConfig,
