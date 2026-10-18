@@ -174,7 +174,11 @@ pub(crate) fn current_limits(
     if !prov.esc_burst_from_spec {
         estimated_limits.push("esc_burst_current_a".to_string());
     }
-    if !estimated_limits.is_empty() {
+    // hitl-physics caps each motor at `min(burst_amps, Ah * C / 4)` and never
+    // reads `continuous_amps` for it, so only the C rating and the burst rating
+    // make the cap an estimate. A derived burst has `esc_burst_from_spec ==
+    // false`, which keeps that case flagged.
+    if !prov.c_rating_from_spec || !prov.esc_burst_from_spec {
         estimated_limits.push("max_current_per_motor_a".to_string());
     }
     CurrentLimits {
@@ -1698,6 +1702,8 @@ mod tests {
         );
     }
 
+    /// The per-motor cap is `min(burst, Ah * C / 4)`, so a defaulted
+    /// continuous rating alone does not make it an estimate.
     #[test]
     fn current_limits_flag_default_esc_continuous() {
         let (spec, physics) = limits_spec(50.0, Some(60.0), 100.0);
@@ -1709,9 +1715,23 @@ mod tests {
                 ..ALL_FROM_SPEC
             },
         );
-        assert!(l
-            .estimated_limits
-            .contains(&"esc_continuous_current_a".to_string()));
+        assert_eq!(l.estimated_limits, vec!["esc_continuous_current_a"]);
+    }
+
+    #[test]
+    fn current_limits_flag_everything_when_nothing_is_from_spec() {
+        let (spec, physics) = limits_spec(50.0, Some(60.0), 100.0);
+        let l = current_limits(&spec, &physics, LimitProvenance::default());
+        assert_eq!(
+            l.estimated_limits,
+            vec![
+                "battery_c_rating",
+                "battery_max_current_a",
+                "esc_continuous_current_a",
+                "esc_burst_current_a",
+                "max_current_per_motor_a"
+            ]
+        );
     }
 
     #[test]
