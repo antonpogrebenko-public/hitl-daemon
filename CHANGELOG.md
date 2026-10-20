@@ -5,6 +5,18 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.26.0]
+
+### Added
+
+- **The state frame carries a board-stall flag.** Byte `[95]` is 1 while the
+  stall guard holds the motors at zero because the flight controller's motor
+  commands went stale, 0 otherwise, making the frame 96 bytes. When the flag is
+  sent, bytes `[87-94]` are always written, NaN for an unknown load value. The
+  change is additive: bytes `[0-94]` are unchanged and readers still accept
+  frames of at least 86 bytes; the daemon's parser reports the flag as
+  unavailable below 96 bytes.
+
 ## [0.25.0]
 
 ### Added

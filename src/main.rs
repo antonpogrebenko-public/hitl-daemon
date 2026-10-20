@@ -455,6 +455,7 @@ fn create_state_update(sim_state: &SimulationState, packets_per_sec: u16) -> Sta
         landed_state: state.landed_state,
         battery_terminal_voltage: Some(state.battery_terminal_voltage as f32),
         battery_current_a: Some(state.battery_current_a as f32),
+        board_stall: Some(state.board_stall),
     }
 }
 
@@ -2116,5 +2117,14 @@ mod tests {
         // `battery_voltage` stays open-circuit; the loaded value has its own field.
         assert_eq!(update.battery_voltage, ocv);
         assert_ne!(update.battery_voltage, 14.5);
+    }
+
+    #[test]
+    fn create_state_update_reports_the_stall_flag() {
+        let sim = SimulationState::new(SimulationConfig::default());
+        sim.write().board_stall = true;
+        let update = create_state_update(&sim, 30);
+        assert_eq!(update.board_stall, Some(true));
+        assert_eq!(update.to_bytes().len(), 96);
     }
 }

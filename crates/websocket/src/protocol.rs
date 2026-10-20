@@ -87,8 +87,12 @@ pub const MSG_TYPE_TERRAIN_NEED: u8 = 0x0F;
 /// Browser -> daemon: decoded elevation tiles for the physics to collide against.
 pub const MSG_TYPE_TERRAIN_TILES: u8 = 0x18;
 
-// State update size (current wire format)
+// State update size with the battery-load fields
 pub const STATE_UPDATE_SIZE: usize = 95;
+
+/// State update size with the board-stall flag at byte 95: the frame the
+/// daemon sends.
+pub const STATE_UPDATE_STALL_SIZE: usize = 96;
 
 /// The frame before the battery-load fields were appended, and what is still
 /// sent for a state update that carries no load values.
@@ -139,12 +143,18 @@ pub struct StateUpdate {
     /// Total motor current on the last physics tick. `None` when parsed from a
     /// frame that predates the field.
     pub battery_current_a: Option<f32>,
+    /// The stall guard is holding the motors at zero because the flight
+    /// controller's motor commands went stale; `armed` is still PX4's. `None`
+    /// when not sent, or parsed from a frame shorter than 96 bytes.
+    pub board_stall: Option<bool>,
 }
 
 impl StateUpdate {
-    /// Serialize to binary format: 95 bytes with both load fields, otherwise
-    /// the 87-byte legacy layout. Writing 0 for an absent value would tell the
-    /// browser the pack was under no load, so absent values are not written.
+    /// Serialize to binary format: 96 bytes with the board-stall flag, whose
+    /// load fields are then always written (NaN when unknown); without the
+    /// flag, 95 bytes with both load fields, otherwise the 87-byte legacy
+    /// layout. Writing 0 for an absent value would tell the browser the pack
+    /// was under no load, so an absent value is never written as 0.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = vec![0u8; STATE_UPDATE_LEGACY_SIZE];
 
@@ -189,11 +199,22 @@ impl StateUpdate {
         buf[84..86].copy_from_slice(&self.packets_per_sec.to_le_bytes());
         buf[86] = self.landed_state;
 
-        if let (Some(voltage), Some(current)) =
-            (self.battery_terminal_voltage, self.battery_current_a)
-        {
-            buf.extend_from_slice(&voltage.to_le_bytes());
-            buf.extend_from_slice(&current.to_le_bytes());
+        match self.board_stall {
+            Some(stall) => {
+                let voltage = self.battery_terminal_voltage.unwrap_or(f32::NAN);
+                let current = self.battery_current_a.unwrap_or(f32::NAN);
+                buf.extend_from_slice(&voltage.to_le_bytes());
+                buf.extend_from_slice(&current.to_le_bytes());
+                buf.push(u8::from(stall));
+            }
+            None => {
+                if let (Some(voltage), Some(current)) =
+                    (self.battery_terminal_voltage, self.battery_current_a)
+                {
+                    buf.extend_from_slice(&voltage.to_le_bytes());
+                    buf.extend_from_slice(&current.to_le_bytes());
+                }
+            }
         }
 
         buf
@@ -261,6 +282,8 @@ impl StateUpdate {
         } else {
             (None, None)
         };
+        // Absent on daemons that predate the flag: unknown, not "no stall".
+        let board_stall = (data.len() >= STATE_UPDATE_STALL_SIZE).then(|| data[95] != 0);
 
         Ok(Self {
             timestamp_us,
@@ -277,6 +300,7 @@ impl StateUpdate {
             landed_state,
             battery_terminal_voltage,
             battery_current_a,
+            board_stall,
         })
     }
 }
@@ -1723,6 +1747,7 @@ mod tests {
             landed_state: 2,
             battery_terminal_voltage: Some(15.0),
             battery_current_a: Some(30.0),
+            board_stall: Some(true),
         };
         let bytes = state.to_bytes();
 
@@ -1749,6 +1774,8 @@ mod tests {
         assert_eq!(bytes[86], 2);
         assert_eq!(&bytes[87..91], &15.0f32.to_le_bytes());
         assert_eq!(&bytes[91..95], &30.0f32.to_le_bytes());
+        assert_eq!(bytes[95], 1);
+        assert_eq!(bytes.len(), STATE_UPDATE_STALL_SIZE);
 
         let old = StateUpdate::from_bytes(&bytes[..STATE_UPDATE_LEGACY_SIZE]).unwrap();
         assert_eq!(
@@ -1794,6 +1821,73 @@ mod tests {
     }
 
     #[test]
+    fn stall_frame_is_96_bytes_with_the_flag_at_95() {
+        let s = StateUpdate {
+            armed: true,
+            board_stall: Some(true),
+            battery_terminal_voltage: Some(15.1),
+            battery_current_a: Some(40.0),
+            ..Default::default()
+        };
+        let b = s.to_bytes();
+        assert_eq!(b.len(), STATE_UPDATE_STALL_SIZE);
+        assert_eq!(b[82], 1);
+        assert_eq!(b[95], 1);
+    }
+
+    /// NaN, not 0: a reader that sees 0 A would report a battery under no load.
+    #[test]
+    fn stall_frame_writes_unknown_load_as_nan() {
+        let b = StateUpdate {
+            board_stall: Some(false),
+            ..Default::default()
+        }
+        .to_bytes();
+        assert_eq!(b.len(), 96);
+        assert!(f32::from_le_bytes(b[87..91].try_into().unwrap()).is_nan());
+        assert!(f32::from_le_bytes(b[91..95].try_into().unwrap()).is_nan());
+        assert_eq!(b[95], 0);
+    }
+
+    #[test]
+    fn parser_reads_the_flag_only_from_96_byte_frames() {
+        let full = StateUpdate {
+            board_stall: Some(true),
+            battery_terminal_voltage: Some(15.0),
+            battery_current_a: Some(1.0),
+            ..Default::default()
+        }
+        .to_bytes();
+        let parsed = StateUpdate::from_bytes(&full).unwrap();
+        assert_eq!(parsed.board_stall, Some(true));
+        assert_eq!(parsed.battery_terminal_voltage, Some(15.0));
+        let shorter = StateUpdate::from_bytes(&full[..95]).unwrap();
+        assert_eq!(shorter.board_stall, None);
+        assert_eq!(shorter.battery_current_a, Some(1.0));
+        assert_eq!(
+            StateUpdate::from_bytes(&full[..87]).unwrap().board_stall,
+            None
+        );
+    }
+
+    #[test]
+    fn old_reader_sees_the_same_first_95_bytes() {
+        let base = StateUpdate {
+            armed: true,
+            battery_terminal_voltage: Some(15.0),
+            battery_current_a: Some(1.0),
+            ..Default::default()
+        };
+        let without = base.to_bytes();
+        let with = StateUpdate {
+            board_stall: Some(true),
+            ..base
+        }
+        .to_bytes();
+        assert_eq!(&with[..95], &without[..95]);
+    }
+
+    #[test]
     fn test_state_update_roundtrip() {
         let state = StateUpdate {
             timestamp_us: 1234567890,
@@ -1810,10 +1904,11 @@ mod tests {
             landed_state: 2, // MAV_LANDED_STATE_IN_AIR
             battery_terminal_voltage: Some(15.8),
             battery_current_a: Some(12.0),
+            board_stall: Some(true),
         };
 
         let bytes = state.to_bytes();
-        assert_eq!(bytes.len(), STATE_UPDATE_SIZE);
+        assert_eq!(bytes.len(), STATE_UPDATE_STALL_SIZE);
         assert_eq!(bytes[0], MSG_TYPE_STATE_UPDATE);
         assert_eq!(bytes[86], 2, "landed_state must occupy the trailing byte");
 
@@ -1835,6 +1930,7 @@ mod tests {
             state.battery_terminal_voltage
         );
         assert_eq!(parsed.battery_current_a, state.battery_current_a);
+        assert_eq!(parsed.board_stall, state.board_stall);
     }
 
     #[test]
