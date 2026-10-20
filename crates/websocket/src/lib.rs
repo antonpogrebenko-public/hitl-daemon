@@ -9,8 +9,11 @@ pub mod handler;
 pub mod param_io;
 pub mod preflight;
 pub mod protocol;
+pub mod px4_ready;
 pub mod server;
 pub mod snapshot;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub use board_identity::BoardIdentity;
 pub use build_config::BuildConfigHandler;

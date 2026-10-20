@@ -841,6 +841,10 @@ async fn main() {
     let (param_value_tx, _) =
         tokio::sync::broadcast::channel::<websocket::param_io::ParamValue>(256);
 
+    // PX4's pre-arm verdict (SYS_STATUS) and latest "Preflight Fail" text,
+    // fed by every receiver task and read by the reset flow.
+    let px4_health = Arc::new(simulation::Px4HealthMonitor::new());
+
     // Create WebSocket server
     let ws_config = WebSocketServerConfig {
         port: args.websocket_port,
@@ -1354,6 +1358,7 @@ async fn main() {
         let board_identity_reconnect = board_identity.clone();
         let sim_state_reconnect = sim_state.clone();
         let param_value_tx_reconnect = param_value_tx.clone();
+        let px4_health_reconnect = px4_health.clone();
         let preferred_port = args.port.clone();
         let baud = args.baud;
         let build_config_handler_reconnect = build_config_handler_for_reconnect;
@@ -1596,6 +1601,7 @@ async fn main() {
                         let board_identity_recv = board_identity_reconnect.clone();
                         let conn_status_tx_recv = conn_status_tx_reconnect.clone();
                         let param_value_tx_recv = param_value_tx_reconnect.clone();
+                        let px4_health_recv = px4_health_reconnect.clone();
                         let port_path_recv = port_path.clone();
                         let sim_state_recv = sim_state_reconnect.clone();
                         let bootloader_suspected_recv = bootloader_suspected.clone();
@@ -1716,6 +1722,8 @@ async fn main() {
                                             let _ = param_value_tx_recv.send(parsed);
                                         }
                                     }
+
+                                    px4_health_recv.observe(&msg, tokio::time::Instant::now());
 
                                     // Process STATUSTEXT messages for vehicle messages overlay
                                     if let MavMessage::STATUSTEXT(status) = &msg {

@@ -24,3 +24,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 url = "2.5"
 crossbeam-channel = { workspace = true }
 mavlink = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

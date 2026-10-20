@@ -1,6 +1,6 @@
 [package]
 name = "simulation"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 description = "HITL simulation loop integrating physics and sensors"
 
@@ -18,5 +18,5 @@ nalgebra = { workspace = true }
 crossbeam-channel = { workspace = true }
 parking_lot = "0.12"
 spin_sleep = "1.2"
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "time"] }
 tracing = { workspace = true }

@@ -5,6 +5,15 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.27.0]
+
+### Added
+
+- **The daemon reads PX4's own verdict on whether it can arm.** It captures the
+  `SYS_STATUS` `MAV_SYS_STATUS_PREARM_CHECK` health bit and PX4's latest
+  "Preflight Fail" text, and logs every change of the bit ("PX4 pre-arm check
+  changed") with the time since the last EKF2 start.
+
 ## [0.26.0]
 
 ### Added
