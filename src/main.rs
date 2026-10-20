@@ -2197,4 +2197,12 @@ mod tests {
         assert_eq!(update.board_stall, Some(true));
         assert_eq!(update.to_bytes().len(), 96);
     }
+
+    #[test]
+    fn create_state_update_sends_a_96_byte_frame_with_the_flag_clear() {
+        let sim = SimulationState::new(SimulationConfig::default());
+        let bytes = create_state_update(&sim, 30).to_bytes();
+        assert_eq!(bytes.len(), 96);
+        assert_eq!(bytes[95], 0);
+    }
 }

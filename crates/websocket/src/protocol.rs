@@ -19,7 +19,14 @@
 //!   2=in air, 3=takeoff, 4=landing)
 //! - `[87-90]`: battery terminal voltage under load (f32 LE, V)
 //! - `[91-94]`: total motor current (f32 LE, A)
-//! - Total: 95 bytes
+//! - `[95]`: board_stall (u8 bool, 1 while the stall guard holds the motors at
+//!   zero because the FC's motor commands went stale; `armed` at `[82]` stays
+//!   PX4's)
+//! - Total: 96 bytes (95 without the flag, 87 without the load fields)
+//!
+//! The daemon always sends 96 bytes; bytes `[87-94]` are then always written,
+//! NaN when a load value is unknown. The parser reports the flag as
+//! unavailable below 96 bytes.
 //!
 //! Readers must accept frames of at least `STATE_UPDATE_MIN_SIZE` (86) bytes so
 //! a browser talking to an older daemon still parses. A field past the end of a
