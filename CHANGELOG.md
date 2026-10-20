@@ -27,6 +27,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--sim-only` it is `ready` with `px4_health: "not_applicable"`. `Rtl` (byte 4)
   is unchanged.
 
+### Changed
+
+- **ConfigureBuild is refused while PX4 is armed or while a reset or another
+  apply runs, and is never half applied.** The refusals read "Land and disarm
+  first." and "Another reset or configuration is in progress." and change
+  nothing (in `--sim-only` the armed refusal does not apply). The flight
+  location (origin, datum and terrain anchor) moves only after the PX4
+  parameters are confirmed, and not at all if PX4 was armed during the push;
+  the daemon then waits for the simulation loop to apply the build (up to 1 s)
+  before EKF2 is restarted. Any failed apply forgets the PID fingerprint, so
+  the retry writes every parameter again.
+
 ## [0.26.0]
 
 ### Added

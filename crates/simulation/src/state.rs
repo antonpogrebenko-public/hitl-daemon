@@ -3,6 +3,7 @@
 use hitl_physics::{BatteryConfig, BatteryState, PhysicsConfig, QuadrotorState};
 use hitl_sensors::{Sensors, SensorsConfig};
 use parking_lot::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use terrain::TerrainCache;
 
@@ -194,6 +195,10 @@ pub struct SimulationState {
     inner: Arc<RwLock<SimulationStateInner>>,
     /// Swappable config: written by `reconfigure`, read by all callers via `config()`.
     config: Arc<RwLock<SimulationConfig>>,
+    /// How many configs `reconfigure` has applied. ConfigureBuild reads it
+    /// before handing a build to the simulation loop and waits for it to move,
+    /// so the EKF2 restart never runs against the previous build.
+    config_generation: Arc<AtomicU64>,
 }
 
 impl SimulationState {
@@ -203,7 +208,15 @@ impl SimulationState {
         Self {
             inner: Arc::new(RwLock::new(inner)),
             config: Arc::new(RwLock::new(config)),
+            config_generation: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// The number of configs applied so far; 0 until the first `reconfigure`.
+    /// A reader that sees a new value also sees the vehicle that `reconfigure`
+    /// reset.
+    pub fn config_generation(&self) -> u64 {
+        self.config_generation.load(Ordering::Acquire)
     }
 
     /// Get read access to inner state
@@ -324,6 +337,8 @@ impl SimulationState {
         *self.config.write() = new_config;
         let cfg = self.config.read().clone();
         self.inner.write().reset(&cfg);
+        // Bumped last, so the reset vehicle is in place before anyone sees it.
+        self.config_generation.fetch_add(1, Ordering::Release);
     }
 
     /// Recharge the battery to full
@@ -556,5 +571,20 @@ mod tests {
         state.set_heartbeat_status(true, true);
         state.reset();
         assert_eq!(state.heartbeat_status(), (1, true, true));
+    }
+
+    #[test]
+    fn reconfigure_bumps_the_config_generation() {
+        let s = SimulationState::new(SimulationConfig::default());
+        assert_eq!(s.config_generation(), 0);
+        s.reconfigure(SimulationConfig::default());
+        assert_eq!(s.config_generation(), 1);
+    }
+
+    #[test]
+    fn reset_leaves_the_config_generation_alone() {
+        let s = SimulationState::new(SimulationConfig::default());
+        s.reset();
+        assert_eq!(s.config_generation(), 0);
     }
 }

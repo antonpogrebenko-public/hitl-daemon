@@ -1,4 +1,4 @@
-use crate::fc_session::FcSession;
+use crate::fc_session::{FcSession, ARMED_REFUSAL};
 use crate::handler::ValidatedNshCommand;
 use crate::param_io::ParamValue;
 use crate::protocol::{
@@ -16,7 +16,7 @@ use mavlink::ardupilotmega::{MavCmd, MavMessage, MavParamType, COMMAND_LONG_DATA
 use simulation::SimulationState;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, MutexGuard};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
@@ -34,6 +34,14 @@ pub(crate) const PARAM_RETRY_COUNT: u8 = 3;
 /// PX4 stores rate-controller gains as `float32`, so any round-trip drift is
 /// well below this bound.
 pub(crate) const PARAM_ACK_EPSILON: f32 = 1.0e-4;
+
+/// How long ConfigureBuild waits for the simulation loop to apply a build.
+/// The loop takes a new config on its next tick (2.5 ms at 400 Hz), so a
+/// second without it means the loop has stopped.
+pub(crate) const CONFIG_APPLY_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How often that wait looks at `SimulationState::config_generation`.
+const CONFIG_APPLY_POLL: Duration = Duration::from_millis(5);
 
 const DEFAULT_API_URL: &str = "https://api.th3seus.net";
 
@@ -83,6 +91,9 @@ pub struct BuildConfigHandler {
     /// works on. `None` until `with_fc_session`: the reset is then unavailable.
     fc_session: Option<Arc<FcSession>>,
     sim_state: Option<SimulationState>,
+    /// How long `handle` waits for the simulation loop to apply a build;
+    /// `CONFIG_APPLY_TIMEOUT` outside tests.
+    config_apply_timeout: Duration,
 }
 
 /// Snapshot of the parameters that were last successfully verified on PX4.
@@ -236,6 +247,7 @@ impl BuildConfigHandler {
             flight_origin,
             fc_session: None,
             sim_state: None,
+            config_apply_timeout: CONFIG_APPLY_TIMEOUT,
         }
     }
 
@@ -344,70 +356,105 @@ impl BuildConfigHandler {
         }
     }
 
-    /// Process a `ConfigureBuild` request through the two-stage lifecycle:
+    /// Whether PX4 reports the vehicle armed (see
+    /// `FcSession::px4_reports_armed`); `false` without a session.
+    fn px4_reports_armed(&self) -> bool {
+        match (&self.fc_session, &self.sim_state) {
+            (Some(session), Some(sim_state)) => session.px4_reports_armed(sim_state),
+            _ => false,
+        }
+    }
+
+    /// Process a `ConfigureBuild` request, in this order:
     ///
-    /// 1. Early validation (fetch component specs from API). Failure here
-    ///    returns a single `state: Error` ConfigResult and aborts.
-    /// 2. Compute physics + PIDs, emit `state: Configuring` via `progress_tx`
-    ///    so the UI can show progress. Each stage is named as it starts (see
-    ///    `report_stage`), so a slow step is distinguishable from a stuck one.
-    ///    The simulation has NOT been reconfigured at this point.
-    /// 3. Push PARAM_SET to PX4 and `await` matching PARAM_VALUE acks (per-
-    ///    param timeout + retry). Failure → `state: Error`, do NOT touch sim.
-    /// 4. On full ack success: deliver new physics to sim loop, restart EKF2,
-    ///    return `state: Ready`. The UI can now unlock "Continue to simulator".
+    /// 1. Refusals: while PX4 reports armed, or while a reset, another apply
+    ///    or the reconnect re-push holds the FC session. A refusal reports no
+    ///    stage and changes nothing.
+    /// 2. The session lock, held to the end, so none of those can start
+    ///    meanwhile.
+    /// 3. Fetch the component specs, then compute physics and PIDs. Each
+    ///    stage is named as it starts (see `report_stage`), so a slow step is
+    ///    distinguishable from a stuck one.
+    /// 4. Push PARAM_SET to PX4 and await matching PARAM_VALUE acks (per-param
+    ///    timeout + retry).
+    /// 5. Only with the parameters confirmed (and PX4 still disarmed) does the
+    ///    flight origin move.
+    /// 6. Hand the build to the simulation loop and wait until it has applied
+    ///    it (`SimulationState::config_generation`).
+    /// 7. Restart EKF2 and return `state: Ready`.
+    ///
+    /// A refusal or a failure returns `state: Error`. A failure before step 5
+    /// leaves the previous flight location, physics and vehicle in effect.
+    /// Every failure forgets the PID fingerprint, so the retry writes every
+    /// parameter again: PX4 may hold part of this push.
     pub async fn handle(
         &self,
         request: ConfigureBuild,
         progress_tx: mpsc::Sender<OutgoingMessage>,
     ) -> ConfigResult {
-        Self::report_stage(&progress_tx, ConfigStage::FetchingSpecs).await;
+        let _session = match self.begin_session() {
+            Ok(guard) => guard,
+            Err(refusal) => return Self::failed(refusal),
+        };
+        match self.apply(request, &progress_tx).await {
+            Ok(config) => ConfigResult {
+                state: ConfigState::Ready,
+                success: true,
+                error: None,
+                config: Some(config),
+                stage: None,
+                px4_health: None,
+            },
+            Err(e) => {
+                self.invalidate_pid_fingerprint();
+                Self::failed(e)
+            }
+        }
+    }
+
+    /// Takes the FC session for an apply, or says why the apply is refused.
+    /// `Ok(None)` without a session: there is nothing to share it with.
+    fn begin_session(&self) -> Result<Option<MutexGuard<'_, ()>>, &'static str> {
+        match (&self.fc_session, &self.sim_state) {
+            (Some(session), Some(sim_state)) => session.begin_unless_armed(sim_state).map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    /// A terminal error, logged here: the log is the only record of why an
+    /// apply failed once the tab has closed.
+    fn failed(reason: impl Into<String>) -> ConfigResult {
+        let reason = reason.into();
+        warn!(reason = %reason, "ConfigureBuild did not complete");
+        ConfigResult::failed(reason)
+    }
+
+    /// Everything after the session is taken: fetch, compute, push, move the
+    /// origin, apply to the simulation and restart EKF2. Returns the applied
+    /// config, or the error the browser is shown.
+    async fn apply(
+        &self,
+        request: ConfigureBuild,
+        progress_tx: &mpsc::Sender<OutgoingMessage>,
+    ) -> Result<AppliedConfig, String> {
+        Self::report_stage(progress_tx, ConfigStage::FetchingSpecs).await;
 
         // Resolve the origin and datum before anything else. An invalid
         // location fails the whole configuration: the caller asked to fly
         // somewhere specific and must not be flown somewhere else instead.
-        let location = match request.resolve_flight_location() {
-            Ok(loc) => loc,
-            Err(e) => {
-                return ConfigResult {
-                    state: ConfigState::Error,
-                    success: false,
-                    error: Some(e),
-                    config: None,
-                    stage: None,
-                    px4_health: None,
-                };
-            }
-        };
-        self.anchor_origin(location.lat, location.lon, request.origin_elevation_msl);
+        // The origin itself moves only once the parameters are confirmed.
+        let location = request.resolve_flight_location()?;
 
         let motor_specs = match self.fetch_motor_specs(&request.motor_slug).await {
             Ok(specs) => specs,
             Err(e) => {
                 error!(slug = %request.motor_slug, error = %e, "Failed to fetch motor specs");
-                return ConfigResult {
-                    state: ConfigState::Error,
-                    success: false,
-                    error: Some(format!("Failed to fetch motor: {e}")),
-                    config: None,
-                    stage: None,
-                    px4_health: None,
-                };
+                return Err(format!("Failed to fetch motor: {e}"));
             }
         };
 
-        let kv = match motor_specs.get("kvRating").and_then(|v| v.as_f64()) {
-            Some(kv) => kv,
-            None => {
-                return ConfigResult {
-                    state: ConfigState::Error,
-                    success: false,
-                    error: Some("Motor missing KV rating in specs".to_string()),
-                    config: None,
-                    stage: None,
-                    px4_health: None,
-                };
-            }
+        let Some(kv) = motor_specs.get("kvRating").and_then(|v| v.as_f64()) else {
+            return Err("Motor missing KV rating in specs".to_string());
         };
 
         let motor_weight_g = motor_specs
@@ -770,7 +817,7 @@ impl BuildConfigHandler {
         // MPC_THR_HOVER push is gated on `can_hover`.
         let hover_cmd = hover_required.clamp(0.1, 0.8) as f32;
 
-        Self::report_stage(&progress_tx, ConfigStage::Computing).await;
+        Self::report_stage(progress_tx, ConfigStage::Computing).await;
 
         // Phase 6: derive per-build rate-controller PIDs. Scales by inertia AND
         // by hover authority — high-TWR builds get attenuated gains to prevent
@@ -838,37 +885,30 @@ impl BuildConfigHandler {
         // Stage 2: push PIDs and await per-param PARAM_VALUE acks. Fail-closed:
         // any verification failure aborts before touching the sim loop, so the
         // user can't accidentally fly with mismatched PIDs vs. physics.
-        let (applied_pids, verified_params) = match self
+        let (applied_pids, verified_params) = self
             .push_pids_and_verify(&pids, hover_cmd, thr_min, can_hover)
             .await
-        {
-            Ok(view) => view,
-            Err(e) => {
-                error!(error = %e, "PID verification failed — aborting reconfigure");
-                return ConfigResult {
-                    state: ConfigState::Error,
-                    success: false,
-                    error: Some(format!("PID verification failed: {e}")),
-                    config: None,
-                    stage: None,
-                    px4_health: None,
-                };
-            }
-        };
+            .map_err(|e| format!("PID verification failed: {e}"))?;
+
+        // A pilot can arm from the RC while the parameters are pushed. Nothing
+        // the vehicle flies on has changed yet, so stop before anything does.
+        if self.px4_reports_armed() {
+            return Err(ARMED_REFUSAL.to_string());
+        }
+
+        // With the parameters confirmed, the flight moves to its new origin.
+        self.anchor_origin(location.lat, location.lon, request.origin_elevation_msl);
 
         // Stage 3: hand new physics to the simulation loop. Only at this point
         // is the running drone state reconfigured. PX4 already has matching
-        // PIDs; EKF2 is about to be reset to clear stale estimator state.
+        // PIDs; EKF2 is restarted below, once the loop has applied the build.
+        let generation_before = self.sim_state.as_ref().map(|s| s.config_generation());
         if let Err(e) = self.config_tx.send((physics, battery, sensors_config)) {
             error!(error = %e, "Failed to send physics config to simulation");
-            return ConfigResult {
-                state: ConfigState::Error,
-                success: false,
-                error: Some("Simulation thread unavailable".to_string()),
-                config: None,
-                stage: None,
-                px4_health: None,
-            };
+            return Err("Simulation thread unavailable".to_string());
+        }
+        if let (Some(sim_state), Some(before)) = (&self.sim_state, generation_before) {
+            wait_for_config_applied(sim_state, before, self.config_apply_timeout).await?;
         }
 
         info!(
@@ -879,24 +919,17 @@ impl BuildConfigHandler {
             "Build configured + PIDs verified"
         );
 
-        Self::report_stage(&progress_tx, ConfigStage::RestartingEkf).await;
+        Self::report_stage(progress_tx, ConfigStage::RestartingEkf).await;
 
         if let Err(e) = self.restart_ekf2_with_retry(3).await {
             error!(error = %e, "EKF2 restart failed — PIDs are applied, EKF will converge on stale state");
         }
 
-        ConfigResult {
-            state: ConfigState::Ready,
-            success: true,
-            error: None,
-            stage: None,
-            px4_health: None,
-            config: Some(AppliedConfig {
-                applied_pids,
-                verified_params,
-                ..configuring_view
-            }),
-        }
+        Ok(AppliedConfig {
+            applied_pids,
+            verified_params,
+            ..configuring_view
+        })
     }
 
     /// Push the per-build PIDs as `PARAM_SET` and verify each one with a
@@ -1317,6 +1350,36 @@ impl BuildConfigHandler {
     }
 }
 
+/// Waits until the simulation loop has applied a config handed over after
+/// `before` was read, so nothing that follows (the EKF2 restart) runs against
+/// the previous build.
+async fn wait_for_config_applied(
+    sim_state: &SimulationState,
+    before: u64,
+    timeout: Duration,
+) -> Result<(), String> {
+    let applied = async {
+        while sim_state.config_generation() == before {
+            tokio::time::sleep(CONFIG_APPLY_POLL).await;
+        }
+    };
+    tokio::time::timeout(timeout, applied).await.map_err(|_| {
+        format!(
+            "Simulation did not apply the build within {}",
+            whole_seconds_or_ms(timeout)
+        )
+    })
+}
+
+/// `1 s` for a whole number of seconds, `100 ms` otherwise.
+fn whole_seconds_or_ms(d: Duration) -> String {
+    if d.subsec_nanos() == 0 {
+        format!("{} s", d.as_secs())
+    } else {
+        format!("{} ms", d.as_millis())
+    }
+}
+
 // ============================================================================
 // Enum parsing helpers — case-insensitive string matching
 // ============================================================================
@@ -1576,6 +1639,10 @@ fn build_sensors_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{
+        catalogue_components, catalogue_request, spawn_catalogue, spawn_fake_px4_with_capture,
+        CapturedMsg,
+    };
     use crossbeam_channel::bounded;
     use hitl_physics::build::{BatterySpec, EscSpec};
     use hitl_physics::px4_pids::REF_PIDS;
@@ -1837,63 +1904,8 @@ mod tests {
         assert!(v.get("applied_pids").is_none());
     }
 
-    /// Serve `{"specs": <value>}` for `GET /api/components/<slug>` from a local
-    /// port, one connection at a time. Returns the base URL.
-    async fn spawn_catalogue(components: Vec<(&'static str, serde_json::Value)>) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = listener.accept().await else {
-                    return;
-                };
-                let mut buf = vec![0u8; 4096];
-                let n = sock.read(&mut buf).await.unwrap_or(0);
-                let head = String::from_utf8_lossy(&buf[..n]).to_string();
-                let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
-                let slug = path.rsplit('/').next().unwrap_or("");
-                let (status, body) = match components.iter().find(|(s, _)| *s == slug) {
-                    Some((_, specs)) => ("200 OK", serde_json::json!({ "specs": specs })),
-                    None => ("404 Not Found", serde_json::json!({})),
-                };
-                let body = body.to_string();
-                let resp = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = sock.write_all(resp.as_bytes()).await;
-                let _ = sock.shutdown().await;
-            }
-        });
-        base
-    }
-
-    fn catalogue_request(with_battery: bool) -> ConfigureBuild {
-        let mut v = serde_json::json!({
-            "motor_slug": "motor",
-            "prop_diameter_inches": 5.0,
-            "frame_weight_g": 300.0,
-            "battery_capacity_mah": 1500.0,
-            "esc_slug": "esc",
-        });
-        if with_battery {
-            v["battery_slug"] = serde_json::json!("pack");
-        }
-        serde_json::from_value(v).expect("valid ConfigureBuild")
-    }
-
     async fn configure(with_battery: bool) -> AppliedConfig {
-        let base = spawn_catalogue(vec![
-            ("motor", serde_json::json!({ "kvRating": 1950.0 })),
-            (
-                "esc",
-                serde_json::json!({ "continuousCurrentA": 50.0, "burstCurrentA": 60.0 }),
-            ),
-            ("pack", serde_json::json!({ "dischargeRateC": 100.0 })),
-        ])
-        .await;
+        let base = spawn_catalogue(catalogue_components(), Duration::ZERO).await;
         // Keep the receiver alive: the handler fails the build if the
         // simulation side of the channel is gone.
         let (config_tx, _config_rx) =
@@ -2001,56 +2013,6 @@ mod tests {
     /// clamped — matches the production formula).
     const REF_THR_MIN: f32 = 0.15;
 
-    /// Captured outbound MAVLink message — either a PARAM_SET (`name`, `value`)
-    /// or a COMMAND_LONG identified by command id. Tests use this to verify
-    /// the daemon pushes the right param set *and* the trailing PARAM_SAVE.
-    #[derive(Debug, Clone)]
-    enum CapturedMsg {
-        ParamSet(String, f32),
-        CommandLong(u32),
-    }
-
-    fn spawn_fake_px4_with_capture(
-        mav_rx: crossbeam_channel::Receiver<MavMessage>,
-        param_value_tx: broadcast::Sender<ParamValue>,
-    ) -> (
-        tokio::task::JoinHandle<()>,
-        std::sync::Arc<Mutex<Vec<CapturedMsg>>>,
-    ) {
-        let captured = std::sync::Arc::new(Mutex::new(Vec::<CapturedMsg>::new()));
-        let captured_clone = captured.clone();
-        let handle = tokio::task::spawn_blocking(move || {
-            while let Ok(msg) = mav_rx.recv() {
-                match msg {
-                    MavMessage::PARAM_SET(p) => {
-                        let name = std::str::from_utf8(&p.param_id)
-                            .unwrap_or("")
-                            .trim_end_matches('\0')
-                            .to_string();
-                        captured_clone
-                            .lock()
-                            .expect("capture mutex poisoned")
-                            .push(CapturedMsg::ParamSet(name.clone(), p.param_value));
-                        let _ = param_value_tx.send(ParamValue {
-                            name,
-                            value: p.param_value,
-                            param_type: p.param_type,
-                            index: 0,
-                        });
-                    }
-                    MavMessage::COMMAND_LONG(c) => {
-                        captured_clone
-                            .lock()
-                            .expect("capture mutex poisoned")
-                            .push(CapturedMsg::CommandLong(c.command as u32));
-                    }
-                    _ => {}
-                }
-            }
-        });
-        (handle, captured)
-    }
-
     #[tokio::test]
     async fn sim_only_mode_skips_verification() {
         let handler = make_handler(None, None);
@@ -2064,7 +2026,7 @@ mod tests {
     async fn happy_path_acks_all_fifteen_params() {
         let (mav_tx, mav_rx) = bounded::<MavMessage>(64);
         let (pv_tx, _) = broadcast::channel::<ParamValue>(64);
-        let (_px4, captured) = spawn_fake_px4_with_capture(mav_rx, pv_tx.clone());
+        let (_px4, captured) = spawn_fake_px4_with_capture(mav_rx, pv_tx.clone(), None);
 
         let handler = make_handler(Some(mav_tx), Some(pv_tx));
         let (view, verified) = handler
@@ -2194,7 +2156,7 @@ mod tests {
 
         let (mav_tx, mav_rx) = bounded::<MavMessage>(64);
         let (pv_tx, _) = broadcast::channel::<ParamValue>(64);
-        let (_px4, captured) = spawn_fake_px4_with_capture(mav_rx, pv_tx.clone());
+        let (_px4, captured) = spawn_fake_px4_with_capture(mav_rx, pv_tx.clone(), None);
 
         let handler = make_handler(Some(mav_tx), Some(pv_tx));
         let (_, verified) = handler
@@ -2296,7 +2258,7 @@ mod tests {
         async fn no_hover_param_is_sent_when_the_build_cannot_hover() {
             let (mav_tx, mav_rx) = bounded::<MavMessage>(64);
             let (pv_tx, _) = broadcast::channel::<ParamValue>(64);
-            let (_px4, captured) = spawn_fake_px4_with_capture(mav_rx, pv_tx.clone());
+            let (_px4, captured) = spawn_fake_px4_with_capture(mav_rx, pv_tx.clone(), None);
 
             let handler = make_handler(Some(mav_tx), Some(pv_tx));
             let (_view, verified) = handler
@@ -2329,7 +2291,7 @@ mod tests {
         async fn the_hover_param_is_sent_when_the_build_can_hover() {
             let (mav_tx, mav_rx) = bounded::<MavMessage>(64);
             let (pv_tx, _) = broadcast::channel::<ParamValue>(64);
-            let (_px4, captured) = spawn_fake_px4_with_capture(mav_rx, pv_tx.clone());
+            let (_px4, captured) = spawn_fake_px4_with_capture(mav_rx, pv_tx.clone(), None);
 
             let handler = make_handler(Some(mav_tx), Some(pv_tx));
             handler
@@ -2515,3 +2477,7 @@ mod origin_anchor_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "build_config_apply_tests.rs"]
+mod apply_tests;
