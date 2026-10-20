@@ -53,7 +53,8 @@ fn begins_a_flight(command_type: CommandType) -> bool {
         | CommandType::Rtl
         | CommandType::SetMode
         | CommandType::EmergencyStop
-        | CommandType::Recharge => false,
+        | CommandType::Recharge
+        | CommandType::ResetVehicle => false,
     }
 }
 
@@ -260,6 +261,7 @@ impl ConnectionHandler {
                             error: Some("Build configuration not available".to_string()),
                             config: None,
                             stage: None,
+                            px4_health: None,
                         };
                         return Ok(Some(OutgoingMessage::ConfigResult(result)));
                     }
@@ -1062,6 +1064,7 @@ mod tests {
             CommandType::EmergencyStop,
             CommandType::SetMode,
             CommandType::Recharge,
+            CommandType::ResetVehicle,
         ] {
             assert!(
                 !begins_a_flight(command_type),

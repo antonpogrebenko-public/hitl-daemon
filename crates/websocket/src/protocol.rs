@@ -93,6 +93,8 @@ pub const MSG_TYPE_CAPABILITIES: u8 = 0x0E;
 pub const MSG_TYPE_TERRAIN_NEED: u8 = 0x0F;
 /// Browser -> daemon: decoded elevation tiles for the physics to collide against.
 pub const MSG_TYPE_TERRAIN_TILES: u8 = 0x18;
+/// Daemon -> browser: progress and outcome of a vehicle reset.
+pub const MSG_TYPE_RESET_RESULT: u8 = 0x19;
 
 // State update size with the battery-load fields
 pub const STATE_UPDATE_SIZE: usize = 95;
@@ -614,7 +616,8 @@ pub enum ConfigState {
     /// configure screen.
     Configuring,
     /// All `PARAM_SET` messages acked by PX4 (or skipped in --sim-only). New
-    /// physics delivered to the sim loop and EKF2 restarted. Safe to fly.
+    /// physics delivered to the sim loop and EKF2 restarted, and PX4 reported
+    /// it can arm (or `px4_health` says why that was not checked). Safe to fly.
     Ready,
     /// Something failed (PX4 unreachable, ack timeout, sim channel down).
     /// Sim still runs the previous config; frontend should show the error.
@@ -643,6 +646,21 @@ pub enum ConfigStage {
     PushingParams,
     /// Restarting EKF2 so the estimator drops state from the previous build.
     RestartingEkf,
+    /// Waiting for PX4 to report it can arm after the EKF2 restart.
+    WaitingForPx4,
+}
+
+/// What the daemon learned about PX4's pre-arm state once a reconfigure or a
+/// reset finished. Only ever sent with a `ready` result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Px4HealthReport {
+    /// PX4 reported it can arm.
+    Healthy,
+    /// PX4 sent no health report in time, so readiness could not be checked.
+    Unknown,
+    /// There is no PX4 to ask (for example `--sim-only`).
+    NotApplicable,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -658,9 +676,37 @@ pub struct ConfigResult {
     /// available" rather than as an error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stage: Option<ConfigStage>,
+    /// PX4's pre-arm state; set on ready by the configure flow, absent on every
+    /// other result and on any daemon older than this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub px4_health: Option<Px4HealthReport>,
 }
 
 impl ConfigResult {
+    /// A terminal failure carrying only the message.
+    pub fn failed(error: impl Into<String>) -> Self {
+        Self {
+            state: ConfigState::Error,
+            success: false,
+            error: Some(error.into()),
+            config: None,
+            stage: None,
+            px4_health: None,
+        }
+    }
+
+    /// A terminal success: the applied config and PX4's pre-arm state.
+    pub fn ready(config: AppliedConfig, px4_health: Px4HealthReport) -> Self {
+        Self {
+            state: ConfigState::Ready,
+            success: true,
+            error: None,
+            config: Some(config),
+            stage: None,
+            px4_health: Some(px4_health),
+        }
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let json = serde_json::to_vec(self).expect("ConfigResult serialization cannot fail");
         let mut buf = Vec::with_capacity(1 + json.len());
@@ -995,6 +1041,84 @@ impl RestoreResult {
     }
 }
 
+/// Lifecycle state of a vehicle reset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResetState {
+    /// The reset is running; `stage` says which step.
+    Resetting,
+    /// The vehicle is back at its start and PX4 was restarted; `px4_health` is set.
+    Ready,
+    /// The reset was refused or failed; `error` says why.
+    Error,
+}
+
+/// Which step of a vehicle reset is running, in the order they happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResetStage {
+    /// Putting the simulated vehicle back at its start.
+    ResettingVehicle,
+    /// Restarting EKF2 so the estimator drops its old state.
+    RestartingEkf,
+    /// Waiting for PX4 to report it can arm.
+    WaitingForPx4,
+}
+
+/// ## Binary format (0x19)
+/// - `[0]`: 0x19 message type
+/// - `[1-N]`: JSON body
+///
+/// `stage` is present only while `resetting`, `error` only on `error`, and
+/// `px4_health` only on `ready`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ResetResult {
+    pub state: ResetState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<ResetStage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub px4_health: Option<Px4HealthReport>,
+}
+
+impl ResetResult {
+    pub fn resetting(stage: ResetStage) -> Self {
+        Self {
+            state: ResetState::Resetting,
+            stage: Some(stage),
+            error: None,
+            px4_health: None,
+        }
+    }
+
+    pub fn ready(px4_health: Px4HealthReport) -> Self {
+        Self {
+            state: ResetState::Ready,
+            stage: None,
+            error: None,
+            px4_health: Some(px4_health),
+        }
+    }
+
+    pub fn failed(error: impl Into<String>) -> Self {
+        Self {
+            state: ResetState::Error,
+            stage: None,
+            error: Some(error.into()),
+            px4_health: None,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let json = serde_json::to_vec(self).expect("ResetResult serialization cannot fail");
+        let mut buf = Vec::with_capacity(1 + json.len());
+        buf.push(MSG_TYPE_RESET_RESULT);
+        buf.extend_from_slice(&json);
+        buf
+    }
+}
+
 /// Lifecycle stage of an `ApplyPreflightParams` request. Mirrors
 /// `ConfigState`'s two-stage shape: the same message type carries both
 /// interim progress (`success: true`, non-terminal `state`) and the final
@@ -1195,6 +1319,7 @@ pub enum CommandType {
     SetMode = 5,
     EmergencyStop = 6,
     Recharge = 7,
+    ResetVehicle = 8,
 }
 
 impl std::fmt::Display for CommandType {
@@ -1208,6 +1333,7 @@ impl std::fmt::Display for CommandType {
             CommandType::SetMode => write!(f, "SetMode"),
             CommandType::EmergencyStop => write!(f, "EmergencyStop"),
             CommandType::Recharge => write!(f, "Recharge"),
+            CommandType::ResetVehicle => write!(f, "ResetVehicle"),
         }
     }
 }
@@ -1225,6 +1351,7 @@ impl TryFrom<u8> for CommandType {
             5 => Ok(CommandType::SetMode),
             6 => Ok(CommandType::EmergencyStop),
             7 => Ok(CommandType::Recharge),
+            8 => Ok(CommandType::ResetVehicle),
             _ => Err(ProtocolError::InvalidCommandType(value)),
         }
     }
@@ -1579,6 +1706,7 @@ pub enum OutgoingMessage {
     Capabilities(Capabilities),
     PreflightStatus(PreflightStatus),
     PreflightApplyResult(PreflightApplyResult),
+    ResetResult(ResetResult),
 }
 
 impl OutgoingMessage {
@@ -1598,6 +1726,7 @@ impl OutgoingMessage {
             OutgoingMessage::Capabilities(c) => c.to_bytes(),
             OutgoingMessage::PreflightStatus(p) => p.to_bytes(),
             OutgoingMessage::PreflightApplyResult(p) => p.to_bytes(),
+            OutgoingMessage::ResetResult(r) => r.to_bytes(),
         }
     }
 }
@@ -2786,5 +2915,124 @@ mod terrain_transport_tests {
         let mut bytes = frame(vec![coord(1, 2)]).to_bytes();
         bytes[0] = MSG_TYPE_COMMAND;
         assert!(TerrainTiles::from_bytes(&bytes).is_err());
+    }
+}
+
+#[cfg(test)]
+mod reset_protocol_tests {
+    use super::*;
+
+    fn body(r: &ResetResult) -> serde_json::Value {
+        serde_json::from_slice(&r.to_bytes()[1..]).unwrap()
+    }
+
+    #[test]
+    fn reset_vehicle_is_command_byte_8() {
+        let cmd = Command::from_bytes(&[MSG_TYPE_COMMAND, 7, 0, 0, 0, 8]).unwrap();
+        assert_eq!(cmd.command_type, CommandType::ResetVehicle);
+        assert_eq!(CommandType::ResetVehicle as u8, 8);
+        assert_eq!(CommandType::ResetVehicle.to_string(), "ResetVehicle");
+        assert_eq!(CommandType::try_from(4).unwrap(), CommandType::Rtl);
+    }
+
+    #[test]
+    fn reset_result_is_type_0x19_with_only_the_fields_its_state_uses() {
+        let r = ResetResult::resetting(ResetStage::ResettingVehicle);
+        assert_eq!(r.to_bytes()[0], 0x19);
+        assert_eq!(
+            OutgoingMessage::ResetResult(r.clone()).to_bytes()[0],
+            MSG_TYPE_RESET_RESULT
+        );
+        assert_eq!(
+            body(&r),
+            serde_json::json!({"state": "resetting", "stage": "resetting_vehicle"})
+        );
+        assert_eq!(
+            body(&ResetResult::resetting(ResetStage::RestartingEkf))["stage"],
+            "restarting_ekf"
+        );
+        assert_eq!(
+            body(&ResetResult::resetting(ResetStage::WaitingForPx4))["stage"],
+            "waiting_for_px4"
+        );
+        assert_eq!(
+            body(&ResetResult::ready(Px4HealthReport::Healthy)),
+            serde_json::json!({"state": "ready", "px4_health": "healthy"})
+        );
+        assert_eq!(
+            body(&ResetResult::failed("Land and disarm first.")),
+            serde_json::json!({"state": "error", "error": "Land and disarm first."})
+        );
+    }
+
+    #[test]
+    fn px4_health_report_serialises_to_the_literals_the_browser_matches() {
+        for (v, s) in [
+            (Px4HealthReport::Healthy, "healthy"),
+            (Px4HealthReport::Unknown, "unknown"),
+            (Px4HealthReport::NotApplicable, "not_applicable"),
+        ] {
+            assert_eq!(serde_json::to_value(v).unwrap(), s);
+        }
+    }
+
+    #[test]
+    fn config_stage_waiting_for_px4_serialises_as_snake_case() {
+        assert_eq!(
+            serde_json::to_value(ConfigStage::WaitingForPx4).unwrap(),
+            "waiting_for_px4"
+        );
+    }
+
+    #[test]
+    fn config_result_carries_px4_health_only_when_set() {
+        let failed = serde_json::to_value(ConfigResult::failed("x")).unwrap();
+        assert!(failed.get("px4_health").is_none());
+        assert_eq!(failed["state"], "error");
+        assert_eq!(failed["success"], false);
+        let ready = ConfigResult {
+            state: ConfigState::Ready,
+            success: true,
+            error: None,
+            config: None,
+            stage: None,
+            px4_health: Some(Px4HealthReport::Unknown),
+        };
+        assert_eq!(
+            serde_json::to_value(ready).unwrap()["px4_health"],
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn the_reset_result_byte_collides_with_nothing() {
+        for existing in [
+            MSG_TYPE_STATE_UPDATE,
+            MSG_TYPE_HANDSHAKE_ACK,
+            MSG_TYPE_COMMAND_ACK,
+            MSG_TYPE_NSH_RESPONSE,
+            MSG_TYPE_CONNECTION_STATUS,
+            MSG_TYPE_VEHICLE_MESSAGE,
+            MSG_TYPE_SHUTDOWN,
+            MSG_TYPE_CONFIG_RESULT,
+            MSG_TYPE_TERRAIN_ORIGIN,
+            MSG_TYPE_PREFLIGHT_STATUS,
+            MSG_TYPE_PREFLIGHT_APPLY_RESULT,
+            MSG_TYPE_SNAPSHOT_CAPTURED,
+            MSG_TYPE_RESTORE_RESULT,
+            MSG_TYPE_CAPABILITIES,
+            MSG_TYPE_TERRAIN_NEED,
+            MSG_TYPE_COMMAND,
+            MSG_TYPE_HANDSHAKE,
+            MSG_TYPE_NSH_COMMAND,
+            MSG_TYPE_CONFIGURE_BUILD,
+            MSG_TYPE_REQUEST_PREFLIGHT_CHECK,
+            MSG_TYPE_APPLY_PREFLIGHT_PARAMS,
+            MSG_TYPE_SNAPSHOT_STORED,
+            MSG_TYPE_RESTORE_SNAPSHOT,
+            MSG_TYPE_TERRAIN_TILES,
+        ] {
+            assert_ne!(MSG_TYPE_RESET_RESULT, existing);
+        }
     }
 }

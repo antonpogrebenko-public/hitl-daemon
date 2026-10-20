@@ -308,6 +308,7 @@ impl BuildConfigHandler {
                 error: None,
                 config: None,
                 stage: Some(stage),
+                px4_health: None,
             }))
             .await
             .is_err()
@@ -347,6 +348,7 @@ impl BuildConfigHandler {
                     error: Some(e),
                     config: None,
                     stage: None,
+                    px4_health: None,
                 };
             }
         };
@@ -362,6 +364,7 @@ impl BuildConfigHandler {
                     error: Some(format!("Failed to fetch motor: {e}")),
                     config: None,
                     stage: None,
+                    px4_health: None,
                 };
             }
         };
@@ -375,6 +378,7 @@ impl BuildConfigHandler {
                     error: Some("Motor missing KV rating in specs".to_string()),
                     config: None,
                     stage: None,
+                    px4_health: None,
                 };
             }
         };
@@ -796,6 +800,7 @@ impl BuildConfigHandler {
                 error: None,
                 config: Some(configuring_view.clone()),
                 stage: Some(ConfigStage::PushingParams),
+                px4_health: None,
             }))
             .await
             .is_err()
@@ -819,6 +824,7 @@ impl BuildConfigHandler {
                     error: Some(format!("PID verification failed: {e}")),
                     config: None,
                     stage: None,
+                    px4_health: None,
                 };
             }
         };
@@ -834,6 +840,7 @@ impl BuildConfigHandler {
                 error: Some("Simulation thread unavailable".to_string()),
                 config: None,
                 stage: None,
+                px4_health: None,
             };
         }
 
@@ -856,6 +863,7 @@ impl BuildConfigHandler {
             success: true,
             error: None,
             stage: None,
+            px4_health: None,
             config: Some(AppliedConfig {
                 applied_pids,
                 verified_params,
@@ -1209,6 +1217,7 @@ impl BuildConfigHandler {
                 error: None,
                 config: None,
                 stage: None,
+                px4_health: None,
             }));
 
         // Clear the fingerprint cache so push_pids_and_verify doesn't skip
@@ -1232,6 +1241,7 @@ impl BuildConfigHandler {
                         error: None,
                         config: None,
                         stage: None,
+                        px4_health: None,
                     }));
                 Ok(())
             }
@@ -1245,6 +1255,7 @@ impl BuildConfigHandler {
                         error: Some(format!("PID re-push after reconnect failed: {e}")),
                         config: None,
                         stage: None,
+                        px4_health: None,
                     }));
                 Err(e)
             }
