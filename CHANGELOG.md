@@ -25,8 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   browser's run screen read it as a landing and ended the flight mid-air,
   opening its report over the instruments. The guard still zeroes the motors,
   but now raises the board-stall flag and keeps PX4's armed state. Declaring
-  the FC connection lost (heartbeat timeout or serial error) is what reports
-  the disarm now.
+  the FC connection lost (5 s without a heartbeat, or a serial error) is what
+  reports the disarm now. A link that had heartbeats and then goes 5 s without
+  one is now declared lost too; before, only a serial error or a missing first
+  heartbeat dropped the link.
 
 ## [0.25.0]
 

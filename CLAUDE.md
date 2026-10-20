@@ -192,7 +192,7 @@ When battery SoC drops below 5%, motor commands are zeroed regardless of PX4 act
 The simulation loop uses `try_recv` on the config channel. If multiple configs are sent rapidly, only the last one applied matters (earlier ones are processed sequentially on next ticks).
 
 ### Bootloader detection
-If no HEARTBEAT is received within 5s of connecting, the daemon suspects the FC is stuck in bootloader mode. The `bootloader_suspected` atomic flag is shared between the receiver task and the connection loop. Connection is retried with a 10s backoff. The current status is broadcast to WebSocket clients via `ConnectionStatus { bootloader_suspected: bool }`.
+If no HEARTBEAT is received within 5s of connecting, the daemon suspects the FC is stuck in bootloader mode. The `bootloader_suspected` atomic flag is shared between the receiver task and the connection loop. Connection is retried with a 10s backoff. The current status is broadcast to WebSocket clients via `ConnectionStatus { bootloader_suspected: bool }`. After the first HEARTBEAT, 5 s without one means the FC is gone with the port still open: the receiver drops the link (`HeartbeatVerdict::Silent`), so the connection loop reports it and `mark_fc_lost` disarms.
 
 ### Stale actuator timeout
 `ACTUATOR_STALE_TIMEOUT` (100ms) in `loop_runner.rs`: if the simulation loop has active motors but receives no actuator commands from PX4 for 100ms, motor outputs are zeroed and `board_stall` is raised (state byte `[95]`) until the next command. Zeroing prevents runaway physics when the FC crashes or disconnects mid-flight.

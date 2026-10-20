@@ -459,6 +459,31 @@ fn create_state_update(sim_state: &SimulationState, packets_per_sec: u16) -> Sta
     }
 }
 
+/// What the receiver's heartbeat watchdog concludes about a serial link.
+#[derive(Debug, PartialEq, Eq)]
+enum HeartbeatVerdict {
+    Alive,
+    /// No HEARTBEAT since the link opened: the FC is likely in its bootloader.
+    NeverArrived,
+    /// HEARTBEATs stopped on a link that had them: the FC is gone even though
+    /// the port is still open. The stall guard keeps PX4's armed state, so this
+    /// is what lets `mark_fc_lost` report the disarm for a silent board.
+    Silent,
+}
+
+/// `since_last` is the time since the last HEARTBEAT, `None` before the first.
+fn heartbeat_verdict(
+    since_start: Duration,
+    since_last: Option<Duration>,
+    timeout: Duration,
+) -> HeartbeatVerdict {
+    match since_last {
+        None if since_start > timeout => HeartbeatVerdict::NeverArrived,
+        Some(gap) if gap > timeout => HeartbeatVerdict::Silent,
+        _ => HeartbeatVerdict::Alive,
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
@@ -1593,7 +1618,7 @@ async fn main() {
                             let mut qgc_buf: Vec<u8> = Vec::with_capacity(300);
                             info!("MAVLink receiver task started");
                             let heartbeat_timeout = Duration::from_secs(5);
-                            let mut heartbeat_received = false;
+                            let mut last_heartbeat: Option<std::time::Instant> = None;
                             let mut best_origin_source: Option<protocol::OriginSource> = None;
                             let mut last_origin_lat: f64 = 0.0;
                             let mut last_origin_lon: f64 = 0.0;
@@ -1608,7 +1633,22 @@ async fn main() {
                                 // Set the flag so the connection loop uses a long backoff (10s) to keep
                                 // the serial port free for firmware-flashing tools. Also broadcast the
                                 // status so the frontend can show "FC is booting, please wait...".
-                                if !heartbeat_received && start_time.elapsed() > heartbeat_timeout {
+                                // Heartbeats that stop after the first mean the FC is gone with the
+                                // port still open: drop the link so the connection loop reports it.
+                                let verdict = heartbeat_verdict(
+                                    start_time.elapsed(),
+                                    last_heartbeat.map(|t| t.elapsed()),
+                                    heartbeat_timeout,
+                                );
+                                if verdict == HeartbeatVerdict::Silent {
+                                    warn!(
+                                        "No heartbeat for {}s — FC connection lost",
+                                        heartbeat_timeout.as_secs()
+                                    );
+                                    mav_io_recv.signal_disconnect();
+                                    break;
+                                }
+                                if verdict == HeartbeatVerdict::NeverArrived {
                                     warn!("No heartbeat received within {}s — FC may be in bootloader mode", heartbeat_timeout.as_secs());
                                     bootloader_suspected_recv.store(true, Ordering::SeqCst);
                                     let _ = conn_status_tx_recv.send(ConnectionStatus {
@@ -1727,8 +1767,8 @@ async fn main() {
                                     }
 
                                     if let MavMessage::HEARTBEAT(hb) = &msg {
-                                        let first_heartbeat = !heartbeat_received;
-                                        heartbeat_received = true;
+                                        let first_heartbeat = last_heartbeat.is_none();
+                                        last_heartbeat = Some(std::time::Instant::now());
 
                                         // Ask for AUTOPILOT_VERSION once the link is
                                         // proven. Requesting before the first heartbeat
@@ -2120,6 +2160,33 @@ mod tests {
         // `battery_voltage` stays open-circuit; the loaded value has its own field.
         assert_eq!(update.battery_voltage, ocv);
         assert_ne!(update.battery_voltage, 14.5);
+    }
+
+    #[test]
+    fn heartbeat_watchdog_declares_a_silent_link_lost_after_the_first_heartbeat() {
+        let timeout = Duration::from_secs(5);
+        let long_ago = Duration::from_secs(60);
+        assert_eq!(
+            heartbeat_verdict(long_ago, Some(Duration::from_secs(6)), timeout),
+            HeartbeatVerdict::Silent
+        );
+        assert_eq!(
+            heartbeat_verdict(long_ago, Some(Duration::from_secs(1)), timeout),
+            HeartbeatVerdict::Alive
+        );
+    }
+
+    #[test]
+    fn heartbeat_watchdog_still_suspects_the_bootloader_before_the_first_heartbeat() {
+        let timeout = Duration::from_secs(5);
+        assert_eq!(
+            heartbeat_verdict(Duration::from_secs(6), None, timeout),
+            HeartbeatVerdict::NeverArrived
+        );
+        assert_eq!(
+            heartbeat_verdict(Duration::from_secs(4), None, timeout),
+            HeartbeatVerdict::Alive
+        );
     }
 
     #[test]
