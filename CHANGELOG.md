@@ -51,6 +51,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Both deliver every result, the terminal one included, over the connection's
   channel, so a long apply no longer trips the 15 s pong timeout and the same
   connection's other replies (console commands among them) keep flowing.
+- **Configure, reset and the PID re-push after an FC reconnect share one
+  lock.** The re-push waits for a running configure or reset before writing
+  any parameter, so their PARAM_SETs never interleave; a configure or reset
+  that arrives while another of the three runs is refused as busy.
 
 ## [0.26.0]
 

@@ -11,6 +11,7 @@ use crate::test_support::{
     FAST_TIMING,
 };
 use crossbeam_channel::{bounded, Receiver};
+use hitl_physics::px4_pids::REF_PIDS;
 use simulation::{Px4HealthMonitor, SharedOrigin, SimulationConfig};
 use terrain::TerrainCache;
 use tokio::time::Instant;
@@ -52,6 +53,9 @@ enum Px4Params {
     AcksArmingOnFirst,
     /// The MAVLink link is gone: the first PARAM_SET fails at once.
     Disconnected,
+    /// PX4 receives every PARAM_SET and acks none: a push stalls on its
+    /// per-parameter timeouts.
+    Silent,
     /// No parameter link at all (`--sim-only`): the push is skipped.
     Absent,
 }
@@ -80,6 +84,12 @@ fn px4_link(params: Px4Params, sim: &SimulationState) -> Px4Link {
         Px4Params::Absent => return (None, None, None),
         Px4Params::Disconnected => {
             let (mav_tx, _dropped) = bounded(MAV_CAPACITY);
+            return (Some(mav_tx), Some(broadcast::channel(MAV_CAPACITY).0), None);
+        }
+        Px4Params::Silent => {
+            let (mav_tx, mav_rx) = bounded::<MavMessage>(MAV_CAPACITY);
+            // Drained so every send succeeds; nothing is acked.
+            std::thread::spawn(move || while mav_rx.recv().is_ok() {});
             return (Some(mav_tx), Some(broadcast::channel(MAV_CAPACITY).0), None);
         }
         Px4Params::Acks => None,
@@ -428,4 +438,53 @@ async fn the_ekf2_restart_starts_after_the_simulation_applied_the_build() {
         *rig.log.lock().unwrap(),
         ["reconfigured", "ekf2 stop", "ekf2 start"]
     );
+}
+
+#[tokio::test]
+async fn the_repush_waits_for_a_running_apply_before_writing_parameters() {
+    let rig = rig(Px4Params::Acks, Some(ok_board), true).await;
+    rig.handler.seed_verified_params(REF_PIDS, 0.5, 0.15);
+    let mut clients = rig.handler.subscribe_system_config();
+    // Stands in for a running configure or reset.
+    let apply = rig.session.try_begin().unwrap();
+    let h = rig.handler.clone();
+    let repush = tokio::spawn(async move { h.repush_if_configured().await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        param_sets(&rig),
+        0,
+        "no PARAM_SET while the session is held"
+    );
+    assert!(
+        clients.try_recv().is_err(),
+        "nothing announced while waiting"
+    );
+    drop(apply);
+    assert!(repush.await.unwrap().is_ok());
+    assert_eq!(param_sets(&rig), 21);
+}
+
+#[tokio::test]
+async fn a_configure_or_reset_during_the_repush_is_refused_as_busy() {
+    // The re-push stalls on unanswered PARAM_SETs, holding the session.
+    let rig = rig(Px4Params::Silent, Some(ok_board), true).await;
+    rig.handler.seed_verified_params(REF_PIDS, 0.5, 0.15);
+    let h = rig.handler.clone();
+    let repush = tokio::spawn(async move { h.repush_if_configured().await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        run(&rig, request_at(B)).await.0.error.as_deref(),
+        Some("Another reset or configuration is in progress.")
+    );
+    let (tx, _rx) = mpsc::channel(PROGRESS_CAPACITY);
+    assert_eq!(
+        rig.handler.reset_vehicle(tx).await,
+        ResetResult::failed("Another reset or configuration is in progress.")
+    );
+    assert!(
+        !repush.is_finished(),
+        "the refusals came while it held the session"
+    );
+    // Its eventual failure takes 2.4 s of ack timeouts; this test is done.
+    repush.abort();
 }

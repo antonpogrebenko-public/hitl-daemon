@@ -1181,6 +1181,13 @@ impl BuildConfigHandler {
     /// Re-push the last verified PID + thrust-curve parameters to PX4 after a
     /// FC power cycle / reconnect.
     ///
+    /// It first takes the FC session and holds it to the end, so its
+    /// PARAM_SETs never interleave with a configure or a vehicle reset, and a
+    /// configure or reset requested meanwhile is refused as busy. Unlike
+    /// those, it waits for the session instead of being refused: it restores
+    /// PX4's PIDs after a power cycle and must not be lost. Restore and
+    /// provisioning stay outside the session; they are not part of this lock.
+    ///
     /// Behaviour:
     /// - If no config was ever applied during this session, returns `Ok(())`
     ///   immediately — nothing to push.
@@ -1195,7 +1202,12 @@ impl BuildConfigHandler {
     /// - Returns `Err` only if the PARAM_SET sequence fails, so the caller
     ///   can log a warning; the sim continues with whatever PX4 has loaded.
     pub async fn repush_if_configured(&self) -> Result<(), String> {
-        // Snapshot the last verified params under the lock, then release.
+        let _session = match &self.fc_session {
+            Some(session) => Some(session.begin().await),
+            None => None,
+        };
+        // Snapshot after the wait, so a configure that just finished is the
+        // one re-pushed. Taken under the cache lock, then released.
         let params = {
             self.last_verified_params
                 .lock()
