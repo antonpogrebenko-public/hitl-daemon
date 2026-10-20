@@ -11,6 +11,7 @@ Connects to a Pixhawk via USB serial, runs 400 Hz physics simulation, and:
 - Serves WebSocket for browser UI and NSH access
 - Accepts runtime build configuration (motor/prop/battery) from web UI
 - Simulates battery discharge with motor cutoff on depletion
+- Resets the vehicle to the start on request (command byte 8) and reports when PX4 can arm again
 
 ## Quick Start
 
@@ -63,6 +64,11 @@ hitl-daemon/
 - `crates/simulation/src/state.rs` — Thread-safe state (QuadrotorState + BatteryState)
 - `crates/websocket/src/handler.rs` — WebSocket message handling, NSH, recharge command
 - `crates/websocket/src/build_config.rs` — ConfigureBuild handler, physics reconfiguration
+- `crates/websocket/src/vehicle_reset.rs`: the byte-8 vehicle reset (vehicle back at its start, EKF2 restart, wait for PX4)
+- `crates/websocket/src/fc_session.rs`: the FC session lock shared by configure, reset and the re-push; the confirmed EKF2 restart
+- `crates/websocket/src/nsh_await.rs`: sends one internal NSH command and awaits its reply
+- `crates/websocket/src/px4_ready.rs`: waits until PX4 reports it can arm after an EKF2 restart
+- `crates/simulation/src/px4_health.rs`: PX4's pre-arm verdict from `SYS_STATUS` and its latest "Preflight Fail" text
 
 ## Runtime Configuration
 
@@ -80,16 +86,28 @@ The daemon accepts `ConfigureBuild` messages from the web UI via WebSocket:
 }
 ```
 
-This triggers:
-1. New `PhysicsConfig` via `from_build_specs`
-2. New `BatteryConfig`
-3. Simulation state reset (position, battery recharged)
-4. EKF2 restart via NSH (`ekf2 stop` → `ekf2 start`) — up to 3 attempts with 200ms backoff
-5. Response with applied config parameters and estimated flight time
-6. Stores `LastVerifiedParams`; if `retry_count > 0`, `repush_if_configured()` re-pushes PID params 3s after reconnect
+It runs off the WebSocket receive loop and reports each stage as a `ConfigResult` with `state: configuring`. In order:
+1. Refused, changing nothing, while PX4 reports armed ("Land and disarm first.", not in `--sim-only`) or while a reset, another apply or the reconnect re-push holds the FC session ("Another reset or configuration is in progress.")
+2. `fetching_specs`: the component specs from the catalogue
+3. `computing`: `PhysicsConfig` via `from_build_specs`, `BatteryConfig` and the PX4 PIDs
+4. `pushing_params`: `PARAM_SET` for every PID and thrust-curve parameter, each verified by its `PARAM_VALUE` ack (skipped in `--sim-only`)
+5. The flight origin, datum and terrain anchor move to the requested location, only now and only if PX4 is still disarmed
+6. The physics go to the simulation loop, and the daemon waits (up to 1 s) until the loop has applied them, which resets the vehicle (position, battery recharged)
+7. `restarting_ekf`: the confirmed EKF2 restart (see Gotchas)
+8. `waiting_for_px4`: until PX4's pre-arm check passes (up to 30 s)
+9. `state: ready` with the applied config, estimated flight time and `px4_health` (`healthy`, or `unknown` when PX4 sends no `SYS_STATUS`). In `--sim-only` steps 7 and 8 are skipped and `px4_health` is `not_applicable`.
+
+Any failure ends in `state: error` and forgets the PID fingerprint, so the retry pushes every parameter again. A success stores `LastVerifiedParams`; if `retry_count > 0`, `repush_if_configured()` re-pushes PID params 3s after reconnect.
 
 ### Recharge Command
 The web UI can send a `Recharge` command to reset battery to 100% without resetting position/attitude. Handled in the websocket handler before forwarding to FC.
+
+### Vehicle Reset Command
+Command byte 8 (`ResetVehicle`) returns the vehicle to its start: position, attitude, velocity, motors, a full battery and the stall flag are reset, while the flight location, the applied build and the simulation clock are kept. EKF2 is then restarted and the daemon waits until PX4 can arm. The command is acknowledged (`CommandAck`) before anything else and runs off the receive loop. Progress and the outcome arrive as `ResetResult` (0x19, JSON): `state: resetting` with `stage` `resetting_vehicle`, `restarting_ekf` or `waiting_for_px4`; `state: ready` with `px4_health`; or `state: error` with `error`.
+- Refused while PX4 reports armed: "Land and disarm first."; while a configure, another reset or the reconnect re-push runs: "Another reset or configuration is in progress."
+- A failed restart reads "EKF2 restart failed: <reason>"; a pre-arm check that never passes carries PX4's "Preflight Fail" text, or "PX4 did not report ready to arm within 30 s".
+- `--sim-only`: no EKF2 restart; `ready` with `px4_health: "not_applicable"`.
+- `Rtl` (byte 4) is unchanged.
 
 ## Sensor Configuration
 
@@ -179,14 +197,27 @@ Reduce GPS noise: `horizontal_noise_sigma: 0.1` (was 1.0m)
 ### NSH when daemon running
 Use `nsh --ws` mode. Direct serial mode outputs garbage when daemon holds the port.
 
-### EKF2 restart on config change
-When `ConfigureBuild` is received, the daemon automatically restarts EKF2 via NSH commands (`ekf2 stop` then `ekf2 start`) to clear stale estimator state. Up to 3 retry attempts with 200ms backoff. This causes a transient "ekf2 missing data" preflight warning that clears in ~2 seconds.
+### EKF2 restart is confirmed, then PX4 is awaited
+ConfigureBuild (once the simulation has applied the build) and the vehicle reset restart EKF2 through `FcSession::restart_ekf2`: `ekf2 stop`, then `ekf2 start`, each reply awaited for up to 3 s. Internal NSH request ids are allocated from `0xFFFF_FF10` (the preflight reboot keeps its fixed `0xFFFF_FF04`). `ekf2 stop` passes on any reply, "not running" included; `ekf2 start` fails when its reply contains "error" or "failed"; no reply, "No FC connected" or a full NSH queue fails the step, and the error reads "EKF2 restart failed: <reason>".
+
+The wait for PX4 then follows three timings. A passing `SYS_STATUS` counts only if it arrives at least 1 s after `ekf2 start` was confirmed (one sent earlier still describes the old estimator). No `SYS_STATUS` at all for 3 s means `ready` with `px4_health: unknown`. After 30 s it fails with PX4's latest "Preflight Fail" text since the restart began, or "PX4 did not report ready to arm within 30 s". The transient "ekf2 missing data" after a restart is expected; it is what this wait sits out.
+
+Log lines for the real recovery time: `EKF2 restart confirmed by PX4` (`stop_ms`, `start_ms`), `PX4 pre-arm check changed` (`can_arm`, `since_ekf2_start_ms`), then `PX4 reports ready to arm after the EKF2 restart` (`after_ms`), `PX4 did not report ready to arm` (`reason`) or `PX4 sent no SYS_STATUS after the EKF2 restart`.
+
+### PX4 pre-arm health
+`Px4HealthMonitor` (`crates/simulation/src/px4_health.rs`) keeps PX4's own verdict on whether it can arm: the `MAV_SYS_STATUS_PREARM_CHECK` bit of `SYS_STATUS.onboard_control_sensors_health`, which PX4 sets while the current mode's pre-arm checks pass (in the health field only, not in present or enabled), and the latest "Preflight Fail" `STATUSTEXT`, so a failed wait names PX4's reason. Every change of the bit is logged. Risk: on older PX4 firmware the bit may be missing or mean something else, and every reset and apply would then wait the full 30 s and fail; if QGroundControl says ready to arm while `can_arm` never turns true, switch to the estimator health bits.
+
+### FC session lock
+`FcSession` holds one lock shared by ConfigureBuild, the vehicle reset and the reconnect PID re-push, so their parameter writes, vehicle resets and EKF2 restarts never interleave. Configure and reset take it with `try_lock` and are refused as busy ("Another reset or configuration is in progress.") while it is held; the re-push waits for it instead, because it must not be lost. Restore and provisioning are outside the lock.
+
+### Sim-only armed flag
+In `--sim-only` the fake hover generator sends `FlightMode::HilArmed` and the loop copies it into `armed`, so `armed` reads true for the whole session. There is no PX4 to be armed, so `FcSession::px4_reports_armed` ignores the flag there: a sim-only configure or reset is never refused as armed.
 
 ### Flight mode from HEARTBEAT
 The daemon extracts flight mode from `HEARTBEAT.custom_mode` bits 16-23 (PX4 main mode) and updates the simulation state. The frontend displays this in real-time. Note: PX4 may reject mode changes when EKF2 has preflight failures.
 
 ### Battery depletion behavior
-When battery SoC drops below 5%, motor commands are zeroed regardless of PX4 actuator outputs. The drone will fall. Recharge via WebSocket `Recharge` command or `ConfigureBuild` (which resets the full state). In `--sim-only` mode, the battery auto-recharges after 3s of depletion (no permanent crash state).
+When battery SoC drops below 5%, motor commands are zeroed regardless of PX4 actuator outputs. The drone will fall. Recharge via WebSocket `Recharge` command, the vehicle reset (command byte 8) or `ConfigureBuild` (both reset the full state). In `--sim-only` mode, the battery auto-recharges after 3s of depletion (no permanent crash state).
 
 ### Config channel is non-blocking
 The simulation loop uses `try_recv` on the config channel. If multiple configs are sent rapidly, only the last one applied matters (earlier ones are processed sequentially on next ticks).
@@ -200,7 +231,7 @@ If no HEARTBEAT is received within 5s of connecting, the daemon suspects the FC 
 Armed is deliberately **not** cleared: a stall is not a disarm PX4 made, and the browser's run screen read the old fake disarm as a landing and ended flights mid-air. The disarm for a vanished FC comes from the reconnect task's "FC connection lost" branch (`SimulationState::mark_fc_lost`), after the heartbeat timeout or a serial error.
 
 ### Auto PID re-push after reconnect
-`BuildConfigHandler::repush_if_configured()` triggers 3s after reconnect when `retry_count > 0`. It re-sends the last `LastVerifiedParams` to PX4 so PIDs do not reset to firmware defaults on a USB reconnect.
+`BuildConfigHandler::repush_if_configured()` triggers 3s after reconnect when `retry_count > 0`. It re-sends the last `LastVerifiedParams` to PX4 so PIDs do not reset to firmware defaults on a USB reconnect. It waits for the FC session lock first, so it never interleaves with a configure or reset, and re-sends what the last successful apply verified.
 
 ### Serial link quality monitoring
 `MavlinkIo` tracks `parse_successes` and `parse_failures`. If link quality drops below 95% over any 5s window, a warning is logged. Persistent parse failures indicate cable quality issues or baud rate mismatch.
@@ -239,6 +270,8 @@ The impulse is derived from **NED** velocity and the accelerometer reads in the 
 - Endpoint: `ws://localhost:9876/ws`
 - Binary protocol for telemetry (30 Hz): includes battery open-circuit voltage and percent, plus loaded (terminal) voltage and total motor current at bytes 87-94 (always written, NaN when unknown) and a board-stall flag at byte 95 (96-byte frame; readers accept >= 86)
 - JSON for commands (NSH, ConfigureBuild, Recharge)
+- Command byte 8 (`ResetVehicle`): acknowledged at once, then `ResetResult` (0x19, JSON) progress and outcome (see Vehicle Reset Command)
+- `ConfigResult` stages end with `waiting_for_px4`, and `ready` carries `px4_health`
 - **Ping/pong**: 5s ping interval, 15s pong timeout — zombie connections are detected and dropped
 - `ConnectionStatus` message includes `bootloader_suspected: bool` field
 

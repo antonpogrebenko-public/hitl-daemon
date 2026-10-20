@@ -47,10 +47,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and no such stage, and `ready` carries `not_applicable`. The old unconfirmed
   restart, three attempts with 200 ms backoff, is gone, with the handler's
   NSH sender.
-- **ConfigureBuild and the vehicle reset run off the WebSocket receive loop.**
-  Both deliver every result, the terminal one included, over the connection's
-  channel, so a long apply no longer trips the 15 s pong timeout and the same
-  connection's other replies (console commands among them) keep flowing.
+- **ConfigureBuild runs off the WebSocket receive loop**, as the vehicle reset
+  does. It delivers every result, the terminal one included, over the
+  connection's channel, so a long apply no longer trips the 15 s pong timeout
+  and the same connection's other replies (console commands among them) keep
+  flowing.
 - **Configure, reset and the PID re-push after an FC reconnect share one
   lock.** The re-push waits for a running configure or reset before writing
   any parameter, so their PARAM_SETs never interleave; a configure or reset
