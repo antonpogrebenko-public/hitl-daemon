@@ -195,6 +195,16 @@ fn param_sets(rig: &Rig) -> usize {
     })
 }
 
+/// The value of the last PARAM_SET PX4 received for `name`.
+fn last_param(rig: &Rig, name: &str) -> Option<f32> {
+    rig.captured.as_ref().and_then(|captured| {
+        captured.lock().unwrap().iter().rev().find_map(|m| match m {
+            CapturedMsg::ParamSet(n, v) if n == name => Some(*v),
+            _ => None,
+        })
+    })
+}
+
 /// The flight origin's latitude and longitude.
 fn at(rig: &Rig) -> (f64, f64) {
     let origin = rig.origin.get();
@@ -275,10 +285,12 @@ async fn a_build_the_simulation_never_applies_fails() {
 #[tokio::test(start_paused = true)]
 async fn the_apply_wait_gives_up_after_one_second() {
     let sim = SimulationState::new(SimulationConfig::default());
+    let started = Instant::now();
     assert_eq!(
         wait_for_config_applied(&sim, 0, CONFIG_APPLY_TIMEOUT).await,
         Err("Simulation did not apply the build within 1 s".to_string())
     );
+    assert_eq!(started.elapsed(), CONFIG_APPLY_TIMEOUT);
 }
 
 #[tokio::test]
@@ -421,19 +433,17 @@ async fn sim_only_configure_skips_the_restart_and_reports_not_applicable() {
     use ConfigStage::*;
     assert_eq!(stages(&sent), [FetchingSpecs, Computing, PushingParams]);
     assert_eq!(result.px4_health, Some(Px4HealthReport::NotApplicable));
-    assert!(!rig
-        .log
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|e| e.starts_with("ekf2")));
+    // The simulation applied the build, and nothing else happened.
+    assert_eq!(*rig.log.lock().unwrap(), ["reconfigured"]);
 }
 
 #[tokio::test]
 async fn the_ekf2_restart_starts_after_the_simulation_applied_the_build() {
     let rig = rig(Px4Params::Absent, Some(ok_board), true).await;
     // No SYS_STATUS at all: ready, with px4_health unknown.
-    assert!(run(&rig, request_at(B)).await.0.success);
+    let (result, _) = run(&rig, request_at(B)).await;
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.px4_health, Some(Px4HealthReport::Unknown));
     assert_eq!(
         *rig.log.lock().unwrap(),
         ["reconfigured", "ekf2 stop", "ekf2 start"]
@@ -459,9 +469,12 @@ async fn the_repush_waits_for_a_running_apply_before_writing_parameters() {
         clients.try_recv().is_err(),
         "nothing announced while waiting"
     );
+    // The running apply verified a new build meanwhile: that build is the one re-pushed.
+    rig.handler.seed_verified_params(REF_PIDS, 0.42, 0.15);
     drop(apply);
     assert!(repush.await.unwrap().is_ok());
     assert_eq!(param_sets(&rig), 21);
+    assert_eq!(last_param(&rig, "MPC_THR_HOVER"), Some(0.42));
 }
 
 #[tokio::test]

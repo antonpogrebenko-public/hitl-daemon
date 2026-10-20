@@ -15,10 +15,11 @@ use tokio::time::{timeout_at, Instant};
 /// fixed internal id (`preflight.rs` uses `0xFFFF_FF04` for the board reboot).
 pub(crate) const INTERNAL_REQUEST_ID_FIRST: u32 = 0xFFFF_FF10;
 
-/// The NSH task's own per-command deadline. It sits inside the 3 s reply window
-/// so a command queued behind a pilot's still fits; if the window expires anyway
-/// the restart error carries the timeout and the pilot can Retry.
-pub(crate) const NSH_COMMAND_TIMEOUT_MS: u16 = 2000;
+/// The NSH task's own per-command deadline, past `run_nsh`'s 3 s reply window.
+/// On its deadline the task answers with whatever it has (often only the echo
+/// of the command), marked complete and successful; `run_nsh` must have given
+/// up by then, or that echo would count as PX4 confirming the command.
+pub(crate) const NSH_COMMAND_TIMEOUT_MS: u16 = 4000;
 
 /// The two channels that reach the NSH task: commands in, replies out.
 #[derive(Clone)]
@@ -241,6 +242,32 @@ mod tests {
         assert_eq!(
             run_nsh(&link, 0xFFFF_FF10, "ekf2 stop", Duration::from_millis(300)).await,
             Err("no reply within 300 ms".to_string())
+        );
+    }
+
+    /// On its own deadline the NSH task answers with whatever it has, the echo of
+    /// the command, marked complete and successful (src/main.rs). That is not PX4
+    /// confirming the command.
+    #[tokio::test(start_paused = true)]
+    async fn the_nsh_tasks_echo_only_deadline_reply_is_not_a_confirmation() {
+        let (commands, mut inbox) = mpsc::channel::<ValidatedNshCommand>(16);
+        let (replies, _) = broadcast::channel::<NshResponse>(16);
+        let reply_tx = replies.clone();
+        tokio::spawn(async move {
+            while let Some(cmd) = inbox.recv().await {
+                tokio::time::sleep(Duration::from_millis(cmd.timeout_ms.into())).await;
+                let _ = reply_tx.send(NshResponse {
+                    request_id: cmd.request_id,
+                    success: true,
+                    complete: true,
+                    output: format!("{}\r\n", cmd.command),
+                });
+            }
+        });
+        let link = NshLink { commands, replies };
+        assert_eq!(
+            run_nsh(&link, 0xFFFF_FF10, "ekf2 start", NSH_REPLY_TIMEOUT).await,
+            Err("no reply within 3 s".to_string())
         );
     }
 

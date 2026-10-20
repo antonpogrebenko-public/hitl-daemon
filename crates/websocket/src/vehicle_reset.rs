@@ -133,6 +133,8 @@ mod tests {
         s.board_stall = true;
         s.battery.discharge(10_000.0, 1_000.0);
         s.sim_time_us = 63_000_000;
+        s.quadrotor.motor_speeds = [900.0; 4];
+        s.motor_commands = [0.6; 4];
     }
 
     fn results(rx: &mut mpsc::Receiver<OutgoingMessage>) -> Vec<ResetResult> {
@@ -160,10 +162,17 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn reset_returns_the_vehicle_to_the_start_and_keeps_location_build_and_clock() {
+    async fn reset_returns_the_vehicle_to_the_start_and_keeps_the_build_and_clock() {
+        // The location and datum are kept by construction: the reset never
+        // receives the origin or the terrain cache.
         let sim = SimulationState::new(SimulationConfig::default());
-        flown(&sim);
+        // An applied build that differs from the defaults, so keeping it shows.
+        let mut build = sim.config();
+        build.physics.mass_kg += 0.25;
+        sim.reconfigure(build);
         let mass = sim.config().physics.mass_kg;
+        let generation = sim.config_generation();
+        flown(&sim);
         let (tx, _rx) = channel();
         run_reset(&sim_only(), &sim, &tx).await;
         let s = sim.read();
@@ -185,6 +194,7 @@ mod tests {
         assert!(!s.board_stall);
         assert!(s.sim_time_us >= 63_000_000);
         assert_eq!(sim.config().physics.mass_kg, mass); // the applied build is kept
+        assert_eq!(sim.config_generation(), generation);
     }
 
     #[tokio::test(start_paused = true)]

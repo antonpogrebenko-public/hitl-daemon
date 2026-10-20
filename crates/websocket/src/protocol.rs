@@ -611,16 +611,16 @@ impl ConfigureBuild {
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfigState {
-    /// Physics + PIDs computed, but `PARAM_SET` acks still pending. Simulation
-    /// has NOT been reconfigured yet — frontend must keep the user on the
-    /// configure screen.
+    /// Interim progress. Through `pushing_params` the simulation still runs the
+    /// previous build; from `restarting_ekf` on it runs the new one.
     Configuring,
     /// All `PARAM_SET` messages acked by PX4 (or skipped in --sim-only). New
     /// physics delivered to the sim loop and EKF2 restarted, and PX4 reported
     /// it can arm (or `px4_health` says why that was not checked). Safe to fly.
     Ready,
-    /// Something failed (PX4 unreachable, ack timeout, sim channel down).
-    /// Sim still runs the previous config; frontend should show the error.
+    /// Refused or failed. A failure before the build reaches the simulation
+    /// keeps the previous one (PX4 may hold part of the parameter push); a later
+    /// one leaves the new build in effect. The retry applies it again.
     Error,
 }
 

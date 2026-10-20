@@ -21,7 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A `ResetVehicle` command (byte 8) returns the vehicle to the start.** It is
   acknowledged at once, then resets position, attitude, velocity, motors, the
   battery (full) and the stall flag, keeping the location, the applied build
-  and the clock, restarts EKF2 and reports `ResetResult` (0x19) stages
+  and the clock (the PX4-mirrored armed flag, flight mode and landed state read
+  0 until PX4 next reports them, and the simulated sensors are re-created),
+  restarts EKF2 and reports `ResetResult` (0x19) stages
   (`resetting_vehicle`, `restarting_ekf`, `waiting_for_px4`) until PX4 can arm.
   It is refused while armed or while another reset or configuration runs. In
   `--sim-only` it is `ready` with `px4_health: "not_applicable"`. `Rtl` (byte 4)
@@ -30,18 +32,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **ConfigureBuild is refused while PX4 is armed or while a reset or another
-  apply runs, and a failed push changes nothing the vehicle flies on.** The
-  refusals read "Land and disarm
-  first." and "Another reset or configuration is in progress." and change
+  apply runs, and moves the flight only after PX4 confirmed the parameters.**
+  The refusals read "Land and disarm first." and "Another reset or
+  configuration is in progress." and change
   nothing (in `--sim-only` the armed refusal does not apply). The flight
   location (origin, datum and terrain anchor) moves only after the PX4
   parameters are confirmed, and not at all if PX4 was armed during the push;
   the daemon then waits for the simulation loop to apply the build (up to 1 s)
   before EKF2 is restarted. Any failed apply forgets the PID fingerprint, so
-  the retry writes every parameter again. A failure after the simulation has
-  applied the build (the loop missing the 1 s wait, a failed EKF2 restart, or a
-  pre-arm check that never passes) still reports an error, but leaves the new
-  build, location and parameters in effect; the retry applies it again.
+  the retry writes every parameter again. PX4 has no rollback: it keeps the
+  parameters a failed push already wrote, and a pilot who arms during the push
+  is refused after every parameter was written and saved. A failure after the
+  build is handed to the simulation (the loop not taking it within 1 s, a
+  failed EKF2 restart, or a pre-arm check that never passes) still reports an
+  error, but leaves the new location and parameters in effect, the build
+  applied or still queued; the retry applies it again.
 - **ConfigureBuild reports `ready` only once PX4 can arm.** After the
   simulation applies the build, the daemon restarts EKF2 with the confirmed
   restart above, then waits for PX4's pre-arm check under a new final stage,
