@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SYS_STATUS` `MAV_SYS_STATUS_PREARM_CHECK` health bit and PX4's latest
   "Preflight Fail" text, and logs every change of the bit ("PX4 pre-arm check
   changed") with the time since the last EKF2 start.
+- **The EKF2 restart is confirmed by PX4, not assumed.** The daemon sends
+  `ekf2 stop` and `ekf2 start` and waits for each reply (up to 3 s). `ekf2 stop`
+  passes on any reply, including "not running"; `ekf2 start` fails when its
+  reply contains "error" or "failed". No reply, "No FC connected" or a full NSH
+  queue fails either step, and the error reads "EKF2 restart failed: <reason>".
 
 ## [0.26.0]
 

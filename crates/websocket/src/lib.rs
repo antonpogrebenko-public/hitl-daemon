@@ -5,7 +5,9 @@
 
 pub mod board_identity;
 pub mod build_config;
+pub mod fc_session;
 pub mod handler;
+pub mod nsh_await;
 pub mod param_io;
 pub mod preflight;
 pub mod protocol;
@@ -17,7 +19,9 @@ pub(crate) mod test_support;
 
 pub use board_identity::BoardIdentity;
 pub use build_config::BuildConfigHandler;
+pub use fc_session::{FcSession, ARMED_REFUSAL, BUSY_REFUSAL};
 pub use handler::{ConnectionHandler, ValidatedCommand, ValidatedNshCommand};
+pub use nsh_await::NshLink;
 pub use preflight::{heartbeat_hitl_signals, PreflightHandler};
 pub use protocol::{
     Command, CommandType, ConnectionStatus, HandshakeAck, IncomingMessage, LinkState, NshCommand,
