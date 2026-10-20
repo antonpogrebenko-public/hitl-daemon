@@ -5,7 +5,7 @@ use crate::protocol::{
     AppliedConfig, ConfigResult, ConfigStage, ConfigState, ConfigureBuild, OutgoingMessage,
     Px4PidsView, ResetResult,
 };
-use crate::vehicle_reset::{run_reset, RESET_UNAVAILABLE};
+use crate::vehicle_reset::{run_reset, send_terminal, RESET_UNAVAILABLE};
 use crossbeam_channel::Sender;
 use hitl_physics::px4_pids::{compute_pids, fingerprint as pid_fingerprint, Px4Pids};
 use hitl_physics::{
@@ -252,11 +252,7 @@ impl BuildConfigHandler {
     /// reporting each stage on `progress_tx`, and returns the terminal result.
     pub async fn reset_vehicle(&self, progress_tx: mpsc::Sender<OutgoingMessage>) -> ResetResult {
         let (Some(session), Some(sim_state)) = (&self.fc_session, &self.sim_state) else {
-            let result = ResetResult::failed(RESET_UNAVAILABLE);
-            let _ = progress_tx
-                .send(OutgoingMessage::ResetResult(result.clone()))
-                .await;
-            return result;
+            return send_terminal(&progress_tx, ResetResult::failed(RESET_UNAVAILABLE)).await;
         };
         run_reset(session, sim_state, &progress_tx).await
     }

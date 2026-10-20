@@ -9,7 +9,7 @@ use crate::fc_session::FcSession;
 use crate::protocol::{OutgoingMessage, Px4HealthReport, ResetResult, ResetStage};
 use simulation::SimulationState;
 use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Reported when the daemon has no reset flow to run.
 pub(crate) const RESET_UNAVAILABLE: &str = "Reset is unavailable in this session";
@@ -25,6 +25,22 @@ pub(crate) async fn run_reset(
     progress_tx: &mpsc::Sender<OutgoingMessage>,
 ) -> ResetResult {
     let result = reset_steps(session, sim_state, progress_tx).await;
+    send_terminal(progress_tx, result).await
+}
+
+/// Logs a terminal result once, sends it and returns it.
+///
+/// The log is the only record of why a reset failed when the tab has already
+/// closed (the board smoke test reads it), so every terminal result, refusals
+/// and the unavailable report included, goes through here.
+pub(crate) async fn send_terminal(
+    progress_tx: &mpsc::Sender<OutgoingMessage>,
+    result: ResetResult,
+) -> ResetResult {
+    match (&result.error, result.px4_health) {
+        (Some(reason), _) => warn!(reason = %reason, "Vehicle reset did not complete"),
+        (None, health) => info!(?health, "Vehicle reset complete"),
+    }
     send(progress_tx, result.clone()).await;
     result
 }

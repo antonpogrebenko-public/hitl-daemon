@@ -11,7 +11,7 @@ use crate::protocol::{
     PreflightReadiness, PreflightStatus, ResetResult, RestoreResult, RestoreState, SnapshotStored,
     StateUpdate,
 };
-use crate::vehicle_reset::RESET_UNAVAILABLE;
+use crate::vehicle_reset::{send_terminal, RESET_UNAVAILABLE};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -775,10 +775,7 @@ impl ConnectionHandler {
             debug!(client_id, "Reset ack not delivered: client gone");
         }
         let Some(build_config) = self.build_config.clone() else {
-            let unavailable = ResetResult::failed(RESET_UNAVAILABLE);
-            let _ = progress_tx
-                .send(OutgoingMessage::ResetResult(unavailable))
-                .await;
+            send_terminal(progress_tx, ResetResult::failed(RESET_UNAVAILABLE)).await;
             return;
         };
         info!(client_id, command_id, "Vehicle reset requested");
