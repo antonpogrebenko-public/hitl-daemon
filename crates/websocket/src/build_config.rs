@@ -1,4 +1,5 @@
 use crate::fc_session::{FcSession, ARMED_REFUSAL};
+use crate::nsh_await::whole_seconds_or_ms;
 use crate::param_io::ParamValue;
 use crate::protocol::{
     AppliedConfig, ConfigResult, ConfigStage, ConfigState, ConfigureBuild, OutgoingMessage,
@@ -245,6 +246,13 @@ impl BuildConfigHandler {
             sim_state: None,
             config_apply_timeout: CONFIG_APPLY_TIMEOUT,
         }
+    }
+
+    /// Points the spec fetch at a fake catalogue.
+    #[cfg(test)]
+    pub(crate) fn with_api_url(mut self, url: impl Into<String>) -> Self {
+        self.api_url = url.into();
+        self
     }
 
     /// Gives the handler the session and simulation state the vehicle reset
@@ -1307,15 +1315,6 @@ async fn wait_for_config_applied(
             whole_seconds_or_ms(timeout)
         )
     })
-}
-
-/// `1 s` for a whole number of seconds, `100 ms` otherwise.
-fn whole_seconds_or_ms(d: Duration) -> String {
-    if d.subsec_nanos() == 0 {
-        format!("{} s", d.as_secs())
-    } else {
-        format!("{} ms", d.as_millis())
-    }
 }
 
 // ============================================================================

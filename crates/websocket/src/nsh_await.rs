@@ -66,6 +66,16 @@ impl InternalRequestIds {
     }
 }
 
+/// `1 s` for a whole number of seconds, `100 ms` otherwise, so a timeout
+/// shorter than a second never reads `0 s`.
+pub(crate) fn whole_seconds_or_ms(d: Duration) -> String {
+    if d.subsec_nanos() == 0 {
+        format!("{} s", d.as_secs())
+    } else {
+        format!("{} ms", d.as_millis())
+    }
+}
+
 /// Sends one NSH command and waits for its complete reply.
 ///
 /// Subscribes before sending so the reply cannot be missed. Replies for other
@@ -91,7 +101,10 @@ pub(crate) async fn run_nsh(
     loop {
         match timeout_at(deadline, replies.recv()).await {
             Err(_) => {
-                return Err(format!("no reply within {} s", reply_timeout.as_secs()));
+                return Err(format!(
+                    "no reply within {}",
+                    whole_seconds_or_ms(reply_timeout)
+                ));
             }
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
             Ok(Err(broadcast::error::RecvError::Closed)) => {
@@ -220,6 +233,15 @@ mod tests {
             Err("no reply within 3 s".to_string())
         );
         assert_eq!(t.elapsed(), Duration::from_secs(3));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_nsh_names_a_sub_second_timeout_in_milliseconds() {
+        let link = fake_nsh(new_log(), |_| FakeReply::Silent);
+        assert_eq!(
+            run_nsh(&link, 0xFFFF_FF10, "ekf2 stop", Duration::from_millis(300)).await,
+            Err("no reply within 300 ms".to_string())
+        );
     }
 
     #[tokio::test]

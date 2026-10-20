@@ -224,13 +224,12 @@ impl ConnectionHandler {
     /// Handle an incoming message from a client.
     ///
     /// `progress_tx` is the per-client outgoing channel. Most handlers ignore
-    /// it and return their single response via `Ok(Some(...))`. ConfigureBuild
-    /// uses it to push an interim `state: Configuring` ConfigResult before
-    /// the final result is returned (two-stage flow — see `BuildConfigHandler::handle`).
-    /// ApplyPreflightParams goes further: it dispatches its (minutes-long)
-    /// work onto a detached task and returns `Ok(None)`, delivering *every*
-    /// message including the terminal one over `progress_tx`, so the caller's
-    /// receive loop is never blocked.
+    /// it and return their single response via `Ok(Some(...))`. ConfigureBuild,
+    /// the vehicle reset and ApplyPreflightParams run on a detached task and
+    /// return `Ok(None)`, delivering every message, the terminal one included,
+    /// over `progress_tx`, so the caller's receive loop is never blocked by
+    /// their work. Restore is detached too, but reports on the broadcast every
+    /// client hears.
     pub async fn handle_message(
         &self,
         client_id: u64,
@@ -273,8 +272,26 @@ impl ConnectionHandler {
                         return Ok(Some(OutgoingMessage::ConfigResult(result)));
                     }
                 };
-                let result = handler.handle(build, progress_tx.clone()).await;
-                Ok(Some(OutgoingMessage::ConfigResult(result)))
+                // Detached like restore: an apply waits on the catalogue, the
+                // PX4 parameter acks and PX4's pre-arm check, longer than the
+                // receive loop may stall before the pong watchdog drops the
+                // socket. The terminal result follows the stages on this
+                // connection's channel.
+                let progress_tx = progress_tx.clone();
+                tokio::spawn(async move {
+                    let result = handler.handle(build, progress_tx.clone()).await;
+                    if progress_tx
+                        .send(OutgoingMessage::ConfigResult(result))
+                        .await
+                        .is_err()
+                    {
+                        debug!(
+                            client_id,
+                            "ConfigureBuild result not delivered: client gone"
+                        );
+                    }
+                });
+                Ok(None)
             }
             IncomingMessage::TerrainTiles(frame) => {
                 let Some(cache) = &self.terrain else {
