@@ -38,6 +38,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the daemon then waits for the simulation loop to apply the build (up to 1 s)
   before EKF2 is restarted. Any failed apply forgets the PID fingerprint, so
   the retry writes every parameter again.
+- **ConfigureBuild reports `ready` only once PX4 can arm.** After the
+  simulation applies the build, the daemon restarts EKF2 with the confirmed
+  restart above, then waits for PX4's pre-arm check under a new final stage,
+  `waiting_for_px4`. `ready` carries `px4_health` (`healthy`, or `unknown` when
+  PX4 sends no `SYS_STATUS`); a failed restart or a pre-arm check that never
+  passes is an error carrying PX4's reason. In `--sim-only` there is no restart
+  and no such stage, and `ready` carries `not_applicable`. The old unconfirmed
+  restart, three attempts with 200 ms backoff, is gone, with the handler's
+  NSH sender.
 
 ## [0.26.0]
 

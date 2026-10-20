@@ -1333,15 +1333,14 @@ impl PreflightHandler {
     /// `MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN`. See the doc comment on the
     /// `nsh_tx` field for why: the MAVLink command path got zero
     /// `COMMAND_ACK` on real hardware despite correct construction, while
-    /// NSH's `reboot` reliably triggers a real reset. Fire-and-forget, like
-    /// `BuildConfigHandler::restart_ekf2`'s internal NSH commands — a reboot
-    /// makes any response moot.
+    /// NSH's `reboot` reliably triggers a real reset. Fire-and-forget: a
+    /// reboot makes any response moot.
     async fn send_reboot_via_nsh(&self) -> Result<(), String> {
         let Some(ref nsh_tx) = self.nsh_tx else {
             return Err("NSH channel not available".to_string());
         };
         let cmd = ValidatedNshCommand {
-            request_id: 0xFFFF_FF04, // internal-use id, distinct from build_config.rs's 0xFFFF_FF01/02
+            request_id: 0xFFFF_FF04, // fixed internal id, below nsh_await's 0xFFFF_FF10 range
             command: "reboot".to_string(),
             timeout_ms: 2000,
             client_id: 0, // system client

@@ -20,7 +20,7 @@ async fn with_reset() -> (ConnectionHandler, mpsc::Receiver<ValidatedCommand>) {
     // A reset never sends a config; the receiver is only here to build the handler.
     let (config_tx, _config_rx) = crossbeam_channel::bounded(PROGRESS_CAPACITY);
     let session = Arc::new(FcSession::new(None, Arc::new(Px4HealthMonitor::new())));
-    let build = BuildConfigHandler::new(config_tx, None, None, None, None, (0.0, 0.0, 0.0), None)
+    let build = BuildConfigHandler::new(config_tx, None, None, None, (0.0, 0.0, 0.0), None)
         .with_fc_session(session, SimulationState::new(SimulationConfig::default()));
     handler.set_build_config_handler(Arc::new(build));
     (handler, cmd_rx)

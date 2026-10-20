@@ -855,9 +855,9 @@ async fn main() {
     let state_tx = ws_server.state_sender();
     let mut command_rx = ws_server.take_command_receiver();
 
-    // Set up build config handler to send PhysicsConfig updates to simulation
-    // Pass NSH sender so it can restart EKF2 after config changes (clone before moving to ws_server)
-    let nsh_tx_for_config = if sim_only_mode {
+    // NSH sender for the preflight handler's reboot (clone before moving to
+    // ws_server). The build config handler restarts EKF2 through `FcSession`.
+    let nsh_tx_for_preflight = if sim_only_mode {
         None
     } else {
         Some(nsh_cmd_tx.clone())
@@ -882,7 +882,7 @@ async fn main() {
         websocket::PreflightHandler::with_identity(
             build_config_mav_tx.clone(),
             build_config_param_value_tx.clone(),
-            nsh_tx_for_config.clone(),
+            nsh_tx_for_preflight,
             sim_state.clone(),
             board_identity.clone(),
         )
@@ -903,7 +903,6 @@ async fn main() {
     let build_config_handler = std::sync::Arc::new(
         websocket::BuildConfigHandler::new(
             build_config_tx,
-            nsh_tx_for_config,
             build_config_mav_tx,
             build_config_param_value_tx,
             Some(terrain_cache.clone()),

@@ -3,14 +3,17 @@
 //! they were, and the retry pushes every parameter again.
 
 use super::*;
-use crate::protocol::FlightLocation;
+use crate::protocol::{FlightLocation, Px4HealthReport};
 use crate::test_support::{
-    catalogue_components, catalogue_request, fake_nsh, ok_board, spawn_catalogue,
-    spawn_fake_px4_with_capture, spawn_fake_sim_loop, CapturedMsg, FakeReply, FAST_TIMING,
+    catalogue_components, catalogue_request, fake_nsh, ok_board, publish_px4_events,
+    spawn_catalogue, spawn_fake_px4_with_capture, spawn_fake_sim_loop, CapturedMsg, FakeReply,
+    Px4Event::{SysStatus, Text},
+    FAST_TIMING,
 };
 use crossbeam_channel::{bounded, Receiver};
 use simulation::{Px4HealthMonitor, SharedOrigin, SimulationConfig};
 use terrain::TerrainCache;
+use tokio::time::Instant;
 
 /// Where every rig starts, and where a request moves the flight.
 const A: (f64, f64) = (40.015, -105.2705);
@@ -56,6 +59,8 @@ enum Px4Params {
 struct Rig {
     handler: Arc<BuildConfigHandler>,
     session: Arc<FcSession>,
+    /// What the session reads PX4's pre-arm state from; a test scripts it.
+    health: Arc<Px4HealthMonitor>,
     sim: SimulationState,
     origin: Arc<SharedOrigin>,
     cache: Arc<TerrainCache>,
@@ -98,13 +103,12 @@ async fn rig(params: Px4Params, nsh: Option<fn(&str) -> FakeReply>, sim_loop: bo
     let sim = SimulationState::new(SimulationConfig::default());
     let log: Log = Arc::default();
     let board = nsh.map(|script| fake_nsh(log.clone(), script));
-    let session =
-        Arc::new(FcSession::new(board, Arc::new(Px4HealthMonitor::new())).with_timing(FAST_TIMING));
+    let health = Arc::new(Px4HealthMonitor::new());
+    let session = Arc::new(FcSession::new(board, health.clone()).with_timing(FAST_TIMING));
     let (mav_tx, pv_tx, captured) = px4_link(params, &sim);
     let (config_tx, config_rx) = bounded(CONFIG_CAPACITY);
     let mut handler = BuildConfigHandler::new(
         config_tx,
-        None,
         mav_tx,
         pv_tx,
         Some(cache.clone()),
@@ -123,6 +127,7 @@ async fn rig(params: Px4Params, nsh: Option<fn(&str) -> FakeReply>, sim_loop: bo
     Rig {
         handler: Arc::new(handler),
         session,
+        health,
         sim,
         origin,
         cache,
@@ -154,6 +159,18 @@ async fn run(rig: &Rig, request: ConfigureBuild) -> (ConfigResult, Vec<OutgoingM
         sent.push(msg);
     }
     (result, sent)
+}
+
+/// The stage of every `Configuring` result, in the order they were sent.
+fn stages(sent: &[OutgoingMessage]) -> Vec<ConfigStage> {
+    sent.iter()
+        .filter_map(|msg| match msg {
+            OutgoingMessage::ConfigResult(r) if matches!(r.state, ConfigState::Configuring) => {
+                r.stage
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// How many PARAM_SETs PX4 has received.
@@ -319,4 +336,96 @@ async fn a_successful_apply_anchors_the_terrain_cache_to_the_new_location() {
         (B, REQUESTED_ELEVATION)
     );
     assert!(rig.cache.is_anchored_to(B.0, B.1));
+}
+
+#[tokio::test]
+async fn configure_reports_waiting_for_px4_then_ready_healthy() {
+    let rig = rig(Px4Params::Acks, Some(ok_board), true).await;
+    let _px4 = publish_px4_events(
+        rig.health.clone(),
+        Instant::now(),
+        (0..250).map(|i| (i * 20, SysStatus(true))).collect(),
+    );
+    let (result, sent) = run(&rig, request_at(B)).await;
+    use ConfigStage::*;
+    assert_eq!(
+        stages(&sent),
+        [
+            FetchingSpecs,
+            Computing,
+            PushingParams,
+            RestartingEkf,
+            WaitingForPx4
+        ]
+    );
+    assert!(matches!(result.state, ConfigState::Ready));
+    assert_eq!(result.px4_health, Some(Px4HealthReport::Healthy));
+    assert_eq!(
+        serde_json::to_value(&result).unwrap()["px4_health"],
+        "healthy"
+    );
+}
+
+#[tokio::test]
+async fn configure_fails_with_px4s_reason_when_the_prearm_check_never_passes() {
+    let rig = rig(Px4Params::Acks, Some(ok_board), true).await;
+    let failing = (0..250).map(|i| (i * 20, SysStatus(false)));
+    let reasons = (0..50).map(|i| (i * 100, Text("Preflight Fail: ekf2 missing data")));
+    let _px4 = publish_px4_events(
+        rig.health.clone(),
+        Instant::now(),
+        failing.chain(reasons).collect(),
+    );
+    let (result, sent) = run(&rig, request_at(B)).await;
+    assert_eq!(
+        result.error.as_deref(),
+        Some("Preflight Fail: ekf2 missing data")
+    );
+    assert_eq!(stages(&sent).last(), Some(&ConfigStage::WaitingForPx4));
+    assert_eq!(result.px4_health, None);
+}
+
+#[tokio::test]
+async fn configure_fails_when_ekf2_start_reports_an_error() {
+    let rig = rig(
+        Px4Params::Acks,
+        Some(|cmd| match cmd {
+            "ekf2 start" => FakeReply::Ok("ekf2 start\r\nERROR [ekf2] task start failed\r\nnsh> "),
+            other => ok_board(other),
+        }),
+        true,
+    )
+    .await;
+    assert!(run(&rig, request_at(B))
+        .await
+        .0
+        .error
+        .unwrap()
+        .starts_with("EKF2 restart failed: ekf2 start:"));
+}
+
+#[tokio::test]
+async fn sim_only_configure_skips_the_restart_and_reports_not_applicable() {
+    let rig = rig(Px4Params::Absent, None, true).await;
+    let (result, sent) = run(&rig, request_at(B)).await;
+    use ConfigStage::*;
+    assert_eq!(stages(&sent), [FetchingSpecs, Computing, PushingParams]);
+    assert_eq!(result.px4_health, Some(Px4HealthReport::NotApplicable));
+    assert!(!rig
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| e.starts_with("ekf2")));
+}
+
+#[tokio::test]
+async fn the_ekf2_restart_starts_after_the_simulation_applied_the_build() {
+    let rig = rig(Px4Params::Absent, Some(ok_board), true).await;
+    // No SYS_STATUS at all: ready, with px4_health unknown.
+    assert!(run(&rig, request_at(B)).await.0.success);
+    assert_eq!(
+        *rig.log.lock().unwrap(),
+        ["reconfigured", "ekf2 stop", "ekf2 start"]
+    );
 }

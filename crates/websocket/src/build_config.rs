@@ -1,9 +1,8 @@
 use crate::fc_session::{FcSession, ARMED_REFUSAL};
-use crate::handler::ValidatedNshCommand;
 use crate::param_io::ParamValue;
 use crate::protocol::{
     AppliedConfig, ConfigResult, ConfigStage, ConfigState, ConfigureBuild, OutgoingMessage,
-    Px4PidsView, ResetResult,
+    Px4HealthReport, Px4PidsView, ResetResult,
 };
 use crate::vehicle_reset::{run_reset, send_terminal, RESET_UNAVAILABLE};
 use crossbeam_channel::Sender;
@@ -53,7 +52,6 @@ pub struct BuildConfigHandler {
     api_url: String,
     http_client: reqwest::Client,
     config_tx: Sender<(PhysicsConfig, BatteryConfig, hitl_sensors::SensorsConfig)>,
-    nsh_tx: Option<mpsc::Sender<ValidatedNshCommand>>,
     /// MAVLink output channel — same one the simulation loop uses for
     /// `HIL_SENSOR` / `HIL_GPS`. Phase 6 pushes `PARAM_SET` here.
     /// `None` in `--sim-only` mode (no PX4 attached, no point pushing).
@@ -217,7 +215,6 @@ pub(crate) fn current_limits(
 impl BuildConfigHandler {
     pub fn new(
         config_tx: Sender<(PhysicsConfig, BatteryConfig, hitl_sensors::SensorsConfig)>,
-        nsh_tx: Option<mpsc::Sender<ValidatedNshCommand>>,
         mav_tx: Option<Sender<MavMessage>>,
         param_value_tx: Option<broadcast::Sender<ParamValue>>,
         terrain_cache: Option<std::sync::Arc<terrain::TerrainCache>>,
@@ -236,7 +233,6 @@ impl BuildConfigHandler {
                 .build()
                 .expect("Failed to build HTTP client"),
             config_tx,
-            nsh_tx,
             mav_tx,
             param_value_tx,
             last_pid_fingerprint: Mutex::new(None),
@@ -381,7 +377,10 @@ impl BuildConfigHandler {
     ///    flight origin move.
     /// 6. Hand the build to the simulation loop and wait until it has applied
     ///    it (`SimulationState::config_generation`).
-    /// 7. Restart EKF2 and return `state: Ready`.
+    /// 7. With a flight controller attached, restart EKF2 (`restarting_ekf`),
+    ///    then wait for PX4's pre-arm check (`waiting_for_px4`). Return
+    ///    `state: Ready` with `px4_health`: `healthy`, `unknown` when PX4
+    ///    sends no SYS_STATUS, or `not_applicable` without a flight controller.
     ///
     /// A refusal or a failure returns `state: Error`. A failure before step 5
     /// leaves the previous flight location, physics and vehicle in effect.
@@ -397,14 +396,7 @@ impl BuildConfigHandler {
             Err(refusal) => return Self::failed(refusal),
         };
         match self.apply(request, &progress_tx).await {
-            Ok(config) => ConfigResult {
-                state: ConfigState::Ready,
-                success: true,
-                error: None,
-                config: Some(config),
-                stage: None,
-                px4_health: None,
-            },
+            Ok((config, px4_health)) => ConfigResult::ready(config, px4_health),
             Err(e) => {
                 self.invalidate_pid_fingerprint();
                 Self::failed(e)
@@ -430,13 +422,14 @@ impl BuildConfigHandler {
     }
 
     /// Everything after the session is taken: fetch, compute, push, move the
-    /// origin, apply to the simulation and restart EKF2. Returns the applied
-    /// config, or the error the browser is shown.
+    /// origin, apply to the simulation, restart EKF2 and wait for PX4. Returns
+    /// the applied config and PX4's pre-arm state, or the error the browser is
+    /// shown.
     async fn apply(
         &self,
         request: ConfigureBuild,
         progress_tx: &mpsc::Sender<OutgoingMessage>,
-    ) -> Result<AppliedConfig, String> {
+    ) -> Result<(AppliedConfig, Px4HealthReport), String> {
         Self::report_stage(progress_tx, ConfigStage::FetchingSpecs).await;
 
         // Resolve the origin and datum before anything else. An invalid
@@ -919,17 +912,33 @@ impl BuildConfigHandler {
             "Build configured + PIDs verified"
         );
 
+        let px4_health = self.restart_ekf2_and_wait_for_px4(progress_tx).await?;
+
+        Ok((
+            AppliedConfig {
+                applied_pids,
+                verified_params,
+                ..configuring_view
+            },
+            px4_health,
+        ))
+    }
+
+    /// Restarts EKF2 on the build the simulation now flies, then waits for
+    /// PX4's pre-arm check. Without a flight controller (no session, or
+    /// `--sim-only`) there is no estimator to restart: `NotApplicable`, and no
+    /// stage is reported, because a stage names work actually performed.
+    async fn restart_ekf2_and_wait_for_px4(
+        &self,
+        progress_tx: &mpsc::Sender<OutgoingMessage>,
+    ) -> Result<Px4HealthReport, String> {
+        let Some(session) = self.fc_session.as_ref().filter(|s| !s.is_sim_only()) else {
+            return Ok(Px4HealthReport::NotApplicable);
+        };
         Self::report_stage(progress_tx, ConfigStage::RestartingEkf).await;
-
-        if let Err(e) = self.restart_ekf2_with_retry(3).await {
-            error!(error = %e, "EKF2 restart failed — PIDs are applied, EKF will converge on stale state");
-        }
-
-        Ok(AppliedConfig {
-            applied_pids,
-            verified_params,
-            ..configuring_view
-        })
+        let restart = session.restart_ekf2().await?;
+        Self::report_stage(progress_tx, ConfigStage::WaitingForPx4).await;
+        session.wait_for_px4_ready(&restart).await
     }
 
     /// Push the per-build PIDs as `PARAM_SET` and verify each one with a
@@ -1143,77 +1152,6 @@ impl BuildConfigHandler {
             }),
             verified,
         ))
-    }
-
-    /// Attempt a single EKF2 stop → start cycle via NSH.
-    ///
-    /// Returns `Ok(())` when both commands are queued, or `Err(msg)` if the
-    /// NSH channel is unavailable or either send fails.
-    async fn restart_ekf2(&self) -> Result<(), String> {
-        let Some(ref nsh_tx) = self.nsh_tx else {
-            return Err("NSH channel not available".to_string());
-        };
-
-        let stop_cmd = ValidatedNshCommand {
-            request_id: 0xFFFF_FF01, // Special ID for internal commands
-            command: "ekf2 stop".to_string(),
-            timeout_ms: 2000,
-            client_id: 0, // System client
-        };
-
-        nsh_tx
-            .send(stop_cmd)
-            .await
-            .map_err(|e| format!("Failed to send ekf2 stop: {e}"))?;
-
-        // Small delay to let EKF2 stop cleanly before issuing start.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        let start_cmd = ValidatedNshCommand {
-            request_id: 0xFFFF_FF02,
-            command: "ekf2 start".to_string(),
-            timeout_ms: 2000,
-            client_id: 0,
-        };
-
-        nsh_tx
-            .send(start_cmd)
-            .await
-            .map_err(|e| format!("Failed to send ekf2 start: {e}"))?;
-
-        Ok(())
-    }
-
-    /// Retry `restart_ekf2` up to `max_retries` times with 200 ms between
-    /// attempts.  Returns `Ok(())` on the first success.  If every attempt
-    /// fails, returns `Err` with the final error message; the caller is
-    /// responsible for deciding whether to propagate or merely log it.
-    async fn restart_ekf2_with_retry(&self, max_retries: u8) -> Result<(), String> {
-        for attempt in 0..max_retries {
-            match self.restart_ekf2().await {
-                Ok(()) => {
-                    info!(attempt = attempt + 1, "EKF2 restarted after config change");
-                    return Ok(());
-                }
-                Err(e) => {
-                    if attempt < max_retries - 1 {
-                        warn!(
-                            attempt = attempt + 1,
-                            max_retries,
-                            error = %e,
-                            "EKF2 restart attempt failed, retrying in 200 ms"
-                        );
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                    } else {
-                        return Err(format!(
-                            "EKF2 restart failed after {max_retries} attempts: {e}"
-                        ));
-                    }
-                }
-            }
-        }
-        // `max_retries == 0` edge case: nothing to do, treat as success.
-        Ok(())
     }
 
     /// Invalidate the cached PID fingerprint so the next `ConfigureBuild` is
@@ -1910,15 +1848,8 @@ mod tests {
         // simulation side of the channel is gone.
         let (config_tx, _config_rx) =
             bounded::<(PhysicsConfig, BatteryConfig, hitl_sensors::SensorsConfig)>(4);
-        let mut handler = BuildConfigHandler::new(
-            config_tx,
-            None,
-            None,
-            None,
-            None,
-            (40.0, -105.0, 1655.0),
-            None,
-        );
+        let mut handler =
+            BuildConfigHandler::new(config_tx, None, None, None, (40.0, -105.0, 1655.0), None);
         handler.api_url = base;
         let (tx, _rx) = mpsc::channel(16);
         let result = handler.handle(catalogue_request(with_battery), tx).await;
@@ -1994,7 +1925,6 @@ mod tests {
             bounded::<(PhysicsConfig, BatteryConfig, hitl_sensors::SensorsConfig)>(4);
         BuildConfigHandler::new(
             config_tx,
-            None,
             mav_tx,
             param_value_tx,
             None,
@@ -2326,7 +2256,6 @@ mod reconnect_repush_tests {
             cb_bounded::<(PhysicsConfig, BatteryConfig, hitl_sensors::SensorsConfig)>(4);
         BuildConfigHandler::new(
             config_tx,
-            None,
             Some(mav_tx),
             Some(pv_tx),
             None,
@@ -2391,7 +2320,6 @@ mod origin_anchor_tests {
             bounded::<(PhysicsConfig, BatteryConfig, hitl_sensors::SensorsConfig)>(4);
         BuildConfigHandler::new(
             config_tx,
-            None,
             None,
             None,
             Some(cache),
