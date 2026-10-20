@@ -894,7 +894,8 @@ pub struct SimulationLoop {
     channel_full_since: Option<Instant>,
     /// Last time an actuator command was received from the FC. Used to detect
     /// FC disconnection: if no command arrives within ACTUATOR_STALE_TIMEOUT
-    /// while motors are active, commands are zeroed and armed is cleared.
+    /// while motors are active, commands are zeroed and `board_stall` is
+    /// raised; armed is left as PX4 last reported it.
     last_actuator_time: Instant,
     /// Last time a stale-actuator warning was emitted (rate-limits log spam).
     last_stale_warning: Instant,
@@ -1526,15 +1527,19 @@ impl SimulationLoop {
 
         if let Some(actuator) = latest {
             self.last_actuator_time = Instant::now();
-            // Two separate write acquisitions of the state lock, on the branch
-            // that runs on essentially every tick with a real FC attached.
-            // Uninstrumented, they read as actuator "work" — which is exactly
-            // the misattribution `lock_wait_ns` exists to remove, and it would
-            // have been invisible in every real HITL session because only the
-            // no-command branch below was measured.
+            // A write acquisition of the state lock, on the branch that runs on
+            // essentially every tick with a real FC attached. Uninstrumented, it
+            // reads as actuator "work" — which is exactly the misattribution
+            // `lock_wait_ns` exists to remove, and it would have been invisible
+            // in every real HITL session because only the no-command branch
+            // below was measured. A command arriving ends any stall.
             let lock_start = Instant::now();
-            self.state.set_motor_commands(actuator.motors);
-            self.state.set_armed(actuator.is_armed());
+            {
+                let mut state = self.state.write();
+                state.motor_commands = actuator.motors;
+                state.armed = actuator.is_armed();
+                state.board_stall = false;
+            }
             self.tick_lock_wait_ns += lock_start.elapsed().as_nanos() as u64;
 
             if actuator.is_hil_active() {
@@ -1553,16 +1558,22 @@ impl SimulationLoop {
                 state.motor_commands.iter().any(|&c| c > 0.01)
             };
             if motors_active && self.last_actuator_time.elapsed() > ACTUATOR_STALE_TIMEOUT {
-                // Zero motors and disarm: FC is gone, let gravity take over.
+                // Zero the motors and flag the stall: the FC's commands are late,
+                // let gravity take over. Armed stays what PX4 last sent — a stall
+                // is not a disarm, and clients that read one as a landing ended
+                // flights mid-air. A lost FC is reported by `mark_fc_lost`.
                 let lock_start = Instant::now();
-                self.state.set_motor_commands([0.0; 4]);
-                self.state.set_armed(false);
+                {
+                    let mut state = self.state.write();
+                    state.motor_commands = [0.0; 4];
+                    state.board_stall = true;
+                }
                 self.tick_lock_wait_ns += lock_start.elapsed().as_nanos() as u64;
 
                 if self.last_stale_warning.elapsed() >= STALE_WARN_INTERVAL {
                     warn!(
                         stale_ms = self.last_actuator_time.elapsed().as_millis(),
-                        "Actuator commands stale for >100ms — zeroing motors (FC disconnected?)"
+                        "Actuator commands stale for >100ms — zeroing motors, armed state kept (FC disconnected?)"
                     );
                     self.last_stale_warning = Instant::now();
                 }
@@ -3909,6 +3920,75 @@ bdb413ebaece2bde231fe3ea0664f4400000000d5dcce44d5c78740ff1f0000";
             state.motor_commands = [command; 4];
         }
         (sim, ch)
+    }
+
+    /// Runs the actuator step as if the last motor command came 150 ms ago.
+    fn stalled(sim: &mut SimulationLoop) {
+        sim.last_actuator_time = Instant::now()
+            .checked_sub(Duration::from_millis(150))
+            .expect("monotonic clock older than 150 ms");
+        sim.process_actuator_commands();
+    }
+
+    fn command(motors: f32, mode: protocol::FlightMode) -> ActuatorOutputs {
+        ActuatorOutputs {
+            timestamp_us: 1,
+            motors: [motors; 4],
+            mode,
+            controls: [0.0; 16],
+        }
+    }
+
+    #[test]
+    fn stale_actuators_zero_motors_but_keep_armed_and_flag_the_stall() {
+        let (mut sim, _ch) = armed_at(0.5);
+        stalled(&mut sim);
+        let state = sim.state.read();
+        assert_eq!(state.motor_commands, [0.0; 4]);
+        assert!(state.armed, "a stall is not a disarm PX4 made");
+        assert!(state.board_stall);
+    }
+
+    #[test]
+    fn a_fresh_command_clears_the_stall_and_drives_the_motors() {
+        let (mut sim, ch) = armed_at(0.5);
+        stalled(&mut sim);
+        ch._actuator_tx
+            .send(command(0.4, protocol::FlightMode::HilArmed))
+            .unwrap();
+        sim.process_actuator_commands();
+        let state = sim.state.read();
+        assert!(!state.board_stall);
+        assert!(state.armed);
+        assert_eq!(state.motor_commands, [0.4; 4]);
+    }
+
+    #[test]
+    fn a_disarmed_command_after_a_stall_reads_disarmed() {
+        let (mut sim, ch) = armed_at(0.5);
+        stalled(&mut sim);
+        ch._actuator_tx
+            .send(command(0.0, protocol::FlightMode::Disarmed))
+            .unwrap();
+        sim.process_actuator_commands();
+        let state = sim.state.read();
+        assert!(!state.armed);
+        assert!(!state.board_stall);
+    }
+
+    #[test]
+    fn idle_motors_are_not_a_stall() {
+        let (mut sim, _ch) = armed_at(0.0);
+        stalled(&mut sim);
+        assert!(!sim.state.read().board_stall);
+    }
+
+    #[test]
+    fn reset_clears_the_board_stall() {
+        let (mut sim, _ch) = armed_at(0.5);
+        stalled(&mut sim);
+        sim.state.reset();
+        assert!(!sim.state.read().board_stall);
     }
 
     #[test]

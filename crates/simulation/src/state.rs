@@ -99,6 +99,10 @@ pub struct SimulationStateInner {
     pub running: bool,
     /// Armed state from flight controller
     pub armed: bool,
+    /// The stall guard is holding the motors at zero because the flight
+    /// controller's motor commands went stale; PX4's armed state is unchanged.
+    /// Cleared by the next motor command and by `reset()`.
+    pub board_stall: bool,
     /// Flight mode from flight controller (PX4 custom_mode)
     pub flight_mode: u8,
     /// Landed state reported by the flight controller's land detector, as
@@ -155,6 +159,7 @@ impl SimulationStateInner {
             motor_commands: [0.0; 4],
             running: true,
             armed: false,
+            board_stall: false,
             flight_mode: 0,
             landed_state: 0,
             heartbeat_count: 0,
@@ -177,6 +182,7 @@ impl SimulationStateInner {
         // hide that by changing the build.
         self.motor_commands = [0.0; 4];
         self.armed = false;
+        self.board_stall = false;
         self.flight_mode = 0;
         self.landed_state = 0;
     }
