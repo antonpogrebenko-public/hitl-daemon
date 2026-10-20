@@ -145,7 +145,7 @@ ch3 → Motor 4 (BR, CW)
 The 400 Hz loop in `loop_runner.rs`:
 1. Check for new `(PhysicsConfig, BatteryConfig)` on config channel → reconfigure
 2. Drain actuator commands from PX4 (use latest)
-3. **Stale actuator timeout**: if `ACTUATOR_STALE_TIMEOUT` (100ms) elapses with no FC commands while motors are active → zero motor commands and disarm
+3. **Stale actuator timeout**: if `ACTUATOR_STALE_TIMEOUT` (100ms) elapses with no FC commands while motors are active → zero motor commands and raise `board_stall`; armed stays PX4's (a lost FC connection reports the disarm, via `mark_fc_lost`)
 4. Convert throttle [0,1] → motor omega via `throttle_to_omega_with_config`
 5. **Battery voltage sag**: motor omegas scaled by `v_terminal / v_nominal` ratio for accurate thrust at low SoC
 6. Discharge battery based on total motor current (`total_motor_current`)
@@ -195,7 +195,9 @@ The simulation loop uses `try_recv` on the config channel. If multiple configs a
 If no HEARTBEAT is received within 5s of connecting, the daemon suspects the FC is stuck in bootloader mode. The `bootloader_suspected` atomic flag is shared between the receiver task and the connection loop. Connection is retried with a 10s backoff. The current status is broadcast to WebSocket clients via `ConnectionStatus { bootloader_suspected: bool }`.
 
 ### Stale actuator timeout
-`ACTUATOR_STALE_TIMEOUT` (100ms) in `loop_runner.rs`: if the simulation loop has active motors but receives no actuator commands from PX4 for 100ms, motor outputs are zeroed and the sim is disarmed. Prevents runaway physics when the FC crashes or disconnects mid-flight.
+`ACTUATOR_STALE_TIMEOUT` (100ms) in `loop_runner.rs`: if the simulation loop has active motors but receives no actuator commands from PX4 for 100ms, motor outputs are zeroed and `board_stall` is raised (state byte `[95]`) until the next command. Zeroing prevents runaway physics when the FC crashes or disconnects mid-flight.
+
+Armed is deliberately **not** cleared: a stall is not a disarm PX4 made, and the browser's run screen read the old fake disarm as a landing and ended flights mid-air. The disarm for a vanished FC comes from the reconnect task's "FC connection lost" branch (`SimulationState::mark_fc_lost`), after the heartbeat timeout or a serial error.
 
 ### Auto PID re-push after reconnect
 `BuildConfigHandler::repush_if_configured()` triggers 3s after reconnect when `retry_count > 0`. It re-sends the last `LastVerifiedParams` to PX4 so PIDs do not reset to firmware defaults on a USB reconnect.
@@ -235,7 +237,7 @@ The impulse is derived from **NED** velocity and the accelerometer reads in the 
 
 - Port: 9876
 - Endpoint: `ws://localhost:9876/ws`
-- Binary protocol for telemetry (30 Hz): includes battery open-circuit voltage and percent, plus loaded (terminal) voltage and total motor current at bytes 87-94 (95-byte frame; readers accept >= 86)
+- Binary protocol for telemetry (30 Hz): includes battery open-circuit voltage and percent, plus loaded (terminal) voltage and total motor current at bytes 87-94 (always written, NaN when unknown) and a board-stall flag at byte 95 (96-byte frame; readers accept >= 86)
 - JSON for commands (NSH, ConfigureBuild, Recharge)
 - **Ping/pong**: 5s ping interval, 15s pong timeout — zombie connections are detected and dropped
 - `ConnectionStatus` message includes `bootloader_suspected: bool` field

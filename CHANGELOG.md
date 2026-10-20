@@ -17,6 +17,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   frames of at least 86 bytes; the daemon's parser reports the flag as
   unavailable below 96 bytes.
 
+### Changed
+
+- **A motor-command stall no longer reports a disarm.** When the flight
+  controller's motor commands stopped for more than 100 ms, the stall guard
+  zeroed the motors and set `armed = false`, a disarm PX4 never made; the
+  browser's run screen read it as a landing and ended the flight mid-air,
+  opening its report over the instruments. The guard still zeroes the motors,
+  but now raises the board-stall flag and keeps PX4's armed state. Declaring
+  the FC connection lost (heartbeat timeout or serial error) is what reports
+  the disarm now.
+
 ## [0.25.0]
 
 ### Added
