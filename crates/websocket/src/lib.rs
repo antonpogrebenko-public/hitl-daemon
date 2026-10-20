@@ -16,6 +16,7 @@ pub mod server;
 pub mod snapshot;
 #[cfg(test)]
 pub(crate) mod test_support;
+mod vehicle_reset;
 
 pub use board_identity::BoardIdentity;
 pub use build_config::BuildConfigHandler;

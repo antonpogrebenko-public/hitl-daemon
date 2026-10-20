@@ -4,7 +4,7 @@
 use crate::nsh_await::{judge_ekf2_start, judge_ekf2_stop, run_nsh, InternalRequestIds, NshLink};
 use crate::protocol::Px4HealthReport;
 use crate::px4_ready::{wait_for_px4_ready, Px4Timing};
-use simulation::Px4HealthMonitor;
+use simulation::{Px4HealthMonitor, SimulationState};
 use std::sync::Arc;
 use tokio::sync::{Mutex, MutexGuard};
 use tokio::time::Instant;
@@ -56,6 +56,34 @@ impl FcSession {
     /// a second request is refused, not queued behind a long flow).
     pub fn try_begin(&self) -> Option<MutexGuard<'_, ()>> {
         self.lock.try_lock().ok()
+    }
+
+    /// Whether PX4 itself reports the vehicle armed.
+    ///
+    /// Without a flight controller (`--sim-only`) the hover generator reports
+    /// armed for the whole session, so the flag says nothing about a PX4 that
+    /// does not exist and the armed refusal must not apply.
+    pub fn px4_reports_armed(&self, sim_state: &SimulationState) -> bool {
+        !self.is_sim_only() && sim_state.is_armed()
+    }
+
+    /// Takes the session for a reset or configure, or says why it is refused.
+    ///
+    /// The armed check runs before the lock so a refusal costs nothing, and
+    /// again after it: a flight can start while another flow held the session,
+    /// and the check at the door would then be stale.
+    pub fn begin_unless_armed(
+        &self,
+        sim_state: &SimulationState,
+    ) -> Result<MutexGuard<'_, ()>, &'static str> {
+        if self.px4_reports_armed(sim_state) {
+            return Err(ARMED_REFUSAL);
+        }
+        let guard = self.try_begin().ok_or(BUSY_REFUSAL)?;
+        if self.px4_reports_armed(sim_state) {
+            return Err(ARMED_REFUSAL);
+        }
+        Ok(guard)
     }
 
     /// Takes the session, waiting for the holder. The reconnect re-push uses

@@ -890,15 +890,28 @@ async fn main() {
         // flight in progress — see `timebase_arming_gate`.
         .with_timebase_stats(preflight_stats_rx),
     );
-    let build_config_handler = std::sync::Arc::new(websocket::BuildConfigHandler::new(
-        build_config_tx,
-        nsh_tx_for_config,
-        build_config_mav_tx,
-        build_config_param_value_tx,
-        Some(terrain_cache.clone()),
-        terrain_ref,
-        Some(flight_origin.clone()),
-    ));
+    // No NSH link in sim-only mode: there is no board to restart or to be armed.
+    let nsh_link = if sim_only_mode {
+        None
+    } else {
+        Some(websocket::NshLink {
+            commands: nsh_cmd_tx.clone(),
+            replies: nsh_resp_broadcast_tx.clone(),
+        })
+    };
+    let fc_session = Arc::new(websocket::FcSession::new(nsh_link, px4_health.clone()));
+    let build_config_handler = std::sync::Arc::new(
+        websocket::BuildConfigHandler::new(
+            build_config_tx,
+            nsh_tx_for_config,
+            build_config_mav_tx,
+            build_config_param_value_tx,
+            Some(terrain_cache.clone()),
+            terrain_ref,
+            Some(flight_origin.clone()),
+        )
+        .with_fc_session(fc_session, sim_state.clone()),
+    );
     // Keep a clone for the reconnect task so it can re-push PIDs after FC power cycles.
     let build_config_handler_for_reconnect = build_config_handler.clone();
     ws_server.set_build_config_handler(build_config_handler);

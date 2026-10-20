@@ -18,6 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   passes on any reply, including "not running"; `ekf2 start` fails when its
   reply contains "error" or "failed". No reply, "No FC connected" or a full NSH
   queue fails either step, and the error reads "EKF2 restart failed: <reason>".
+- **A `ResetVehicle` command (byte 8) returns the vehicle to the start.** It is
+  acknowledged at once, then resets position, attitude, velocity, motors, the
+  battery (full) and the stall flag, keeping the location, the applied build
+  and the clock, restarts EKF2 and reports `ResetResult` (0x19) stages
+  (`resetting_vehicle`, `restarting_ekf`, `waiting_for_px4`) until PX4 can arm.
+  It is refused while armed or while another reset or configuration runs. In
+  `--sim-only` it is `ready` with `px4_health: "not_applicable"`. `Rtl` (byte 4)
+  is unchanged.
 
 ## [0.26.0]
 

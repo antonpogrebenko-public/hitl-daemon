@@ -1,9 +1,11 @@
+use crate::fc_session::FcSession;
 use crate::handler::ValidatedNshCommand;
 use crate::param_io::ParamValue;
 use crate::protocol::{
     AppliedConfig, ConfigResult, ConfigStage, ConfigState, ConfigureBuild, OutgoingMessage,
-    Px4PidsView,
+    Px4PidsView, ResetResult,
 };
+use crate::vehicle_reset::{run_reset, RESET_UNAVAILABLE};
 use crossbeam_channel::Sender;
 use hitl_physics::px4_pids::{compute_pids, fingerprint as pid_fingerprint, Px4Pids};
 use hitl_physics::{
@@ -11,7 +13,8 @@ use hitl_physics::{
     PhysicsConfig,
 };
 use mavlink::ardupilotmega::{MavCmd, MavMessage, MavParamType, COMMAND_LONG_DATA, PARAM_SET_DATA};
-use std::sync::Mutex;
+use simulation::SimulationState;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::timeout;
@@ -76,6 +79,10 @@ pub struct BuildConfigHandler {
     /// `ConfigureBuild` sets it, so ground contact, the barometer and HIL_GPS
     /// adopt the browser's chosen location and elevation together.
     flight_origin: Option<std::sync::Arc<simulation::SharedOrigin>>,
+    /// The flight-controller session and the simulation state the reset flow
+    /// works on. `None` until `with_fc_session`: the reset is then unavailable.
+    fc_session: Option<Arc<FcSession>>,
+    sim_state: Option<SimulationState>,
 }
 
 /// Snapshot of the parameters that were last successfully verified on PX4.
@@ -227,7 +234,31 @@ impl BuildConfigHandler {
             terrain_cache,
             terrain_ref: Mutex::new(terrain_ref),
             flight_origin,
+            fc_session: None,
+            sim_state: None,
         }
+    }
+
+    /// Gives the handler the session and simulation state the vehicle reset
+    /// needs. A builder rather than a `new` parameter: `new` is at the limit
+    /// of the arguments clippy accepts.
+    pub fn with_fc_session(mut self, session: Arc<FcSession>, sim_state: SimulationState) -> Self {
+        self.fc_session = Some(session);
+        self.sim_state = Some(sim_state);
+        self
+    }
+
+    /// Resets the vehicle to the start (see `vehicle_reset::run_reset`),
+    /// reporting each stage on `progress_tx`, and returns the terminal result.
+    pub async fn reset_vehicle(&self, progress_tx: mpsc::Sender<OutgoingMessage>) -> ResetResult {
+        let (Some(session), Some(sim_state)) = (&self.fc_session, &self.sim_state) else {
+            let result = ResetResult::failed(RESET_UNAVAILABLE);
+            let _ = progress_tx
+                .send(OutgoingMessage::ResetResult(result.clone()))
+                .await;
+            return result;
+        };
+        run_reset(session, sim_state, &progress_tx).await
     }
 
     /// Anchor the whole vertical stack to a flight origin.

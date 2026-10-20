@@ -8,8 +8,10 @@ use crate::preflight::PreflightHandler;
 use crate::protocol::{
     Command, CommandAck, CommandType, ConfigResult, ConfigState, HandshakeAck, IncomingMessage,
     NshCommand, NshResponse, OutgoingMessage, PreflightApplyResult, PreflightApplyState,
-    PreflightReadiness, PreflightStatus, RestoreResult, RestoreState, SnapshotStored, StateUpdate,
+    PreflightReadiness, PreflightStatus, ResetResult, RestoreResult, RestoreState, SnapshotStored,
+    StateUpdate,
 };
+use crate::vehicle_reset::RESET_UNAVAILABLE;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -244,6 +246,11 @@ impl ConnectionHandler {
             }
             IncomingMessage::Command(cmd) => {
                 debug!(client_id, command_id = cmd.command_id, ?cmd.command_type, "Received command");
+                if cmd.command_type == CommandType::ResetVehicle {
+                    self.dispatch_reset(client_id, cmd.command_id, progress_tx)
+                        .await;
+                    return Ok(None);
+                }
                 Ok(Some(self.handle_command(client_id, cmd).await))
             }
             IncomingMessage::NshCommand(nsh) => {
@@ -743,6 +750,44 @@ impl ConnectionHandler {
         Ok(())
     }
 
+    /// Acknowledges a reset at once, then runs it on a detached task.
+    ///
+    /// The ack goes first so the browser knows the command arrived before any
+    /// stage lands; the reset takes seconds (EKF2 restart, pre-arm wait) and
+    /// must not block this client's receive loop. It bypasses `handle_command`,
+    /// its rate limit and the `command_tx` loop: a reset is not a flight command.
+    async fn dispatch_reset(
+        &self,
+        client_id: u64,
+        command_id: u32,
+        progress_tx: &mpsc::Sender<OutgoingMessage>,
+    ) {
+        let ack = CommandAck {
+            command_id,
+            success: true,
+            error: None,
+        };
+        if progress_tx
+            .send(OutgoingMessage::CommandAck(ack))
+            .await
+            .is_err()
+        {
+            debug!(client_id, "Reset ack not delivered: client gone");
+        }
+        let Some(build_config) = self.build_config.clone() else {
+            let unavailable = ResetResult::failed(RESET_UNAVAILABLE);
+            let _ = progress_tx
+                .send(OutgoingMessage::ResetResult(unavailable))
+                .await;
+            return;
+        };
+        info!(client_id, command_id, "Vehicle reset requested");
+        let progress_tx = progress_tx.clone();
+        tokio::spawn(async move {
+            build_config.reset_vehicle(progress_tx).await;
+        });
+    }
+
     /// Clean up rate limit entries for disconnected clients
     pub async fn cleanup_client(&self, client_id: u64) {
         self.rate_limits.write().await.remove(&client_id);
@@ -778,7 +823,8 @@ mod tests {
     use crate::protocol;
     use tokio::sync::broadcast;
 
-    async fn create_test_handler() -> (ConnectionHandler, mpsc::Receiver<ValidatedCommand>) {
+    pub(super) async fn create_test_handler(
+    ) -> (ConnectionHandler, mpsc::Receiver<ValidatedCommand>) {
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
         let (state_tx, state_rx) = broadcast::channel(16);
         drop(state_tx); // We don't need to send states in these tests
@@ -1272,3 +1318,7 @@ mod tests {
         assert!(terminal.error.unwrap().contains("identifying serial"));
     }
 }
+
+#[cfg(test)]
+#[path = "handler_dispatch_tests.rs"]
+mod dispatch_tests;
