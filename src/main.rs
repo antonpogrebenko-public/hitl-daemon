@@ -1381,6 +1381,9 @@ async fn main() {
                 // Not connected - clean up old connection if any
                 if current_mav_io.is_some() {
                     warn!("FC connection lost");
+                    // The stall guard keeps PX4's armed state, so this is where
+                    // a vanished FC reads as disarmed.
+                    sim_state_reconnect.mark_fc_lost();
                     current_mav_io = None;
                     *mav_io_shared.write().await = None;
                     *fc_model_reconnect.write().await = None;

@@ -235,6 +235,17 @@ impl SimulationState {
         self.inner.write().armed = armed;
     }
 
+    /// The flight-controller connection was declared lost (main.rs reconnect
+    /// task): report disarmed, end any stall and stop the motors, in one write.
+    /// The stall guard keeps PX4's armed state, so losing the FC is what
+    /// reports the disarm that ends a flight in the browser.
+    pub fn mark_fc_lost(&self) {
+        let mut inner = self.inner.write();
+        inner.armed = false;
+        inner.board_stall = false;
+        inner.motor_commands = [0.0; 4];
+    }
+
     /// Update flight mode from flight controller
     pub fn set_flight_mode(&self, mode: u8) {
         self.inner.write().flight_mode = mode;
@@ -330,6 +341,30 @@ impl SimulationState {
 mod tests {
     use super::*;
     use hitl_physics::BatteryConfig;
+
+    #[test]
+    fn mark_fc_lost_disarms_and_clears_the_stall() {
+        let sim = SimulationState::new(SimulationConfig::default());
+        {
+            let mut s = sim.write();
+            s.armed = true;
+            s.board_stall = true;
+            s.motor_commands = [0.5; 4];
+        }
+        sim.mark_fc_lost();
+        let s = sim.read();
+        assert!(!s.armed);
+        assert!(!s.board_stall);
+        assert_eq!(s.motor_commands, [0.0; 4]);
+    }
+
+    #[test]
+    fn mark_fc_lost_disarms_without_a_stall_in_progress() {
+        let sim = SimulationState::new(SimulationConfig::default());
+        sim.set_armed(true);
+        sim.mark_fc_lost();
+        assert!(!sim.read().armed);
+    }
 
     /// A recharge between ticks must not leave the drained pack's loaded
     /// voltage beside the full pack's open-circuit voltage: a client would read
