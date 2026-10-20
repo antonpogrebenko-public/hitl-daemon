@@ -30,14 +30,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **ConfigureBuild is refused while PX4 is armed or while a reset or another
-  apply runs, and is never half applied.** The refusals read "Land and disarm
+  apply runs, and a failed push changes nothing the vehicle flies on.** The
+  refusals read "Land and disarm
   first." and "Another reset or configuration is in progress." and change
   nothing (in `--sim-only` the armed refusal does not apply). The flight
   location (origin, datum and terrain anchor) moves only after the PX4
   parameters are confirmed, and not at all if PX4 was armed during the push;
   the daemon then waits for the simulation loop to apply the build (up to 1 s)
   before EKF2 is restarted. Any failed apply forgets the PID fingerprint, so
-  the retry writes every parameter again.
+  the retry writes every parameter again. A failure after the simulation has
+  applied the build (the loop missing the 1 s wait, a failed EKF2 restart, or a
+  pre-arm check that never passes) still reports an error, but leaves the new
+  build, location and parameters in effect; the retry applies it again.
 - **ConfigureBuild reports `ready` only once PX4 can arm.** After the
   simulation applies the build, the daemon restarts EKF2 with the confirmed
   restart above, then waits for PX4's pre-arm check under a new final stage,
@@ -46,7 +50,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   passes is an error carrying PX4's reason. In `--sim-only` there is no restart
   and no such stage, and `ready` carries `not_applicable`. The old unconfirmed
   restart, three attempts with 200 ms backoff, is gone, with the handler's
-  NSH sender.
+  NSH sender. A browser that fails an apply after a fixed 15 s and does not
+  know `waiting_for_px4` (th3seus-web before its fly-again reset and
+  reconfigure change) can show a timeout while PX4 recovers, so ship that
+  browser change first or together with this daemon.
 - **ConfigureBuild runs off the WebSocket receive loop**, as the vehicle reset
   does. It delivers every result, the terminal one included, over the
   connection's channel, so a long apply no longer trips the 15 s pong timeout

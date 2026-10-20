@@ -391,7 +391,10 @@ impl BuildConfigHandler {
     ///    sends no SYS_STATUS, or `not_applicable` without a flight controller.
     ///
     /// A refusal or a failure returns `state: Error`. A failure before step 5
-    /// leaves the previous flight location, physics and vehicle in effect.
+    /// leaves the previous flight location, physics and vehicle in effect. A
+    /// failure in step 6 or 7 leaves the new build in effect (origin, physics,
+    /// PX4 parameters, and EKF2 stopped if its start failed); the retry
+    /// applies it again.
     /// Every failure forgets the PID fingerprint, so the retry writes every
     /// parameter again: PX4 may hold part of this push.
     pub async fn handle(

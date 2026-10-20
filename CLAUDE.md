@@ -97,7 +97,7 @@ It runs off the WebSocket receive loop and reports each stage as a `ConfigResult
 8. `waiting_for_px4`: until PX4's pre-arm check passes (up to 30 s)
 9. `state: ready` with the applied config, estimated flight time and `px4_health` (`healthy`, or `unknown` when PX4 sends no `SYS_STATUS`). In `--sim-only` steps 7 and 8 are skipped and `px4_health` is `not_applicable`.
 
-Any failure ends in `state: error` and forgets the PID fingerprint, so the retry pushes every parameter again. A success stores `LastVerifiedParams`; if `retry_count > 0`, `repush_if_configured()` re-pushes PID params 3s after reconnect.
+Any failure ends in `state: error` and forgets the PID fingerprint, so the retry pushes every parameter again. A failure before step 5 leaves the previous location, physics and vehicle in effect; a failure from step 6 on (the loop missing the 1 s wait, a failed EKF2 restart, a pre-arm check that never passes) leaves the new build in effect, and the retry applies it again. A success stores `LastVerifiedParams`; if `retry_count > 0`, `repush_if_configured()` re-pushes PID params 3s after reconnect.
 
 ### Recharge Command
 The web UI can send a `Recharge` command to reset battery to 100% without resetting position/attitude. Handled in the websocket handler before forwarding to FC.
