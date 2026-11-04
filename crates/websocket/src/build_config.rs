@@ -1361,6 +1361,21 @@ fn parse_imu_chip(s: &str) -> ImuChip {
         "icm42688p" | "icm42688" => ImuChip::Icm42688p,
         "bmi270" => ImuChip::Bmi270,
         "lsm6dso" | "lsm6dso32" => ImuChip::Lsm6dso,
+        "adis16470" => ImuChip::Adis16470,
+        "adis16607" => ImuChip::Adis16607,
+        "bmi055" => ImuChip::Bmi055,
+        "bmi088" => ImuChip::Bmi088,
+        "icm20602" => ImuChip::Icm20602,
+        "icm20608g" => ImuChip::Icm20608g,
+        "icm20649" => ImuChip::Icm20649,
+        "icm20948" => ImuChip::Icm20948,
+        "icm42670p" => ImuChip::Icm42670p,
+        "icm42686p" => ImuChip::Icm42686p,
+        "icm45686" => ImuChip::Icm45686,
+        "iim42652" => ImuChip::Iim42652,
+        "iim42653" => ImuChip::Iim42653,
+        "mpu9250" => ImuChip::Mpu9250,
+        "sch16t" => ImuChip::Sch16t,
         _ => ImuChip::Other,
     }
 }
@@ -1378,6 +1393,8 @@ fn parse_baro_chip(s: &str) -> BaroChip {
         "dps310" => BaroChip::Dps310,
         "spl06" | "spl06001" => BaroChip::Spl06,
         "ms5611" | "ms561101ba03" => BaroChip::Ms5611,
+        "bmp581" => BaroChip::Bmp581,
+        "icp201xx" => BaroChip::Icp201xx,
         _ => BaroChip::Other,
     }
 }
@@ -1467,6 +1484,11 @@ fn parse_mag_chip(s: &str) -> MagChip {
         "rm3100" => MagChip::Rm3100,
         "lis3mdl" => MagChip::Lis3mdl,
         "none" | "" => MagChip::None,
+        "ak09916" => MagChip::Ak09916,
+        "bmm150" => MagChip::Bmm150,
+        "bmm350" => MagChip::Bmm350,
+        "iis2mdc" => MagChip::Iis2mdc,
+        "qmc5883p" => MagChip::Qmc5883p,
         _ => MagChip::Other,
     }
 }
@@ -1474,6 +1496,9 @@ fn parse_mag_chip(s: &str) -> MagChip {
 fn parse_gps_chipset(s: &str) -> hitl_physics::build::GpsChipset {
     use hitl_physics::build::GpsChipset;
     let normalized = s.to_lowercase().replace(['-', '_', ' '], "");
+    if matches!(normalized.as_str(), "ubx7") {
+        return GpsChipset::Ubx7;
+    }
     if normalized.contains("f9p") || normalized.contains("zedf9p") {
         return GpsChipset::UbloxF9P;
     }
@@ -1599,6 +1624,137 @@ mod tests {
     use hitl_physics::build::{BatterySpec, EscSpec};
     use hitl_physics::px4_pids::REF_PIDS;
     use mavlink::ardupilotmega::MavMessage;
+
+    /// Spellings that 0.27.0 already parsed must keep their variants.
+    #[test]
+    fn parsers_keep_every_0_27_spelling() {
+        use hitl_physics::build::GpsChipset;
+        let imu = [
+            ("MPU6000", ImuChip::Mpu6000),
+            ("mpu-6000p", ImuChip::Mpu6000),
+            ("MPU6500", ImuChip::Mpu6500),
+            ("mpu6500p", ImuChip::Mpu6500),
+            ("ICM-20689", ImuChip::Icm20689),
+            ("icm20689p", ImuChip::Icm20689),
+            ("ICM-42688-P", ImuChip::Icm42688p),
+            ("icm42688", ImuChip::Icm42688p),
+            ("BMI270", ImuChip::Bmi270),
+            ("LSM6DSO", ImuChip::Lsm6dso),
+            ("lsm6dso32", ImuChip::Lsm6dso),
+        ];
+        for (input, expected) in imu {
+            assert_eq!(parse_imu_chip(input), expected, "imu {input:?}");
+        }
+        let baro = [
+            ("BMP280", BaroChip::Bmp280),
+            ("BMP388", BaroChip::Bmp388),
+            ("BMP390", BaroChip::Bmp388),
+            ("DPS310", BaroChip::Dps310),
+            ("SPL06", BaroChip::Spl06),
+            ("spl06-001", BaroChip::Spl06),
+            ("MS5611", BaroChip::Ms5611),
+            ("ms5611-01ba03", BaroChip::Ms5611),
+        ];
+        for (input, expected) in baro {
+            assert_eq!(parse_baro_chip(input), expected, "baro {input:?}");
+        }
+        let mag = [
+            ("HMC5883", MagChip::Hmc5883),
+            ("hmc5883l", MagChip::Hmc5883),
+            ("QMC5883", MagChip::Qmc5883),
+            ("qmc5883l", MagChip::Qmc5883),
+            ("IST8310", MagChip::Ist8310),
+            ("RM3100", MagChip::Rm3100),
+            ("LIS3MDL", MagChip::Lis3mdl),
+            ("None", MagChip::None),
+            ("", MagChip::None),
+        ];
+        for (input, expected) in mag {
+            assert_eq!(parse_mag_chip(input), expected, "mag {input:?}");
+        }
+        let gps = [
+            ("u-blox ZED-F9P", GpsChipset::UbloxF9P),
+            ("NEO-M10", GpsChipset::UbloxM10),
+            ("NEO-M9N", GpsChipset::UbloxM9N),
+            ("NEO-M8N", GpsChipset::UbloxM8N),
+            ("Septentrio mosaic-X5", GpsChipset::SeptentrioMosaic),
+            ("Here3", GpsChipset::Here3),
+            ("unknown", GpsChipset::Other),
+        ];
+        for (input, expected) in gps {
+            assert_eq!(parse_gps_chipset(input), expected, "gps {input:?}");
+        }
+    }
+
+    /// One row per arm of the calibration run's `rust/daemon_aliases.rs`
+    /// (th3seus-tools): the normalized name, plus a catalog-style spelling.
+    #[test]
+    fn parsers_know_the_run_spellings() {
+        use hitl_physics::build::GpsChipset;
+        let imu = [
+            ("adis16470", ImuChip::Adis16470),
+            ("ADIS16470", ImuChip::Adis16470),
+            ("adis16607", ImuChip::Adis16607),
+            ("ADIS16607", ImuChip::Adis16607),
+            ("bmi055", ImuChip::Bmi055),
+            ("BMI055", ImuChip::Bmi055),
+            ("bmi088", ImuChip::Bmi088),
+            ("BMI088", ImuChip::Bmi088),
+            ("icm20602", ImuChip::Icm20602),
+            ("ICM-20602", ImuChip::Icm20602),
+            ("icm20608g", ImuChip::Icm20608g),
+            ("ICM-20608-G", ImuChip::Icm20608g),
+            ("icm20649", ImuChip::Icm20649),
+            ("ICM-20649", ImuChip::Icm20649),
+            ("icm20948", ImuChip::Icm20948),
+            ("ICM-20948", ImuChip::Icm20948),
+            ("icm42670p", ImuChip::Icm42670p),
+            ("ICM-42670-P", ImuChip::Icm42670p),
+            ("icm42686p", ImuChip::Icm42686p),
+            ("ICM-42686-P", ImuChip::Icm42686p),
+            ("icm45686", ImuChip::Icm45686),
+            ("ICM-45686", ImuChip::Icm45686),
+            ("iim42652", ImuChip::Iim42652),
+            ("IIM-42652", ImuChip::Iim42652),
+            ("iim42653", ImuChip::Iim42653),
+            ("IIM-42653", ImuChip::Iim42653),
+            ("mpu9250", ImuChip::Mpu9250),
+            ("MPU-9250", ImuChip::Mpu9250),
+            ("sch16t", ImuChip::Sch16t),
+            ("SCH16T", ImuChip::Sch16t),
+        ];
+        for (input, expected) in imu {
+            assert_eq!(parse_imu_chip(input), expected, "imu {input:?}");
+        }
+        let baro = [
+            ("bmp581", BaroChip::Bmp581),
+            ("BMP581", BaroChip::Bmp581),
+            ("icp201xx", BaroChip::Icp201xx),
+            ("ICP-201xx", BaroChip::Icp201xx),
+        ];
+        for (input, expected) in baro {
+            assert_eq!(parse_baro_chip(input), expected, "baro {input:?}");
+        }
+        let mag = [
+            ("ak09916", MagChip::Ak09916),
+            ("AK09916", MagChip::Ak09916),
+            ("bmm150", MagChip::Bmm150),
+            ("BMM150", MagChip::Bmm150),
+            ("bmm350", MagChip::Bmm350),
+            ("BMM350", MagChip::Bmm350),
+            ("iis2mdc", MagChip::Iis2mdc),
+            ("IIS2MDC", MagChip::Iis2mdc),
+            ("qmc5883p", MagChip::Qmc5883p),
+            ("QMC5883P", MagChip::Qmc5883p),
+        ];
+        for (input, expected) in mag {
+            assert_eq!(parse_mag_chip(input), expected, "mag {input:?}");
+        }
+        let gps = [("ubx7", GpsChipset::Ubx7), ("UBX-7", GpsChipset::Ubx7)];
+        for (input, expected) in gps {
+            assert_eq!(parse_gps_chipset(input), expected, "gps {input:?}");
+        }
+    }
 
     /// A 1500 mAh pack and an ESC with the given ratings, plus the physics
     /// `to_physics_config()` derives from them.
