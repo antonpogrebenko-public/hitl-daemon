@@ -13,22 +13,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   first source that has one.** For the IMU, the barometer, the magnetometer and
   the GPS receiver, a part the build names (other than `Other`) takes its
   `hitl-physics` table value; otherwise the request's sensor profile value for
-  that sensor applies; otherwise the `Other` entry. Before, the request's
-  MCU-family profile overrode every chip value. A build with no magnetometer
+  that sensor applies; otherwise the `Other` entry. Before, any value in
+  the request's sensor profile overrode the chip's table value, whatever its
+  match type. A build with no magnetometer
   (none listed, or "None") and a build with no GPS module keep their 0.27.0
   values (request value, else 0.005 G; request values, else 0.1 m / 0.3 m /
   0.05 m/s at 10 Hz, 80 ms).
 - **A build names only the sensor chips its FC catalog lists.** The daemon no
   longer starts from the reference build's MPU-6000 and BMP280. A build without
   FC catalog sensor data (no FC slug, a failed fetch or a missing key) follows
-  the request profile, then `Other`, for those sensors.
+  the request profile, then `Other`, for the IMU and the barometer; its
+  magnetometer is treated as absent (request value, else 0.005 G).
 - **An FC whose catalog barometer is "None" or empty still gets a simulated
-  barometer.** It follows the unknown-part rule, and the daemon logs "FC lists
+  barometer.** It follows the same rule as an unknown part (the request profile value, else
+  the `Other` entry), and the daemon logs "FC lists
   no barometer; simulating one with the fallback noise". No build is rejected.
 
 ### Added
 
-- **23 part spellings from the calibration run are recognised.**
+- **23 new part spellings are recognised.**
   - IMU (15): ADIS16470, ADIS16607, BMI055, BMI088, ICM-20602, ICM-20608-G,
     ICM-20649, ICM-20948, ICM-42670-P, ICM-42686-P, ICM-45686, IIM-42652,
     IIM-42653, MPU-9250, SCH16T.
@@ -40,14 +43,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The "Sensor noise" log line names each sensor's source** in a new `sources`
   field, for example
   `imu=table:Icm42688p baro=profile:mcu_family mag=other gps=table:UbloxM9N`.
-  `default` marks the no-magnetometer and no-GPS-module defaults, and
-  `mixed(gyro=...,accel=...)` marks a sensor whose fields came from different
-  sources.
+  `default` marks the no-magnetometer and no-GPS-module defaults, while
+  `profile:default` means the request sent profile values without a match type.
+  `mixed(...)` marks a sensor whose fields came from different sources, for
+  example `mixed(gyro=...,accel=...)` for the IMU (the GPS prints
+  `mixed(h=...,alt=...,vel=...)`).
 
 ### Dependencies
 
-- Picks up `hitl-physics` 0.14.0 (its measured part tables and new variants).
-  Merge after that `hitl-physics` release. The `websocket` crate moves from
+- Requires `hitl-physics` 0.14.0 (its measured part tables and new variants).
+  The `websocket` crate moves from
   0.6.0 to 0.7.0.
 
 ## [0.27.0]
