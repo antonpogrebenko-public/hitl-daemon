@@ -12,18 +12,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **BREAKING for builds with known chips: each sensor takes its value from the
   first source that has one.** For the IMU, the barometer, the magnetometer and
   the GPS receiver, a part the build names (other than `Other`) takes its
-  `hitl-physics` table value; otherwise the request's sensor profile value for
+  `hitl-physics` table value (for a named GPS receiver that covers the noise
+  values and the delay; the update rate still comes from the GPS listing's
+  catalog `updateRateHz`, else 10 Hz, never the table rate); otherwise the request's sensor profile value for
   that sensor applies; otherwise the `Other` entry. Before, any value in
   the request's sensor profile overrode the chip's table value, whatever its
   match type. A build with no magnetometer
   (none listed, or "None") and a build with no GPS module keep their 0.27.0
   values (request value, else 0.005 G; request values, else 0.1 m / 0.3 m /
   0.05 m/s at 10 Hz, 80 ms).
-- **A build names only the sensor chips its FC catalog lists.** The daemon no
-  longer starts from the reference build's MPU-6000 and BMP280. A build without
-  FC catalog sensor data (no FC slug, a failed fetch or a missing key) follows
-  the request profile, then `Other`, for the IMU and the barometer; its
-  magnetometer is treated as absent (request value, else 0.005 G).
+- **BREAKING for builds without FC catalog sensor data: a build names only the
+  sensor chips its FC catalog lists.** The daemon no longer starts from the
+  reference build's MPU-6000 and BMP280. A build without FC catalog sensor data
+  (no FC slug, a failed fetch or a missing key) follows the request profile,
+  then `Other`, for the IMU and the barometer; its magnetometer is treated as
+  absent (request value, else 0.005 G). Without request values its values
+  change: the IMU and barometer move from the MPU-6000 and BMP280 entries to
+  `Other` (for example the barometer noise goes from 0.16 m to 0.2198 m).
 - **An FC whose catalog barometer is "None" or empty still gets a simulated
   barometer.** It follows the same rule as an unknown part (the request profile value, else
   the `Other` entry), and the daemon logs "FC lists
@@ -45,11 +50,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   field, for example
   `imu=table:Icm42688p baro=profile:mcu_family mag=other gps=table:UbloxM9N`.
   `default` marks the no-magnetometer and no-GPS-module defaults, while
-  `profile:default` means the request sent profile values without a match type.
+  `profile:default` means the request sent profile values without a match type,
+  and `profile:<match type>` prints the match type only when it is `exact`,
+  `mcu_family` or `average`; an unrecognised match type prints as `unknown`.
   `mixed(...)` marks a sensor whose fields came from different sources, for
   example `mixed(gyro=...,accel=...)` for the IMU (the GPS prints
   `mixed(h=...,alt=...,vel=...)`). The line now opens with
-  `Sensor noise (request profile: <match type>)`, because the bracket names
+  `Sensor noise (request profile: <match type>)` (an unrecognised match type
+  prints as `unknown` there too), because the bracket names
   the profile the request carried, not where each value came from; the
   `sources` field says that.
 

@@ -723,12 +723,14 @@ impl BuildConfigHandler {
         // noise densities for realistic sensor behavior.
         let (sensors_config, sources) = build_sensors_config(&spec, &request);
 
-        // Log the resolved sensor noise and how the profile was matched
-        // (exact / mcu_family / average, or "default" when no profile was sent).
+        // Log the resolved sensor noise. The header names the request's match
+        // type ("default" when it carried none, "unknown" when it is not a
+        // recognised value), and `sources` names where each sensor's values
+        // came from.
         info!(
             sources = %sensor_sources_line(&sources),
             "Sensor noise (request profile: {}): gyro_nd={:.6} accel_nd={:.5} | baro={:.4}m mag={:.5}G | gps h={:.3}m alt={:.3}m vel={:.3}m/s rate={}Hz delay={}ms",
-            request.sensor_match_type.as_deref().unwrap_or("default"),
+            match_type_label(request.sensor_match_type.as_deref()),
             sensors_config.imu.gyro_noise_density,
             sensors_config.imu.accel_noise_density,
             sensors_config.baro.noise_sigma,
@@ -1382,7 +1384,9 @@ fn parse_baro_chip(s: &str) -> BaroChip {
 
 /// The spec a configure starts from. The reference build's sensor chips are
 /// not parts this build names, so a chip counts only when the FC catalog
-/// names it; the rest follow the request profile, then the `Other` entry.
+/// names it. The IMU and barometer follow the request profile, then the
+/// `Other` entry; a magnetometer the FC does not name counts as none (request
+/// value, else the HITL default).
 fn new_build_spec() -> BuildSpec {
     let mut spec = BuildSpec::default();
     spec.flight_controller.imu_chip = None;
@@ -1621,7 +1625,7 @@ fn pick_value(
     match request {
         Some(v) => (
             v,
-            SensorSource::Profile(match_type.unwrap_or("default").to_string()),
+            SensorSource::Profile(match_type_label(match_type).to_string()),
         ),
         None => (other, SensorSource::Other),
     }
@@ -1645,9 +1649,17 @@ fn shared_source(fields: Vec<(&'static str, SensorSource)>) -> SensorSource {
     }
 }
 
-/// The label text for a request value's match type.
-fn profile_label(mt: Option<&str>) -> String {
-    mt.unwrap_or("default").to_string()
+/// The label text for a request value's match type. The type comes from the
+/// websocket client unchecked, so only the known values are passed through;
+/// anything else prints as `unknown`, which keeps it out of the logs.
+fn match_type_label(mt: Option<&str>) -> &'static str {
+    match mt {
+        None => "default",
+        Some("exact") => "exact",
+        Some("mcu_family") => "mcu_family",
+        Some("average") => "average",
+        Some(_) => "unknown",
+    }
 }
 
 /// IMU noise: the named part, else the request profile, else `Other`. Bias
@@ -1738,7 +1750,7 @@ fn mag_config(
             pick_value(name.as_deref(), request.mag_noise_sigma, mt, table, other)
         }
         None => match request.mag_noise_sigma {
-            Some(v) => (v, SensorSource::Profile(profile_label(mt))),
+            Some(v) => (v, SensorSource::Profile(match_type_label(mt).to_string())),
             None => (NO_MAG_NOISE_GAUSS, SensorSource::Default),
         },
     };
@@ -1825,7 +1837,7 @@ fn default_gps_config(
     mt: Option<&str>,
 ) -> (hitl_sensors::GpsConfig, SensorSource) {
     let field = |req: Option<f64>, default: f64| match req {
-        Some(v) => (v, SensorSource::Profile(profile_label(mt))),
+        Some(v) => (v, SensorSource::Profile(match_type_label(mt).to_string())),
         None => (default, SensorSource::Default),
     };
     let (h, h_src) = field(request.gps_horizontal_noise, NO_GPS_HORIZONTAL_NOISE_M);
@@ -2779,6 +2791,9 @@ mod tests {
         assert_eq!(cfg.gps.velocity_noise_sigma, NO_GPS_VELOCITY_NOISE_MPS);
         assert_eq!(cfg.gps.update_rate_hz, NO_GPS_UPDATE_RATE_HZ);
         assert_eq!(cfg.gps.delay_ms, NO_GPS_DELAY_MS);
+        assert_eq!(cfg.gps.horizontal_noise_sigma, 0.1);
+        assert_eq!(cfg.gps.altitude_noise_sigma, 0.3);
+        assert_eq!(cfg.gps.velocity_noise_sigma, 0.05);
         assert_eq!(sources.gps, SensorSource::Default);
     }
 
@@ -2985,6 +3000,7 @@ mod tests {
             gyro_noise_density: Some(0.03),
             accel_noise_density: Some(0.7),
             baro_noise_sigma: Some(0.2),
+            sensor_match_type: Some("mcu_family".to_string()),
             ..no_profile_request()
         };
         let (cfg, sources) = build_sensors_config(&spec, &request);
@@ -2994,6 +3010,32 @@ mod tests {
         assert_eq!(sources.imu, SensorSource::Table("Icm42688p".to_string()));
         assert_eq!(cfg.baro.noise_sigma, 0.2);
         assert!(matches!(sources.baro, SensorSource::Profile(_)));
+        assert!(sensor_sources_line(&sources)
+            .starts_with("imu=table:Icm42688p baro=profile:mcu_family"));
+    }
+
+    #[test]
+    fn match_type_label_passes_only_known_values() {
+        assert_eq!(match_type_label(Some("mcu_family")), "mcu_family");
+        assert_eq!(match_type_label(Some("exact")), "exact");
+        assert_eq!(match_type_label(Some("average")), "average");
+        assert_eq!(match_type_label(None), "default");
+        assert_eq!(match_type_label(Some("bad\nline")), "unknown");
+        assert_eq!(match_type_label(Some("x\u{1b}[31m")), "unknown");
+        assert_eq!(match_type_label(Some("")), "unknown");
+    }
+
+    #[test]
+    fn an_unrecognised_match_type_is_labelled_unknown_in_the_sources() {
+        let spec = spec_with_parts(None, None, None, None);
+        let request = ConfigureBuild {
+            baro_noise_sigma: Some(0.2),
+            sensor_match_type: Some("bad\nline".to_string()),
+            ..no_profile_request()
+        };
+        let (_cfg, sources) = build_sensors_config(&spec, &request);
+        assert_eq!(sources.baro, SensorSource::Profile("unknown".to_string()));
+        assert!(!sensor_sources_line(&sources).contains('\n'));
     }
 
     #[test]
