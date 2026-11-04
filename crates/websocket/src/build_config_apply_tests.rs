@@ -501,3 +501,39 @@ async fn a_configure_or_reset_during_the_repush_is_refused_as_busy() {
     // Its eventual failure takes 2.4 s of ack timeouts; this test is done.
     repush.abort();
 }
+
+/// The handler starts from `new_build_spec()`: an FC that lists a gyro and no
+/// barometer gives the gyro's table values and the `Other` barometer entry,
+/// not the reference build's chips.
+#[tokio::test]
+async fn an_fc_catalogue_entry_names_the_gyro_and_leaves_the_barometer_unnamed() {
+    let mut rig = rig(Px4Params::Absent, None, false).await;
+    let mut components = catalogue_components();
+    components.push((
+        "fc",
+        serde_json::json!({ "gyro": "ICM-42688-P", "barometer": "None" }),
+    ));
+    Arc::get_mut(&mut rig.handler).unwrap().api_url =
+        spawn_catalogue(components, Duration::ZERO).await;
+    let request = ConfigureBuild {
+        fc_slug: Some("fc".to_string()),
+        ..request_at(B)
+    };
+
+    // No simulation loop applies the build, so the result is a timeout; the
+    // sensors it pushed are still on the config channel.
+    let _ = run(&rig, request).await;
+
+    let (_, _, sensors) = rig
+        ._config_rx
+        .as_ref()
+        .unwrap()
+        .try_recv()
+        .expect("the handler pushed a build");
+    let imu = ImuChip::Icm42688p.imu_profile();
+    assert_eq!(sensors.imu.gyro_noise_density, imu.gyro_noise_density);
+    assert_eq!(sensors.imu.accel_noise_density, imu.accel_noise_density);
+    let other = BaroChip::Other.baro_profile().noise_sigma_m;
+    assert_eq!(sensors.baro.noise_sigma, other);
+    assert_ne!(other, BaroChip::Bmp280.baro_profile().noise_sigma_m);
+}

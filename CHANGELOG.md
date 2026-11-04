@@ -27,7 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **An FC whose catalog barometer is "None" or empty still gets a simulated
   barometer.** It follows the same rule as an unknown part (the request profile value, else
   the `Other` entry), and the daemon logs "FC lists
-  no barometer; simulating one with the fallback noise". No build is rejected.
+  no barometer; simulating one from the request profile, else the Other entry".
+  No build is rejected.
 
 ### Added
 
@@ -47,7 +48,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `profile:default` means the request sent profile values without a match type.
   `mixed(...)` marks a sensor whose fields came from different sources, for
   example `mixed(gyro=...,accel=...)` for the IMU (the GPS prints
-  `mixed(h=...,alt=...,vel=...)`).
+  `mixed(h=...,alt=...,vel=...)`). The line now opens with
+  `Sensor noise (request profile: <match type>)`, because the bracket names
+  the profile the request carried, not where each value came from; the
+  `sources` field says that.
 
 ### Dependencies
 

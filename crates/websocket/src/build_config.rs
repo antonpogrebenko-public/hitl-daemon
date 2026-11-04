@@ -727,7 +727,7 @@ impl BuildConfigHandler {
         // (exact / mcu_family / average, or "default" when no profile was sent).
         info!(
             sources = %sensor_sources_line(&sources),
-            "Sensor noise [{}]: gyro_nd={:.6} accel_nd={:.5} | baro={:.4}m mag={:.5}G | gps h={:.3}m alt={:.3}m vel={:.3}m/s rate={}Hz delay={}ms",
+            "Sensor noise (request profile: {}): gyro_nd={:.6} accel_nd={:.5} | baro={:.4}m mag={:.5}G | gps h={:.3}m alt={:.3}m vel={:.3}m/s rate={}Hz delay={}ms",
             request.sensor_match_type.as_deref().unwrap_or("default"),
             sensors_config.imu.gyro_noise_density,
             sensors_config.imu.accel_noise_density,
@@ -1404,7 +1404,7 @@ fn apply_fc_catalogue(spec: &mut BuildSpec, specs: &serde_json::Value, fc_slug: 
             Some(chip) => spec.flight_controller.baro_chip = Some(chip),
             None => info!(
                 slug = %fc_slug,
-                "FC lists no barometer; simulating one with the fallback noise"
+                "FC lists no barometer; simulating one from the request profile, else the Other entry"
             ),
         }
     }
@@ -1416,11 +1416,7 @@ fn apply_fc_catalogue(spec: &mut BuildSpec, specs: &serde_json::Value, fc_slug: 
 /// The FC catalog's barometer string as a chip, or `None` when the FC lists
 /// no barometer ("None" or empty, normalized like the part parsers do).
 fn fc_baro_listed(s: &str) -> Option<BaroChip> {
-    let normalized = s
-        .to_lowercase()
-        .replace('-', "")
-        .replace('_', "")
-        .replace(' ', "");
+    let normalized = s.to_lowercase().replace(['-', '_', ' '], "");
     match normalized.as_str() {
         "none" | "" => None,
         _ => Some(parse_baro_chip(s)),
@@ -1649,6 +1645,208 @@ fn shared_source(fields: Vec<(&'static str, SensorSource)>) -> SensorSource {
     }
 }
 
+/// The label text for a request value's match type.
+fn profile_label(mt: Option<&str>) -> String {
+    mt.unwrap_or("default").to_string()
+}
+
+/// IMU noise: the named part, else the request profile, else `Other`. Bias
+/// drift stays off in HITL (it diverges the EKF).
+fn imu_config(
+    fc: &hitl_physics::build::FlightControllerSpec,
+    request: &crate::protocol::ConfigureBuild,
+    mt: Option<&str>,
+) -> (hitl_sensors::ImuConfig, SensorSource) {
+    let name = named_part(fc.imu_chip.as_ref(), |c| *c == ImuChip::Other);
+    let table = fc
+        .imu_chip
+        .as_ref()
+        .unwrap_or(&ImuChip::Other)
+        .imu_profile();
+    let other = ImuChip::Other.imu_profile();
+    let (gyro, gyro_src) = pick_value(
+        name.as_deref(),
+        request.gyro_noise_density,
+        mt,
+        table.gyro_noise_density,
+        other.gyro_noise_density,
+    );
+    let (accel, accel_src) = pick_value(
+        name.as_deref(),
+        request.accel_noise_density,
+        mt,
+        table.accel_noise_density,
+        other.accel_noise_density,
+    );
+    let imu = hitl_sensors::ImuConfig {
+        gyro_noise_density: gyro,
+        accel_noise_density: accel,
+        gyro_bias_sigma: 0.0, // CRITICAL: no drift in HITL
+        gyro_bias_tau: 1000.0,
+        accel_bias_sigma: 0.0, // CRITICAL: no drift in HITL
+        accel_bias_tau: 1000.0,
+    };
+    (
+        imu,
+        shared_source(vec![("gyro", gyro_src), ("accel", accel_src)]),
+    )
+}
+
+/// Barometer noise: the named part, else the request profile, else `Other`.
+fn baro_config(
+    fc: &hitl_physics::build::FlightControllerSpec,
+    request: &crate::protocol::ConfigureBuild,
+    mt: Option<&str>,
+) -> (hitl_sensors::BaroConfig, SensorSource) {
+    let name = named_part(fc.baro_chip.as_ref(), |c| *c == BaroChip::Other);
+    let table = fc
+        .baro_chip
+        .as_ref()
+        .unwrap_or(&BaroChip::Other)
+        .baro_profile();
+    let (sigma, src) = pick_value(
+        name.as_deref(),
+        request.baro_noise_sigma,
+        mt,
+        table.noise_sigma_m,
+        BaroChip::Other.baro_profile().noise_sigma_m,
+    );
+    let baro = hitl_sensors::BaroConfig {
+        noise_sigma: sigma,
+        ..hitl_sensors::BaroConfig::default()
+    };
+    (baro, src)
+}
+
+/// Magnetometer noise. With no magnetometer in the build: the HITL default,
+/// or the request's value.
+fn mag_config(
+    fc: &hitl_physics::build::FlightControllerSpec,
+    request: &crate::protocol::ConfigureBuild,
+    mt: Option<&str>,
+) -> (hitl_sensors::MagConfig, SensorSource) {
+    let mag_chip = fc.mag_chip.as_ref().filter(|c| **c != MagChip::None);
+    let (sigma, src) = match mag_chip {
+        Some(chip) => {
+            let table = chip
+                .mag_profile()
+                .map_or(NO_MAG_NOISE_GAUSS, |p| p.noise_sigma_gauss);
+            let other = MagChip::Other
+                .mag_profile()
+                .map_or(NO_MAG_NOISE_GAUSS, |p| p.noise_sigma_gauss);
+            let name = named_part(Some(chip), |c| *c == MagChip::Other);
+            pick_value(name.as_deref(), request.mag_noise_sigma, mt, table, other)
+        }
+        None => match request.mag_noise_sigma {
+            Some(v) => (v, SensorSource::Profile(profile_label(mt))),
+            None => (NO_MAG_NOISE_GAUSS, SensorSource::Default),
+        },
+    };
+    let mag = hitl_sensors::MagConfig {
+        noise_sigma_gauss: sigma,
+        ..hitl_sensors::MagConfig::default()
+    };
+    (mag, src)
+}
+
+/// GPS receiver noise: the build's module when it has one, else the HITL
+/// defaults field by field (a request value replaces a default).
+fn gps_config(
+    spec: &BuildSpec,
+    request: &crate::protocol::ConfigureBuild,
+    mt: Option<&str>,
+) -> (hitl_sensors::GpsConfig, SensorSource) {
+    match &spec.gps {
+        Some(gps_spec) => module_gps_config(gps_spec, request, mt),
+        None => default_gps_config(request, mt),
+    }
+}
+
+fn module_gps_config(
+    gps_spec: &hitl_physics::build::GpsSpec,
+    request: &crate::protocol::ConfigureBuild,
+    mt: Option<&str>,
+) -> (hitl_sensors::GpsConfig, SensorSource) {
+    use hitl_physics::build::GpsChipset;
+
+    let name = named_part(Some(&gps_spec.chipset), |c| *c == GpsChipset::Other);
+    let table = gps_spec.chipset.gps_profile();
+    let other = GpsChipset::Other.gps_profile();
+    let (h, h_src) = pick_value(
+        name.as_deref(),
+        request.gps_horizontal_noise,
+        mt,
+        table.horizontal_noise_sigma_m,
+        other.horizontal_noise_sigma_m,
+    );
+    let (a, a_src) = pick_value(
+        name.as_deref(),
+        request.gps_altitude_noise,
+        mt,
+        table.altitude_noise_sigma_m,
+        other.altitude_noise_sigma_m,
+    );
+    let (v, v_src) = pick_value(
+        name.as_deref(),
+        request.gps_velocity_noise,
+        mt,
+        table.velocity_noise_sigma_mps,
+        other.velocity_noise_sigma_mps,
+    );
+    let cfg = hitl_sensors::GpsConfig {
+        horizontal_noise_sigma: h,
+        altitude_noise_sigma: a,
+        velocity_noise_sigma: v,
+        // Still no *extra* random walk on top of the module's stated
+        // accuracy. That accuracy is no longer applied as per-sample white
+        // noise: `GpsSensor` splits it into a small uncorrelated part and a
+        // slow correlated one, so the wander a real receiver shows is
+        // already inside `horizontal_noise_sigma` / `altitude_noise_sigma`.
+        // Feeding the profile's own drift figures in here as well would
+        // count the same physical error twice.
+        position_drift_sigma: 0.0,
+        position_drift_tau: 1000.0,
+        // The API-reported rate of the specific GPS product listing
+        // replaces the chipset default.
+        update_rate_hz: gps_spec.update_rate_hz,
+        delay_ms: table.delay_ms,
+        ..hitl_sensors::GpsConfig::default()
+    };
+    (
+        cfg,
+        shared_source(vec![("h", h_src), ("alt", a_src), ("vel", v_src)]),
+    )
+}
+
+/// No GPS module selected: tight HITL defaults, each replaced by the
+/// request's value when it carries one, and labelled field by field.
+fn default_gps_config(
+    request: &crate::protocol::ConfigureBuild,
+    mt: Option<&str>,
+) -> (hitl_sensors::GpsConfig, SensorSource) {
+    let field = |req: Option<f64>, default: f64| match req {
+        Some(v) => (v, SensorSource::Profile(profile_label(mt))),
+        None => (default, SensorSource::Default),
+    };
+    let (h, h_src) = field(request.gps_horizontal_noise, NO_GPS_HORIZONTAL_NOISE_M);
+    let (a, a_src) = field(request.gps_altitude_noise, NO_GPS_ALTITUDE_NOISE_M);
+    let (v, v_src) = field(request.gps_velocity_noise, NO_GPS_VELOCITY_NOISE_MPS);
+    let cfg = hitl_sensors::GpsConfig {
+        horizontal_noise_sigma: h,
+        altitude_noise_sigma: a,
+        velocity_noise_sigma: v,
+        position_drift_sigma: 0.0,
+        position_drift_tau: 1000.0,
+        update_rate_hz: NO_GPS_UPDATE_RATE_HZ,
+        delay_ms: NO_GPS_DELAY_MS,
+        ..hitl_sensors::GpsConfig::default()
+    };
+    (
+        cfg,
+        shared_source(vec![("h", h_src), ("alt", a_src), ("vel", v_src)]),
+    )
+}
+
 /// Construct a `SensorsConfig` from the build's parts and the request.
 ///
 /// For HITL: bias drift is always disabled (causes EKF divergence in sim) but
@@ -1666,179 +1864,27 @@ fn build_sensors_config(
     spec: &BuildSpec,
     request: &crate::protocol::ConfigureBuild,
 ) -> (hitl_sensors::SensorsConfig, SensorSources) {
-    use hitl_physics::build::GpsChipset;
-    use hitl_sensors::{BaroConfig, GpsConfig, ImuConfig, MagConfig, SensorsConfig};
-
     let mt = request.sensor_match_type.as_deref();
     let fc = &spec.flight_controller;
 
-    let imu_name = named_part(fc.imu_chip.as_ref(), |c| *c == ImuChip::Other);
-    let imu_table = fc
-        .imu_chip
-        .as_ref()
-        .unwrap_or(&ImuChip::Other)
-        .imu_profile();
-    let imu_other = ImuChip::Other.imu_profile();
-    let (gyro, gyro_src) = pick_value(
-        imu_name.as_deref(),
-        request.gyro_noise_density,
-        mt,
-        imu_table.gyro_noise_density,
-        imu_other.gyro_noise_density,
-    );
-    let (accel, accel_src) = pick_value(
-        imu_name.as_deref(),
-        request.accel_noise_density,
-        mt,
-        imu_table.accel_noise_density,
-        imu_other.accel_noise_density,
-    );
-    let imu = ImuConfig {
-        gyro_noise_density: gyro,
-        accel_noise_density: accel,
-        gyro_bias_sigma: 0.0, // CRITICAL: no drift in HITL
-        gyro_bias_tau: 1000.0,
-        accel_bias_sigma: 0.0, // CRITICAL: no drift in HITL
-        accel_bias_tau: 1000.0,
-    };
+    let (imu, imu_src) = imu_config(fc, request, mt);
+    let (baro, baro_src) = baro_config(fc, request, mt);
+    let (mag, mag_src) = mag_config(fc, request, mt);
+    let (gps, gps_src) = gps_config(spec, request, mt);
 
-    let baro_name = named_part(fc.baro_chip.as_ref(), |c| *c == BaroChip::Other);
-    let baro_table = fc
-        .baro_chip
-        .as_ref()
-        .unwrap_or(&BaroChip::Other)
-        .baro_profile();
-    let (baro_sigma, baro_src) = pick_value(
-        baro_name.as_deref(),
-        request.baro_noise_sigma,
-        mt,
-        baro_table.noise_sigma_m,
-        BaroChip::Other.baro_profile().noise_sigma_m,
-    );
-    let baro = BaroConfig {
-        noise_sigma: baro_sigma,
-        ..BaroConfig::default()
-    };
-
-    let mag_chip = fc.mag_chip.as_ref().filter(|c| **c != MagChip::None);
-    let (mag_sigma, mag_src) = match mag_chip {
-        Some(chip) => {
-            let table = chip
-                .mag_profile()
-                .map_or(NO_MAG_NOISE_GAUSS, |p| p.noise_sigma_gauss);
-            let other = MagChip::Other
-                .mag_profile()
-                .map_or(NO_MAG_NOISE_GAUSS, |p| p.noise_sigma_gauss);
-            let name = named_part(Some(chip), |c| *c == MagChip::Other);
-            pick_value(name.as_deref(), request.mag_noise_sigma, mt, table, other)
-        }
-        // No magnetometer in the build: the HITL default, or the request's value.
-        None => match request.mag_noise_sigma {
-            Some(v) => (
-                v,
-                SensorSource::Profile(mt.unwrap_or("default").to_string()),
-            ),
-            None => (NO_MAG_NOISE_GAUSS, SensorSource::Default),
-        },
-    };
-    let mag = MagConfig {
-        noise_sigma_gauss: mag_sigma,
-        ..MagConfig::default()
-    };
-
-    let (gps, gps_source) = if let Some(gps_spec) = &spec.gps {
-        let name = named_part(Some(&gps_spec.chipset), |c| *c == GpsChipset::Other);
-        let table = gps_spec.chipset.gps_profile();
-        let other = GpsChipset::Other.gps_profile();
-        let (h, h_src) = pick_value(
-            name.as_deref(),
-            request.gps_horizontal_noise,
-            mt,
-            table.horizontal_noise_sigma_m,
-            other.horizontal_noise_sigma_m,
-        );
-        let (a, a_src) = pick_value(
-            name.as_deref(),
-            request.gps_altitude_noise,
-            mt,
-            table.altitude_noise_sigma_m,
-            other.altitude_noise_sigma_m,
-        );
-        let (v, v_src) = pick_value(
-            name.as_deref(),
-            request.gps_velocity_noise,
-            mt,
-            table.velocity_noise_sigma_mps,
-            other.velocity_noise_sigma_mps,
-        );
-        let cfg = GpsConfig {
-            horizontal_noise_sigma: h,
-            altitude_noise_sigma: a,
-            velocity_noise_sigma: v,
-            // Still no *extra* random walk on top of the module's stated
-            // accuracy. That accuracy is no longer applied as per-sample white
-            // noise: `GpsSensor` splits it into a small uncorrelated part and a
-            // slow correlated one, so the wander a real receiver shows is
-            // already inside `horizontal_noise_sigma` / `altitude_noise_sigma`.
-            // Feeding the profile's own drift figures in here as well would
-            // count the same physical error twice.
-            position_drift_sigma: 0.0,
-            position_drift_tau: 1000.0,
-            // The API-reported rate of the specific GPS product listing
-            // replaces the chipset default.
-            update_rate_hz: gps_spec.update_rate_hz,
-            delay_ms: table.delay_ms,
-            ..GpsConfig::default()
-        };
-        (
-            cfg,
-            shared_source(vec![("h", h_src), ("alt", a_src), ("vel", v_src)]),
-        )
-    } else {
-        // No GPS module selected - use API values or tight defaults for HITL
-        let req = [
-            request.gps_horizontal_noise,
-            request.gps_altitude_noise,
-            request.gps_velocity_noise,
-        ];
-        let source = if req.iter().any(Option::is_some) {
-            SensorSource::Profile(mt.unwrap_or("default").to_string())
-        } else {
-            SensorSource::Default
-        };
-        let cfg = GpsConfig {
-            horizontal_noise_sigma: request
-                .gps_horizontal_noise
-                .unwrap_or(NO_GPS_HORIZONTAL_NOISE_M),
-            altitude_noise_sigma: request
-                .gps_altitude_noise
-                .unwrap_or(NO_GPS_ALTITUDE_NOISE_M),
-            velocity_noise_sigma: request
-                .gps_velocity_noise
-                .unwrap_or(NO_GPS_VELOCITY_NOISE_MPS),
-            position_drift_sigma: 0.0,
-            position_drift_tau: 1000.0,
-            update_rate_hz: NO_GPS_UPDATE_RATE_HZ,
-            delay_ms: NO_GPS_DELAY_MS,
-            ..GpsConfig::default()
-        };
-        (cfg, source)
-    };
-
-    let sources = SensorSources {
-        imu: shared_source(vec![("gyro", gyro_src), ("accel", accel_src)]),
-        baro: baro_src,
-        mag: mag_src,
-        gps: gps_source,
-    };
     (
-        SensorsConfig {
+        hitl_sensors::SensorsConfig {
             imu,
             gps,
             baro,
             mag,
         },
-        sources,
+        SensorSources {
+            imu: imu_src,
+            baro: baro_src,
+            mag: mag_src,
+            gps: gps_src,
+        },
     )
 }
 
@@ -1979,7 +2025,14 @@ mod tests {
         for (input, expected) in mag {
             assert_eq!(parse_mag_chip(input), expected, "mag {input:?}");
         }
-        let gps = [("ubx7", GpsChipset::Ubx7), ("UBX-7", GpsChipset::Ubx7)];
+        let gps = [
+            ("ubx7", GpsChipset::Ubx7),
+            ("UBX-7", GpsChipset::Ubx7),
+            // Not the early `ubx7` return: bare "ubx" names no chipset, and
+            // "ubx-m8" is the M8N by its generation.
+            ("ubx", GpsChipset::Other),
+            ("ubx-m8", GpsChipset::UbloxM8N),
+        ];
         for (input, expected) in gps {
             assert_eq!(parse_gps_chipset(input), expected, "gps {input:?}");
         }
@@ -2012,7 +2065,8 @@ mod tests {
         esc_burst_from_spec: true,
     };
 
-    /// The handler starts from `BuildSpec::default()`, whose burst rating is
+    /// The handler's starting spec (`new_build_spec()`, the reference build with
+    /// the sensor chips cleared) keeps the reference burst rating, which is
     /// set, so a catalogue entry without one keeps the default the physics
     /// then enforces. It must be reported as that value, and flagged.
     #[test]
@@ -2106,7 +2160,7 @@ mod tests {
         assert!(l.estimated_limits.is_empty());
     }
 
-    // The handler starts from `BuildSpec::default()` (burst `Some(55)`), so
+    // The handler's starting spec keeps the reference burst (`Some(55)`), so
     // `burst_amps == None` is unreachable today; this pins `current_limits`'
     // behaviour should that change.
     #[test]
@@ -2975,6 +3029,38 @@ mod tests {
                 ("accel", SensorSource::Other),
             ])
         );
+    }
+
+    #[test]
+    fn partial_request_without_a_gps_module_is_mixed() {
+        let spec = spec_with_parts(None, None, None, None);
+        let request = ConfigureBuild {
+            gps_horizontal_noise: Some(1.7),
+            sensor_match_type: Some("exact".to_string()),
+            ..no_profile_request()
+        };
+        let (cfg, sources) = build_sensors_config(&spec, &request);
+        assert_eq!(cfg.gps.horizontal_noise_sigma, 1.7);
+        assert_eq!(cfg.gps.altitude_noise_sigma, NO_GPS_ALTITUDE_NOISE_M);
+        assert_eq!(cfg.gps.velocity_noise_sigma, NO_GPS_VELOCITY_NOISE_MPS);
+        assert_eq!(
+            sources.gps,
+            SensorSource::Mixed(vec![
+                ("h", SensorSource::Profile("exact".to_string())),
+                ("alt", SensorSource::Default),
+                ("vel", SensorSource::Default),
+            ])
+        );
+
+        let full = ConfigureBuild {
+            gps_horizontal_noise: Some(1.7),
+            gps_altitude_noise: Some(2.5),
+            gps_velocity_noise: Some(0.4),
+            sensor_match_type: Some("exact".to_string()),
+            ..no_profile_request()
+        };
+        let (_, sources) = build_sensors_config(&spec, &full);
+        assert_eq!(sources.gps, SensorSource::Profile("exact".to_string()));
     }
 
     #[test]
