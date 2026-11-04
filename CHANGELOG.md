@@ -5,6 +5,51 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.28.0]
+
+### Changed
+
+- **BREAKING for builds with known chips: each sensor takes its value from the
+  first source that has one.** For the IMU, the barometer, the magnetometer and
+  the GPS receiver, a part the build names (other than `Other`) takes its
+  `hitl-physics` table value; otherwise the request's sensor profile value for
+  that sensor applies; otherwise the `Other` entry. Before, the request's
+  MCU-family profile overrode every chip value. A build with no magnetometer
+  (none listed, or "None") and a build with no GPS module keep their 0.27.0
+  values (request value, else 0.005 G; request values, else 0.1 m / 0.3 m /
+  0.05 m/s at 10 Hz, 80 ms).
+- **A build names only the sensor chips its FC catalog lists.** The daemon no
+  longer starts from the reference build's MPU-6000 and BMP280. A build without
+  FC catalog sensor data (no FC slug, a failed fetch or a missing key) follows
+  the request profile, then `Other`, for those sensors.
+- **An FC whose catalog barometer is "None" or empty still gets a simulated
+  barometer.** It follows the unknown-part rule, and the daemon logs "FC lists
+  no barometer; simulating one with the fallback noise". No build is rejected.
+
+### Added
+
+- **23 part spellings from the calibration run are recognised.**
+  - IMU (15): ADIS16470, ADIS16607, BMI055, BMI088, ICM-20602, ICM-20608-G,
+    ICM-20649, ICM-20948, ICM-42670-P, ICM-42686-P, ICM-45686, IIM-42652,
+    IIM-42653, MPU-9250, SCH16T.
+  - Barometer (2): BMP581, ICP-201xx.
+  - Magnetometer (5): AK09916, BMM150, BMM350, IIS2MDC, QMC5883P.
+  - GPS (1): UBX7.
+
+  Every spelling that 0.27.0 accepted keeps its part.
+- **The "Sensor noise" log line names each sensor's source** in a new `sources`
+  field, for example
+  `imu=table:Icm42688p baro=profile:mcu_family mag=other gps=table:UbloxM9N`.
+  `default` marks the no-magnetometer and no-GPS-module defaults, and
+  `mixed(gyro=...,accel=...)` marks a sensor whose fields came from different
+  sources.
+
+### Dependencies
+
+- Picks up `hitl-physics` 0.14.0 (its measured part tables and new variants).
+  Merge after that `hitl-physics` release. The `websocket` crate moves from
+  0.6.0 to 0.7.0.
+
 ## [0.27.0]
 
 ### Added
