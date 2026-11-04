@@ -539,7 +539,7 @@ impl BuildConfigHandler {
         // Build a typed BuildSpec from the request + fetched component specs.
         // Phase 0 keeps parity with the prior `from_build_specs` call; later phases
         // (frame/ESC/FC fetched as full components) populate more fields.
-        let mut spec = BuildSpec::default();
+        let mut spec = new_build_spec();
         spec.frame.weight_g = request.frame_weight_g;
         spec.motors.kv = kv;
         spec.motors.weight_g = motor_weight_g;
@@ -612,24 +612,7 @@ impl BuildConfigHandler {
         if let Some(ref fc_slug) = request.fc_slug {
             match self.fetch_component_specs(fc_slug).await {
                 Ok(specs) => {
-                    if let Some(weight) = specs.get("weightG").and_then(|v| v.as_f64()) {
-                        spec.flight_controller.weight_g = weight;
-                    }
-                    if let Some(gyro_str) = specs.get("gyro").and_then(|v| v.as_str()) {
-                        spec.flight_controller.imu_chip = Some(parse_imu_chip(gyro_str));
-                    }
-                    if let Some(baro_str) = specs.get("barometer").and_then(|v| v.as_str()) {
-                        match fc_baro_listed(baro_str) {
-                            Some(chip) => spec.flight_controller.baro_chip = Some(chip),
-                            None => info!(
-                                slug = %fc_slug,
-                                "FC lists no barometer; simulating one with the fallback noise"
-                            ),
-                        }
-                    }
-                    if let Some(mag_str) = specs.get("magnetometer").and_then(|v| v.as_str()) {
-                        spec.flight_controller.mag_chip = Some(parse_mag_chip(mag_str));
-                    }
+                    apply_fc_catalogue(&mut spec, &specs, fc_slug);
                     info!(
                         slug = %fc_slug,
                         weight_g = spec.flight_controller.weight_g,
@@ -1394,6 +1377,39 @@ fn parse_baro_chip(s: &str) -> BaroChip {
         "bmp581" => BaroChip::Bmp581,
         "icp201xx" => BaroChip::Icp201xx,
         _ => BaroChip::Other,
+    }
+}
+
+/// The spec a configure starts from. The reference build's sensor chips are
+/// not parts this build names, so a chip counts only when the FC catalog
+/// names it; the rest follow the request profile, then the `Other` entry.
+fn new_build_spec() -> BuildSpec {
+    let mut spec = BuildSpec::default();
+    spec.flight_controller.imu_chip = None;
+    spec.flight_controller.mag_chip = None;
+    spec.flight_controller.baro_chip = None;
+    spec
+}
+
+/// Apply the FC catalog entry (weight and the sensor parts it names) to the spec.
+fn apply_fc_catalogue(spec: &mut BuildSpec, specs: &serde_json::Value, fc_slug: &str) {
+    if let Some(weight) = specs.get("weightG").and_then(|v| v.as_f64()) {
+        spec.flight_controller.weight_g = weight;
+    }
+    if let Some(gyro_str) = specs.get("gyro").and_then(|v| v.as_str()) {
+        spec.flight_controller.imu_chip = Some(parse_imu_chip(gyro_str));
+    }
+    if let Some(baro_str) = specs.get("barometer").and_then(|v| v.as_str()) {
+        match fc_baro_listed(baro_str) {
+            Some(chip) => spec.flight_controller.baro_chip = Some(chip),
+            None => info!(
+                slug = %fc_slug,
+                "FC lists no barometer; simulating one with the fallback noise"
+            ),
+        }
+    }
+    if let Some(mag_str) = specs.get("magnetometer").and_then(|v| v.as_str()) {
+        spec.flight_controller.mag_chip = Some(parse_mag_chip(mag_str));
     }
 }
 
@@ -2775,12 +2791,65 @@ mod tests {
     fn no_barometer_build_still_gets_a_barometer() {
         let spec = spec_with_parts(None, fc_baro_listed("None"), None, None);
 
-        let (cfg, _) = build_sensors_config(&spec, &no_profile_request());
+        let (cfg, sources) = build_sensors_config(&spec, &no_profile_request());
 
         assert_eq!(
             cfg.baro.noise_sigma,
             BaroChip::Other.baro_profile().noise_sigma_m
         );
+        assert_eq!(sources.baro, SensorSource::Other);
+    }
+
+    #[test]
+    fn new_build_spec_names_no_sensor_chips() {
+        let spec = new_build_spec();
+
+        assert_eq!(spec.flight_controller.imu_chip, None);
+        assert_eq!(spec.flight_controller.mag_chip, None);
+        assert_eq!(spec.flight_controller.baro_chip, None);
+    }
+
+    #[test]
+    fn fc_listing_no_barometer_follows_the_unknown_part_rule() {
+        let mut spec = new_build_spec();
+        let specs = serde_json::json!({"gyro": "ICM-42688-P", "barometer": "None"});
+        apply_fc_catalogue(&mut spec, &specs, "some-fc");
+
+        assert_eq!(spec.flight_controller.baro_chip, None);
+        assert_eq!(spec.flight_controller.imu_chip, Some(ImuChip::Icm42688p));
+
+        let (cfg, sources) = build_sensors_config(&spec, &no_profile_request());
+        assert_eq!(
+            cfg.baro.noise_sigma,
+            BaroChip::Other.baro_profile().noise_sigma_m
+        );
+        assert_eq!(sources.baro, SensorSource::Other);
+
+        let request = ConfigureBuild {
+            baro_noise_sigma: Some(0.77),
+            sensor_match_type: Some("exact".to_string()),
+            ..no_profile_request()
+        };
+        let (cfg, sources) = build_sensors_config(&spec, &request);
+        assert_eq!(cfg.baro.noise_sigma, 0.77);
+        assert!(matches!(sources.baro, SensorSource::Profile(_)));
+    }
+
+    #[test]
+    fn build_without_fc_data_follows_the_request_then_other() {
+        let spec = new_build_spec();
+        let request = ConfigureBuild {
+            gyro_noise_density: Some(0.03),
+            accel_noise_density: Some(0.7),
+            sensor_match_type: Some("exact".to_string()),
+            ..no_profile_request()
+        };
+
+        let (cfg, sources) = build_sensors_config(&spec, &request);
+
+        assert_eq!(cfg.imu.gyro_noise_density, 0.03);
+        assert_eq!(cfg.imu.accel_noise_density, 0.7);
+        assert!(matches!(sources.imu, SensorSource::Profile(_)));
     }
 
     #[test]
