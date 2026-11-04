@@ -619,7 +619,13 @@ impl BuildConfigHandler {
                         spec.flight_controller.imu_chip = Some(parse_imu_chip(gyro_str));
                     }
                     if let Some(baro_str) = specs.get("barometer").and_then(|v| v.as_str()) {
-                        spec.flight_controller.baro_chip = Some(parse_baro_chip(baro_str));
+                        match fc_baro_listed(baro_str) {
+                            Some(chip) => spec.flight_controller.baro_chip = Some(chip),
+                            None => info!(
+                                slug = %fc_slug,
+                                "FC lists no barometer; simulating one with the fallback noise"
+                            ),
+                        }
                     }
                     if let Some(mag_str) = specs.get("magnetometer").and_then(|v| v.as_str()) {
                         spec.flight_controller.mag_chip = Some(parse_mag_chip(mag_str));
@@ -732,13 +738,12 @@ impl BuildConfigHandler {
         // Build sensor config from FC/GPS chip profiles.
         // For HITL: disable bias drift (causes EKF divergence) but use chip-specific
         // noise densities for realistic sensor behavior.
-        // `sources` is logged once the barometer rule lands.
-        #[allow(unused_variables)]
         let (sensors_config, sources) = build_sensors_config(&spec, &request);
 
         // Log the resolved sensor noise and how the profile was matched
         // (exact / mcu_family / average, or "default" when no profile was sent).
         info!(
+            sources = %sensor_sources_line(&sources),
             "Sensor noise [{}]: gyro_nd={:.6} accel_nd={:.5} | baro={:.4}m mag={:.5}G | gps h={:.3}m alt={:.3}m vel={:.3}m/s rate={}Hz delay={}ms",
             request.sensor_match_type.as_deref().unwrap_or("default"),
             sensors_config.imu.gyro_noise_density,
@@ -1392,6 +1397,20 @@ fn parse_baro_chip(s: &str) -> BaroChip {
     }
 }
 
+/// The FC catalog's barometer string as a chip, or `None` when the FC lists
+/// no barometer ("None" or empty, normalized like the part parsers do).
+fn fc_baro_listed(s: &str) -> Option<BaroChip> {
+    let normalized = s
+        .to_lowercase()
+        .replace('-', "")
+        .replace('_', "")
+        .replace(' ', "");
+    match normalized.as_str() {
+        "none" | "" => None,
+        _ => Some(parse_baro_chip(s)),
+    }
+}
+
 /// Build a `PARAM_SET` MAVLink message targeting the autopilot. Param IDs
 /// are right-padded with NUL bytes inside the 16-byte buffer per the MAVLink
 /// spec; names longer than 16 chars are truncated.
@@ -1526,6 +1545,35 @@ enum SensorSource {
     Default,
     /// The sensor's fields came from different sources: each field with its own.
     Mixed(Vec<(&'static str, SensorSource)>),
+}
+
+/// One source as it appears in the sensor-noise log line.
+fn sensor_source_label(source: &SensorSource) -> String {
+    match source {
+        SensorSource::Table(name) => format!("table:{name}"),
+        SensorSource::Profile(match_type) => format!("profile:{match_type}"),
+        SensorSource::Other => "other".to_string(),
+        SensorSource::Default => "default".to_string(),
+        SensorSource::Mixed(fields) => {
+            let parts: Vec<String> = fields
+                .iter()
+                .map(|(field, src)| format!("{field}={}", sensor_source_label(src)))
+                .collect();
+            format!("mixed({})", parts.join(","))
+        }
+    }
+}
+
+/// The per-sensor sources as one log field, for example
+/// `imu=table:Icm42688p baro=profile:mcu_family mag=other gps=table:UbloxM9N`.
+fn sensor_sources_line(sources: &SensorSources) -> String {
+    format!(
+        "imu={} baro={} mag={} gps={}",
+        sensor_source_label(&sources.imu),
+        sensor_source_label(&sources.baro),
+        sensor_source_label(&sources.mag),
+        sensor_source_label(&sources.gps),
+    )
 }
 
 /// Magnetometer noise (Gauss) for a build without a magnetometer.
@@ -2713,6 +2761,59 @@ mod tests {
             sensor_match_type: None,
             ..catalogue_request(false)
         }
+    }
+
+    #[test]
+    fn fc_with_no_barometer_is_unnamed() {
+        assert_eq!(fc_baro_listed("None"), None);
+        assert_eq!(fc_baro_listed(""), None);
+        assert_eq!(fc_baro_listed(" no-ne "), None);
+        assert_eq!(fc_baro_listed("DPS310"), Some(BaroChip::Dps310));
+    }
+
+    #[test]
+    fn no_barometer_build_still_gets_a_barometer() {
+        let spec = spec_with_parts(None, fc_baro_listed("None"), None, None);
+
+        let (cfg, _) = build_sensors_config(&spec, &no_profile_request());
+
+        assert_eq!(
+            cfg.baro.noise_sigma,
+            BaroChip::Other.baro_profile().noise_sigma_m
+        );
+    }
+
+    #[test]
+    fn sources_line_names_each_source() {
+        let sources = SensorSources {
+            imu: SensorSource::Table("Icm42688p".to_string()),
+            baro: SensorSource::Profile("mcu_family".to_string()),
+            mag: SensorSource::Other,
+            gps: SensorSource::Table("UbloxM9N".to_string()),
+        };
+
+        assert_eq!(
+            sensor_sources_line(&sources),
+            "imu=table:Icm42688p baro=profile:mcu_family mag=other gps=table:UbloxM9N"
+        );
+    }
+
+    #[test]
+    fn sources_line_names_default_and_mixed_sources() {
+        let sources = SensorSources {
+            imu: SensorSource::Mixed(vec![
+                ("gyro", SensorSource::Profile("exact".to_string())),
+                ("accel", SensorSource::Other),
+            ]),
+            baro: SensorSource::Other,
+            mag: SensorSource::Default,
+            gps: SensorSource::Default,
+        };
+
+        assert_eq!(
+            sensor_sources_line(&sources),
+            "imu=mixed(gyro=profile:exact,accel=other) baro=other mag=default gps=default"
+        );
     }
 
     #[test]
