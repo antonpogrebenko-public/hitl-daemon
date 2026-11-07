@@ -5,6 +5,26 @@ All notable changes to the HITL daemon will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.28.1]
+
+### Fixed
+
+- **A drone parked on sloped terrain no longer turns on the spot.** The ground
+  clamp rebuilds the resting attitude on every physics step from the current
+  yaw, and it projected the nose onto the slope along the surface normal. On
+  any slope that swung the nose's compass direction a little towards the fall
+  line, and the swing compounded step after step: a drone sitting disarmed on
+  a 0.3-degree slope turned at 0.27 deg/s at first and kept turning until it
+  lay along the contour line, in the browser's 3D model and its heading tape
+  (both draw the simulated attitude). The nose is now lifted vertically onto
+  the slope, so the resting attitude keeps the yaw exactly while the airframe
+  still tilts with the surface. Flat ground was never affected, and the level
+  path is unchanged.
+
+### Dependencies
+
+- The `simulation` crate moves from 0.8.0 to 0.8.1.
+
 ## [0.28.0]
 
 ### Changed
