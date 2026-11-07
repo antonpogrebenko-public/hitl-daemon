@@ -91,7 +91,8 @@ fn is_level(normal: [f32; 3]) -> bool {
 
 /// Attitude of a body resting on a surface with the given NED normal, keeping
 /// its current heading. Body Z (down in FRD) is planted into the surface and
-/// the nose is the current yaw projected onto the surface plane.
+/// the nose is the current yaw lifted vertically onto the surface plane, so
+/// the attitude's yaw is exactly `yaw`.
 fn attitude_on_surface(normal: [f32; 3], yaw: f64) -> nalgebra::UnitQuaternion<f64> {
     if is_level(normal) {
         // Exact level attitude — no matrix round-trip, so no residual tilt.
@@ -100,15 +101,20 @@ fn attitude_on_surface(normal: [f32; 3], yaw: f64) -> nalgebra::UnitQuaternion<f
 
     let up = nalgebra::Vector3::new(normal[0] as f64, normal[1] as f64, normal[2] as f64);
     let z_body = -up; // FRD: body Z points down, into the surface.
-    let heading = nalgebra::Vector3::new(yaw.cos(), yaw.sin(), 0.0);
 
-    // Project the heading onto the surface plane. Degenerate only if the
-    // surface is vertical and faces along the heading, which real terrain
-    // sampled from a heightfield cannot produce.
-    let x_body = heading - z_body * heading.dot(&z_body);
-    let Some(x_body) = x_body.try_normalize(1e-9) else {
+    // Keep the heading's north and east components and solve for the down
+    // component that puts the nose in the surface plane. Projecting along the
+    // normal instead swung the nose's compass direction towards the fall line,
+    // and because the ground clamp rebuilds this attitude every physics step,
+    // a parked drone kept turning until it lay along the contour line.
+    // Degenerate only for a vertical surface, which real terrain sampled from
+    // a heightfield cannot produce.
+    if z_body.z.abs() < 1e-9 {
         return nalgebra::UnitQuaternion::from_euler_angles(0.0, 0.0, yaw);
-    };
+    }
+    let (sin_yaw, cos_yaw) = yaw.sin_cos();
+    let down = -(cos_yaw * z_body.x + sin_yaw * z_body.y) / z_body.z;
+    let x_body = nalgebra::Vector3::new(cos_yaw, sin_yaw, down).normalize();
     let y_body = z_body.cross(&x_body);
 
     nalgebra::UnitQuaternion::from_rotation_matrix(&nalgebra::Rotation3::from_matrix_unchecked(
@@ -2846,6 +2852,56 @@ mod tests {
             (z_body_ned.dot(&up) + 1.0).abs() < 1e-6,
             "body down should be antiparallel to the surface normal"
         );
+    }
+
+    /// A parked drone on a slope must keep its heading for as long as it sits
+    /// there. The ground clamp re-reads the yaw and rebuilds the resting
+    /// attitude on every physics step, so a rebuild that moves the yaw by even
+    /// a hair compounds: projecting the nose along the surface normal turned a
+    /// disarmed drone on a 0.3-degree slope by 0.27 deg/s until it lay along
+    /// the contour line, in both the browser's model and its heading tape.
+    #[test]
+    fn resting_on_a_slope_never_turns_the_heading() {
+        let ticks = 400 * 60; // 60 s parked at the default 400 Hz
+        for slope_deg in [0.3_f64, 5.0, 30.0] {
+            for downhill_deg in [0.0_f64, 90.0, 215.0] {
+                let (theta, dir) = (slope_deg.to_radians(), downhill_deg.to_radians());
+                let normal = [
+                    (theta.sin() * dir.cos()) as f32,
+                    (theta.sin() * dir.sin()) as f32,
+                    -theta.cos() as f32,
+                ];
+                for heading_deg in [0.0_f64, 30.0, 120.0, 200.0, 325.0] {
+                    let start = heading_deg.to_radians();
+                    let mut q = attitude_on_surface(normal, start);
+                    for _ in 0..ticks {
+                        let (_, _, yaw) = q.euler_angles();
+                        q = attitude_on_surface(normal, yaw);
+                    }
+                    let (_, _, yaw) = q.euler_angles();
+                    let turned = (yaw - start + std::f64::consts::PI)
+                        .rem_euclid(std::f64::consts::TAU)
+                        - std::f64::consts::PI;
+                    assert!(
+                        turned.abs() < 1e-9,
+                        "heading {heading_deg} deg on a {slope_deg}-degree slope falling \
+                         towards {downhill_deg} deg turned by {} deg in 60 s",
+                        turned.to_degrees()
+                    );
+
+                    let z_body_ned = q * nalgebra::Vector3::new(0.0, 0.0, 1.0);
+                    let up = nalgebra::Vector3::new(
+                        normal[0] as f64,
+                        normal[1] as f64,
+                        normal[2] as f64,
+                    );
+                    assert!(
+                        (z_body_ned.dot(&up) + 1.0).abs() < 1e-6,
+                        "body down must stay planted into the surface"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
